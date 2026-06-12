@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# One-command wrapper around the documented DLIO++ bag prep, map build,
+# map export, and localization replay flow.
+#
+# Run this inside the ROS distrobox. The script will source
+# /opt/ros/jazzy/setup.bash and install/setup.bash when available.
+#
+# Common cases:
+#   1. Full pipeline for a run (prep -> map -> export pcd -> localize replay)
+#      scripts/run_dlio_pipeline.sh \
+#        --raw "/path/to/run_5/filtered/all" \
+#        --data-root "/run/host/home/dongc1/dlio_data" \
+#        --run "run_5"
+#
+#   2. Prep + localize a different run against an existing map/origin
+#      scripts/run_dlio_pipeline.sh \
+#        --raw "/path/to/run_3/filtered/all" \
+#        --data-root "/run/host/home/dongc1/dlio_data" \
+#        --run "run_3" \
+#        --origin-run "run_5" \
+#        --map-run "run_5" \
+#        --rviz true
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage:
+  scripts/run_dlio_pipeline.sh --raw <filtered/all> --data-root <dir> --run <name> [options]
+
+required:
+  --raw <path>            Raw input bag directory or .mcap file for prep_bag.py
+  --data-root <dir>       Output root directory for generated artifacts
+  --run <name>            Logical run name, e.g. run_5
+
+optional:
+  --origin-run <name>     Reuse UTM origin from <data-root>/<name>_prepped/utm_origin.txt
+  --utm-origin-file <f>   Reuse UTM origin from an explicit utm_origin.txt file
+  --map-run <name>        Localize against <data-root>/<name>_map.pcd and
+                          <data-root>/<name>_dump/T_world_utm.txt.
+                          Default: current --run. If different, map building is skipped.
+  --rviz <true|false>     Pass-through to localization replay helper. Default: false
+  -h, --help              Show this help
+
+generated artifacts under <data-root>:
+  <run>_prepped/          Prepared replay bag
+  <run>_dump/             GLIM dump (full-pipeline mode only)
+  <run>_map.pcd           Exported map PCD (full-pipeline mode only)
+  <run>_loc/              Localization replay logs + evaluation
+
+examples:
+  scripts/run_dlio_pipeline.sh \
+    --raw "/run/media/.../run_5/filtered/all" \
+    --data-root "/run/host/home/dongc1/dlio_data" \
+    --run "run_5"
+
+  scripts/run_dlio_pipeline.sh \
+    --raw "/run/media/.../run_3/filtered/all" \
+    --data-root "/run/host/home/dongc1/dlio_data" \
+    --run "run_3" \
+    --origin-run "run_5" \
+    --map-run "run_5" \
+    --rviz true
+EOF
+}
+
+RAW=""
+DATA_ROOT=""
+RUN_NAME=""
+ORIGIN_RUN=""
+UTM_ORIGIN_FILE=""
+MAP_RUN=""
+RVIZ="false"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw)
+      RAW="${2:-}"
+      shift 2
+      ;;
+    --data-root)
+      DATA_ROOT="${2:-}"
+      shift 2
+      ;;
+    --run)
+      RUN_NAME="${2:-}"
+      shift 2
+      ;;
+    --origin-run)
+      ORIGIN_RUN="${2:-}"
+      shift 2
+      ;;
+    --utm-origin-file)
+      UTM_ORIGIN_FILE="${2:-}"
+      shift 2
+      ;;
+    --map-run)
+      MAP_RUN="${2:-}"
+      shift 2
+      ;;
+    --rviz)
+      RVIZ="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+[ -n "$RAW" ] || { echo "--raw is required" >&2; usage >&2; exit 1; }
+[ -n "$DATA_ROOT" ] || { echo "--data-root is required" >&2; usage >&2; exit 1; }
+[ -n "$RUN_NAME" ] || { echo "--run is required" >&2; usage >&2; exit 1; }
+
+if [ -n "$ORIGIN_RUN" ] && [ -n "$UTM_ORIGIN_FILE" ]; then
+  echo "use either --origin-run or --utm-origin-file, not both" >&2
+  exit 1
+fi
+
+if [ -z "$MAP_RUN" ]; then
+  MAP_RUN="$RUN_NAME"
+fi
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+source_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    # shellcheck disable=SC1090
+    source "$file"
+  fi
+}
+
+source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+source_if_exists "$REPO/install/setup.bash"
+
+command -v ros2 >/dev/null 2>&1 || { echo "ros2 not found; source your ROS environment first" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
+
+[ -e "$RAW" ] || { echo "raw input does not exist: $RAW" >&2; exit 1; }
+mkdir -p "$DATA_ROOT"
+
+PREPPED="$DATA_ROOT/${RUN_NAME}_prepped"
+DUMP="$DATA_ROOT/${RUN_NAME}_dump"
+MAP="$DATA_ROOT/${RUN_NAME}_map.pcd"
+LOC="$DATA_ROOT/${RUN_NAME}_loc"
+
+REF_MAP="$DATA_ROOT/${MAP_RUN}_map.pcd"
+REF_UTM="$DATA_ROOT/${MAP_RUN}_dump/T_world_utm.txt"
+
+if [ -n "$ORIGIN_RUN" ]; then
+  UTM_ORIGIN_FILE="$DATA_ROOT/${ORIGIN_RUN}_prepped/utm_origin.txt"
+fi
+
+UTM_ORIGIN_ARGS=()
+if [ -n "$UTM_ORIGIN_FILE" ]; then
+  [ -f "$UTM_ORIGIN_FILE" ] || { echo "UTM origin file not found: $UTM_ORIGIN_FILE" >&2; exit 1; }
+  UTM_ORIGIN_VALUE="$(tail -n 1 "$UTM_ORIGIN_FILE")"
+  [ -n "$UTM_ORIGIN_VALUE" ] || { echo "UTM origin file is empty: $UTM_ORIGIN_FILE" >&2; exit 1; }
+  UTM_ORIGIN_ARGS=(--utm-origin "$UTM_ORIGIN_VALUE")
+fi
+
+if [ -e "$PREPPED" ]; then
+  echo "refusing to overwrite existing prepped output: $PREPPED" >&2
+  exit 1
+fi
+if [ -e "$LOC" ]; then
+  echo "refusing to overwrite existing localization output: $LOC" >&2
+  exit 1
+fi
+
+FULL_PIPELINE="false"
+if [ "$MAP_RUN" = "$RUN_NAME" ]; then
+  FULL_PIPELINE="true"
+  [ ! -e "$DUMP" ] || { echo "refusing to overwrite existing dump dir: $DUMP" >&2; exit 1; }
+  [ ! -e "$MAP" ] || { echo "refusing to overwrite existing map file: $MAP" >&2; exit 1; }
+else
+  [ -e "$REF_MAP" ] || { echo "reference map not found: $REF_MAP" >&2; exit 1; }
+  [ -e "$REF_UTM" ] || { echo "reference T_world_utm.txt not found: $REF_UTM" >&2; exit 1; }
+fi
+
+echo "[pipeline] repo root: $REPO"
+echo "[pipeline] raw input: $RAW"
+echo "[pipeline] data root: $DATA_ROOT"
+echo "[pipeline] run name: $RUN_NAME"
+echo "[pipeline] map run: $MAP_RUN"
+echo "[pipeline] full pipeline: $FULL_PIPELINE"
+if [ ${#UTM_ORIGIN_ARGS[@]} -gt 0 ]; then
+  echo "[pipeline] reusing UTM origin from: $UTM_ORIGIN_FILE"
+fi
+
+echo "[pipeline] step 1/4: prepping bag"
+python3 -u "$REPO/scripts/prep_bag.py" \
+  --input "$RAW" \
+  --output "$PREPPED" \
+  "${UTM_ORIGIN_ARGS[@]}"
+
+if [ "$FULL_PIPELINE" = "true" ]; then
+  echo "[pipeline] step 2/4: building map with GLIM"
+  ros2 run glim_ros glim_rosbag "$PREPPED" \
+    --ros-args -p dump_path:="$DUMP" -p auto_quit:=true
+
+  echo "[pipeline] step 2b/4: evaluating map trajectory against GNSS"
+  python3 "$REPO/scripts/eval_traj_vs_gnss.py" \
+    --dump "$DUMP" \
+    --bag "$PREPPED"
+
+  echo "[pipeline] step 3/4: exporting PCD map"
+  ros2 run glim_ros glim_dump_to_pcd "$DUMP" "$MAP"
+else
+  echo "[pipeline] skipping map build/export; using existing map from run '$MAP_RUN'"
+fi
+
+echo "[pipeline] step 4/4: localization replay"
+"$REPO/scripts/run_localization_replay.sh" \
+  "$PREPPED" \
+  "$REF_MAP" \
+  "$REF_UTM" \
+  "$LOC" \
+  "$RVIZ"
+
+echo
+echo "[pipeline] done"
+echo "[pipeline] prepared bag: $PREPPED"
+if [ "$FULL_PIPELINE" = "true" ]; then
+  echo "[pipeline] dump dir:     $DUMP"
+  echo "[pipeline] map pcd:      $MAP"
+fi
+echo "[pipeline] loc output:   $LOC"

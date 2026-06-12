@@ -98,6 +98,14 @@ target_link_libraries(validator_node
   glim_ros
 )
 
+### glim_dump_to_pcd ###
+ament_auto_add_executable(glim_dump_to_pcd
+  src/glim_dump_to_pcd.cpp
+)
+target_link_libraries(glim_dump_to_pcd
+  glim_ros
+)
+
 if(BUILD_WITH_VIEWER)
   ### offline_viewer ###
   ament_auto_add_executable(offline_viewer

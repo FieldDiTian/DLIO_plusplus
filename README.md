@@ -35,7 +35,7 @@ Atlas firmware compensates the IMU-to-antenna lever arm internally, so the softw
 
 1. **Config flag** — `GLIM/glim_ext/config/config_gnss_global.json` sets `"enable_lever_arm": false`. This is the grep-able single source of truth.
 2. **Empty antenna frame** — same file sets `"urdf_gnss_frame": ""`. With this empty, the URDF lookup is skipped and `t_imu_gnss` stays zero even if the flag check were bypassed.
-3. **Module not loaded** — `GLIM/glim/config/config_ros.json` keeps `libgnss_global.so` commented out of `extension_modules`, so the code path does not execute in the current INS-based mapping pipeline.
+3. **Even though the module is loaded** — `libgnss_global.so` is enabled in `GLIM/glim/config/config_ros.json` (it provides the RTK position priors and the `T_world_utm.txt` export) — items 1 and 2 keep its lever-arm math disabled.
 
 To verify the disable in one command:
 
@@ -64,13 +64,20 @@ When the `imu_topic:=` launch arg points at a non-existent topic, the subscripti
 
 ## Workflow
 
+> **See [PIPELINE.md](PIPELINE.md) for the complete, tested, end-to-end
+> recipe** (bag prep → mapping → PCD export → localization replay →
+> evaluation) including the `/atlas/*` → `/gps_p1/*` conversion step that the
+> raw AV-24 recordings require.
+
 1. **Record** a bag containing IMU + LiDAR + GNSS topics during a driving session.
+1b. **Prep** the bag with `scripts/prep_bag.py` (topic conversion, IMU/GNSS
+   re-stamping, UTM odometry — see PIPELINE.md §1).
 2. **Map** offline with GLIM:
    ```bash
-   ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=/tmp/dump
+   ros2 run glim_ros glim_rosbag <prepped_bag> --ros-args -p dump_path:=/tmp/dump
    ```
    Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` (GNSS-to-map SE(3)) into `dump_path`.
-3. **Convert** submaps into a single PCD map by opening the dump in `glim_ros offline_viewer` and exporting to PLY (then to PCD via `gicp_localization/scripts/convert_ply_to_pcd.py`). The GUI step is **intentional, not a gap** — see "Why the offline_viewer step is manual" below.
+3. **Convert** submaps into a single PCD map. Scripted route (used by the automated pipeline): `ros2 run glim_ros glim_dump_to_pcd <dump_dir> <out.pcd>`. QA route (recommended before freezing a production map): open the dump in `glim_ros offline_viewer`, inspect/re-optimize/close loops, export PLY, then `gicp_localization/scripts/convert_ply_to_pcd.py` — see "Why the offline_viewer step is manual" below for what the GUI pass buys you.
 4. **Localize** online against that PCD map with `gicp_localization`. Point the launch file at the PCD and (optionally) the matching `T_world_utm.txt`.
 
 ### Why the offline_viewer step is manual
@@ -85,9 +92,10 @@ A blind `merge_glim_submaps.py` would skip all three and bake any unresolved dri
 
 ## Build
 
-ROS 2 Humble + colcon. Built and tested inside an Ubuntu 22.04 distrobox (`distrobox enter ros2-humble`).
+ROS 2 Jazzy + colcon. Built and tested inside an Ubuntu 24.04 distrobox (`distrobox enter ros2-jazzy`); branch `art-jazzy`.
 
 ```bash
+sudo apt-get install -y libpcap-dev   # hard build dep of glim_ros (pcap reader)
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
@@ -97,13 +105,13 @@ Headline dependencies (per-package READMEs go deeper):
 - GTSAM 4.2, gtsam_points (GPU factors), Eigen3, PCL, OpenMP, nlohmann::json, spdlog
 - Optional: CUDA 11.8+ (GPU acceleration), Iridescence (viewer), OpenCV
 
-If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-humble-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/humble/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
+If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-jazzy-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/jazzy/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 
 ## Quick Reference
 
 ```bash
-# Live SLAM with real sensors
-ros2 launch glim_ros glim_ros.launch.py config_path:=config
+# Live SLAM with real sensors (config_path defaults to the glim package's config/)
+ros2 run glim_ros glim_rosnode --ros-args -p config_path:=config
 
 # Offline bag → map (ROS 2 mcap input)
 ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=<out_dir>
@@ -115,11 +123,13 @@ ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path
 ros2 run glim_ros offline_viewer
 
 # GICP localization against a pre-built PCD map
-# (single-source P1 design: IMU + GT odom both from Atlas, at gps_antenna_top)
+# (single-source P1 design: IMU + GT odom both from Atlas, at gps_antenna_top;
+#  gt_odom must be in the MAP frame — for bag replay use
+#  gicp_localization/scripts/utm_to_map_odom.py, see PIPELINE.md §4)
 ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_p1/imu \
-    gt_odom_topic:=/gps_p1/filtered_odom
+    gt_odom_topic:=/gps_p1/filtered_odom_map
 ```
 
 ---

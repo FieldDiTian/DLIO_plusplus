@@ -70,10 +70,11 @@
     // drives mapping. Once RTK reacquires, the next GNSS factor pulls the
     // post-dropout trajectory back into the global frame; iSAM2 smooths the
     // dropout retroactively.
+    // Viewer modules (libstandard_viewer.so, librviz_viewer.so) are disabled
+    // for unattended offline mapping runs; re-add them when you want the live
+    // 3D view during mapping. They are not required for map/dump output.
     "extension_modules": [
       "libmemory_monitor.so",
-      "libstandard_viewer.so",
-      "librviz_viewer.so",
       "libimu_validator.so",
       "libgnss_global.so"
     ],

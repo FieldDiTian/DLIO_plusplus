@@ -16,6 +16,11 @@
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,
     "isam2_relinearize_thresh": 0.1,
+    // Keep bias estimation ON. The Atlas imu_calibrated stream still carries
+    // a small residual accel bias (measured |a| at rest = 9.799 vs g = 9.8066
+    // on run_5, i.e. ~7e-3 m/s^2); with the bias fixed the smoother cannot
+    // absorb it and it integrates to tens of meters of z drift per minute on
+    // geometry that poorly constrains z.
     "fix_imu_bias": false,
     // Registration settings
     "registration_type": "GICP",
@@ -32,6 +37,6 @@
     // Optimizer params
     "validate_imu": true,
     "save_imu_rate_trajectory": true,
-    "num_threads": 2
+    "num_threads": 12
   }
 }

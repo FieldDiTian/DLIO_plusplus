@@ -39,8 +39,11 @@
     localization/imu_frame: "gps_antenna_top"
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
-    # Map downsampling for GICP (smaller = more accurate but slower)
-    localization/voxel_leaf_size: 0.25
+    # Map downsampling for GICP (smaller = more accurate but slower).
+    # 0.4 keeps startup tractable on full-track maps (the 26M-point Putnam
+    # map's covariance/KdTree build takes >15 min at 0.25, ~5 min at 0.4).
+    # Lower back toward 0.25 for small/cropped maps or accuracy-critical runs.
+    localization/voxel_leaf_size: 0.4
 
     # Optional map rotation (degrees) to correct sideways/up-axis issues from source map files.
     # If your map looks sideways, try roll +/-90 first.
@@ -139,7 +142,7 @@
     # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
     dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
-    dlio/preprocessing/voxelFilter/res: 0.5   # 0.3 m voxel — good balance of density vs. speed
+    dlio/preprocessing/voxelFilter/res: 0.75  # keeps the merged 3-lidar scan small enough for <50ms GICP on the full-track map
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
@@ -162,7 +165,14 @@
     localization/sensor_type: "luminar"
 
     # IMU and Deskewing Parameters
-    dlio/deskew: false  # Disabled: Luminar per-point timestamps are collapsed, so deskewing has no effect
+    # NOTE: Luminar per-point timestamps are NOT collapsed (verified on the
+    # may_26 putnam bags: uint64 ns stamps spanning the full 49 ms scan,
+    # ~16k unique values per scan). Deskew stays off here as the conservative
+    # default because the node's deskew path moves preprocessing into the
+    # world frame (see the cropBoxFilter note above — the crop box must be
+    # disabled/enlarged before enabling deskew). At 20 m/s an undeskewed scan
+    # smears ~1 m; consider enabling deskew for high-speed runs.
+    dlio/deskew: false
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
     # Hard guard on IMU topic remap. When true, node startup fails unless the
@@ -238,7 +248,7 @@
     odom/geo/gbias_max: 0.05   # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
-    localization/debug/enable_pub: false
+    localization/debug/enable_pub: true   # publishes per-scan fitness/elapsed-ms/etc on gicp/localization/debug/*
     localization/debug/enable_jump_log: false
     localization/debug/verbose_scan_log: false
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
@@ -246,8 +256,12 @@
     localization/debug/jump_rot_deg: 30.0     # Log/reject if pose jumps > this (degrees)
 
     # GICP Registration Parameters
-    # Maximum number of iterations (increased for better convergence)
-    gicp/maxIterations: 128
+    # Iteration cap. The IMU prior is already close, so convergence happens in
+    # a handful of iterations; a large cap only adds tail latency on hard
+    # scans. Measured on the full-track Putnam map: per-scan latency must stay
+    # well under the 50 ms scan period or the published pose lags ground truth
+    # (each 100 ms of processing latency ≈ 1.5 m of error at race speed).
+    gicp/maxIterations: 32
 
     # Number of neighbors used to compute per-point covariances (typical: 20)
     gicp/correspondenceRandomness: 20

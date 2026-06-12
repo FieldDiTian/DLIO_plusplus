@@ -39,7 +39,7 @@ def generate_launch_description():
     # subscription -- the gate is self-contained in callbackGtOdom.
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_p1/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
-    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom')
+    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom_map')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
@@ -63,9 +63,12 @@ def generate_launch_description():
         'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(
         'gt_odom_topic', default_value=gt_odom_topic,
-        description='Ground-truth odometry topic for init / divergence cross-check / GT-recovery snap. '
-                    'Default /gps_p1/filtered_odom -- Atlas FusionEngine INS solution, '
-                    'header.frame_id="map", child_frame_id="gps_antenna_top" (matches base_frame). '
+        description='Ground-truth odometry topic for init / divergence cross-check / GT-recovery '
+                    'snap. MUST be in the map frame of the loaded PCD map. The prepped bags carry '
+                    '/gps_p1/filtered_odom in the "utm" frame; run '
+                    'gicp_localization/scripts/utm_to_map_odom.py (with the map dump\'s '
+                    'T_world_utm.txt) to produce the default /gps_p1/filtered_odom_map. '
+                    'child_frame_id is gps_antenna_top (matches base_frame). '
                     'Do NOT point this at /localization/global/odom (cg frame) without also changing '
                     'localization/base_frame to cg, or the cross-check baseline will be biased by '
                     '~0.39 m and applyInitialPose will seed the state offset by the same amount.')
@@ -85,6 +88,11 @@ def generate_launch_description():
     declare_map_path_arg = DeclareLaunchArgument(
         'map_path', default_value='',
         description='Path to PCD map file for localization (overrides localization.yaml when non-empty)')
+    declare_utm_transform_path_arg = DeclareLaunchArgument(
+        'utm_transform_path', default_value='',
+        description='Path to the GLIM dump\'s T_world_utm.txt for the map in use. '
+                    'Enables the gicp/localization/*_utm output topics '
+                    '(overrides localization.yaml when non-empty)')
 
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
 
@@ -121,6 +129,7 @@ def generate_launch_description():
     # GICP Localization Node
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
+        utm_path_value = LaunchConfiguration('utm_transform_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         params = [
             localization_yaml_path,
@@ -129,6 +138,8 @@ def generate_launch_description():
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
+        if utm_path_value:
+            params.append({'localization/utm_transform_path': utm_path_value})
 
         node = Node(
             package='gicp_localization',
@@ -189,6 +200,7 @@ def generate_launch_description():
         declare_parent_frame_arg,
         declare_child_frame_arg,
         declare_map_path_arg,
+        declare_utm_transform_path_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
         OpaqueFunction(function=make_rviz_node),

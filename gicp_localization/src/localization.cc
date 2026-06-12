@@ -2308,8 +2308,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
   Eigen::Matrix4f initial_guess = this->deskew_
-      ? Eigen::Matrix4f::Identity()
-      : (this->T_prior * T_base_lidar);
+      ? Eigen::Matrix4f(Eigen::Matrix4f::Identity())
+      : Eigen::Matrix4f(this->T_prior * T_base_lidar);
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;

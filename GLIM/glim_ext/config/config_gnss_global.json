@@ -37,10 +37,15 @@
     // (larger values) if loop closures show residual drift through
     // dropouts (the GNSS anchor at dropout exit isn't being trusted
     // enough to absorb the IMU/LiDAR drift).
+    // Raised from (1e4,1e4,1e3): with the INS-driven odometry the VGICP
+    // registration factors (thousands of correspondences per submap pair)
+    // were still able to bend the trajectory up to ~4 m away from the
+    // RTK-fixed track on feature-ambiguous sections of the Putnam runs.
+    // The rtk_fixed stream is cm-accurate, so pin the submaps hard.
     "prior_inf_scale": [
-      1e4,
-      1e4,
-      1e3
+      1e6,
+      1e6,
+      1e5
     ],
     "orientation_prior_inf_scale": [
       1e-6,
