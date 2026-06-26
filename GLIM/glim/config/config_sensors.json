@@ -69,7 +69,12 @@
     "distortion_model": "plumb_bob",
     "flip_points_y": false,
     "global_shutter_camera": true,
-    "global_shutter_lidar": true,
+    // MUST be false for the Luminar Iris (a scanning LiDAR with valid per-point
+    // timestamps). When true, the preprocessor ZEROS every per-point time and
+    // collapses scan_end_time to the frame stamp, which silently DISABLES motion
+    // deskew -- defeating the whole UINT8[8] per-point-time path above. Only set
+    // true for a genuine global-shutter sensor with no per-point times.
+    "global_shutter_lidar": false,
     "image_size": [
       752,
       480
@@ -102,6 +107,11 @@
       830.3149255906893,
       639.4531613962971
     ],
+    // NOTE: perpoint_relative_time and perpoint_time_scale are INERT while
+    // autoconf_perpoint_times=true -- TimeKeeper only reads them when autoconf is
+    // disabled. Kept as a correct manual fallback (Luminar times are absolute and
+    // already epoch-seconds, so relative=false / scale=1.0); changing them has no
+    // effect unless autoconf_perpoint_times is set false.
     "perpoint_relative_time": false,
     "perpoint_time_scale": 1.0,
     "ring_field": "line_index",

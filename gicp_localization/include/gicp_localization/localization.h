@@ -126,6 +126,8 @@ private:
   bool gtSampleIsRtkFixed(const GtSample& s) const;
 
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
+  // Sensor-frame crop box; must run BEFORE deskew (world-frame transform).
+  void cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud);
   void deskewPointcloud();
   void performLocalization();
   void publishPose();
@@ -211,6 +213,15 @@ private:
   bool concat_enabled_;
   double concat_time_threshold_;
   size_t concat_buffer_size_;
+
+  // Luminar multi-LiDAR deskew anchor. mergeAuxClouds() captures the PRIMARY
+  // scan's earliest per-point timestamp BEFORE appending aux clouds; the deskew
+  // LUMINAR branch anchors merged-sweep timing on this instead of the global
+  // merged minimum, so an aux scan that began before the primary does not shift
+  // the whole sweep late. Reset (valid=false) each scan; only set on the concat
+  // path. See deskewPointcloud().
+  uint64_t luminar_primary_min_ts_ns_ = 0;
+  bool luminar_primary_min_ts_valid_ = false;
 
   // Publishers
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;

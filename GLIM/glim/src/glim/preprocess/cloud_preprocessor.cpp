@@ -136,6 +136,20 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
   frame = gtsam_points::sample(frame, indices);
 
   if (params.global_shutter) {
+    // global_shutter treats the whole scan as captured at one instant and zeros
+    // per-point times -- this DISABLES motion deskew. Points are time-sorted
+    // above, so a nonzero span means the cloud actually carried per-point
+    // timestamps; warn once that they are being discarded, since for a scanning
+    // LiDAR (e.g. Luminar) this silently defeats the per-point-time deskew the
+    // rest of the pipeline implements.
+    static bool warned_global_shutter = false;
+    if (!warned_global_shutter && frame->size() > 1 && frame->times[frame->size() - 1] > frame->times[0]) {
+      spdlog::warn(
+        "global_shutter_lidar=true is discarding non-trivial per-point timestamps (scan span={:.6f}s); "
+        "motion deskew is DISABLED. Set global_shutter_lidar=false for a scanning LiDAR that provides per-point times.",
+        frame->times[frame->size() - 1] - frame->times[0]);
+      warned_global_shutter = true;
+    }
     std::fill(frame->times, frame->times + frame->size(), 0.0);
   }
 

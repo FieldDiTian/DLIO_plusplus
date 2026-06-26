@@ -206,13 +206,21 @@ inline void shift_cloud_timestamps(
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds
-        // (driver reconstruction of header seconds + per-ray nanoseconds;
-        // see header comment for the format and citation). Absolute
-        // timestamps -- leave untouched.
-        // Any other count is not a recognised timestamp encoding.
+        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds (driver
+        // reconstruction of header seconds + per-ray nanoseconds; see header
+        // comment). Absolute timestamps -- leave untouched. Any OTHER count is
+        // not a recognised timestamp encoding; mirror extract_raw_points()'s
+        // `count != 8` rejection by warning once rather than silently assuming
+        // Luminar (we still leave it untouched -- there is no correct shift for
+        // an unknown layout).
+        if (time_count != 8) {
+          static bool warned_uint8_count = false;
+          if (!warned_uint8_count) {
+            spdlog::warn("shift_cloud_timestamps: UINT8 time field with count={} (expected 8 for Luminar epoch-ns); leaving unshifted", time_count);
+            warned_uint8_count = true;
+          }
+        }
         (void)dt;
-        (void)time_count;
         break;
       }
       default:
@@ -238,8 +246,22 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     return primary;
   }
 
+  // Concatenation treats each cloud as a TIGHT array of point_step-sized points
+  // (it byte-appends aux data and re-counts by point_step). Reject a row-padded
+  // primary (data.size() != width*height*point_step) loudly rather than silently
+  // counting padding as points. Organized-but-tight (height>1, no padding) is
+  // fine to flatten; only padding is rejected. Luminar clouds are unorganized and
+  // tight (PCAP reader emits height=1, row_step=point_step*width).
+  if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
+    spdlog::warn("lidar_concat: primary cloud is organized/padded (data={}, width={}, height={}, step={}); skipping concat",
+                 primary->data.size(), primary->width, primary->height, point_step);
+    return primary;
+  }
+
   auto merged = std::make_shared<sensor_msgs::msg::PointCloud2>(*primary);
-  size_t total_points = primary->width * primary->height;
+  // Count points from the byte buffer (equals width*height for the tight cloud
+  // validated above) so merged width/row_step always match the appended bytes.
+  size_t total_points = primary->data.size() / point_step;
 
   for (auto& aux : aux_sensors) {
     auto match = find_nearest(aux.buffer, t_primary, time_threshold);
@@ -260,6 +282,16 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       continue;
     }
 
+    // Reject an organized/padded or otherwise non-tight aux: byte-appending it
+    // (or counting by point_step) would desync points from the field layout.
+    // Requires data.size() == width*height*point_step. Organized-but-tight is OK.
+    if ((match->data.size() % point_step) != 0 ||
+        match->data.size() != static_cast<size_t>(match->width) * match->height * point_step) {
+      spdlog::warn("lidar_concat: skipping {} — non-tight cloud (data={}, width={}, height={}, step={})",
+                   aux.topic, match->data.size(), match->width, match->height, point_step);
+      continue;
+    }
+
     std::vector<uint8_t> data(match->data.begin(), match->data.end());
     int ax, ay, az;
     if (find_xyz_offsets(*match, ax, ay, az)) {
@@ -269,17 +301,19 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     int time_off;
     uint8_t time_datatype;
     int time_count;
+    const double dt = stamp_to_sec(match->header.stamp) - t_primary;
     if (find_time_field(*match, time_off, time_datatype, time_count)) {
-      double dt = stamp_to_sec(match->header.stamp) - t_primary;
       shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt);
       spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s", aux.topic, dt);
     }
 
+    const size_t aux_pts = data.size() / point_step;
     merged->data.insert(merged->data.end(), data.begin(), data.end());
-    total_points += match->width * match->height;
+    // Accumulate the byte-derived count (matches the bytes actually appended),
+    // not width*height, so merged->width/row_step stay consistent with data.
+    total_points += aux_pts;
 
-    double dt = std::abs(stamp_to_sec(match->header.stamp) - t_primary);
-    spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, dt, match->width * match->height);
+    spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, std::abs(dt), aux_pts);
   }
 
   merged->width = total_points;

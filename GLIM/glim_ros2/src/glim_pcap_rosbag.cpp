@@ -580,10 +580,15 @@ int main(int argc, char** argv) {
       AssembledScan& s = ev.scan;
       if (s.topic == primary_points_topic) {
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
+        int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
+          // Anchor the epoch rebase on the primary scan (its points lead the
+          // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
+          // scan started before the primary.
+          epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
           final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold);
         }
-        const size_t workload = glim->points_callback(final_points);
+        const size_t workload = glim->points_callback(final_points, epoch_anchor_count);
         cnt_pcap_primary++;
         if (s.cloud->header.stamp.sec + s.cloud->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");
@@ -631,10 +636,12 @@ int main(int argc, char** argv) {
       AssembledScan& s = ev.scan;
       if (s.topic == primary_points_topic) {
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
+        int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
+          epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
           final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold);
         }
-        glim->points_callback(final_points);
+        glim->points_callback(final_points, epoch_anchor_count);
       }
     } else {
       bag_dispatch_fanout(ev);

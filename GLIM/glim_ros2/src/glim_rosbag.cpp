@@ -366,10 +366,15 @@ int main(int argc, char** argv) {
 
         // Merge auxiliary LiDAR clouds if concatenation is enabled
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = points_msg;
+        int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
+          // Anchor the epoch rebase on the primary scan (its points lead the
+          // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
+          // scan started before the primary.
+          epoch_anchor_count = static_cast<int>(points_msg->width * points_msg->height);
           final_points = glim_ros::merge_clouds(points_msg, aux_sensors, concat_time_threshold);
         }
-        const size_t workload = glim->points_callback(final_points);
+        const size_t workload = glim->points_callback(final_points, epoch_anchor_count);
 
         if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");

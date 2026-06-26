@@ -134,12 +134,14 @@
     localization/initial_pose/yaw: 2.711203   # radians (-0.289 deg)
 
     # Preprocessing Parameters (override defaults for localization)
-    # Crop box filter: keeps points within ±size meters of sensor origin (sensor frame).
-    # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in world frame,
-    # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
-    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
+    # Crop box filter: keeps points within ±size meters of the sensor origin.
+    # Applied in SENSOR frame BEFORE deskew (cropBoxFilterSensorFrame), so it is a
+    # near/far-field filter around the lidar regardless of deskew on/off. (It is
+    # NOT applied after deskew, where the cloud is world-frame and a box would clip
+    # around the map origin.)
+    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160 m cube around the sensor
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
-    dlio/preprocessing/voxelFilter/res: 0.5   # 0.3 m voxel — good balance of density vs. speed
+    dlio/preprocessing/voxelFilter/res: 0.5   # 0.5 m voxel — good balance of density vs. speed
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.

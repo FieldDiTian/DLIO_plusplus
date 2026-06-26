@@ -64,7 +64,14 @@ Eigen::Vector4d get_vec4(const void* x, const void* y, const void* z) {
   return Eigen::Vector4d(*reinterpret_cast<const T*>(x), *reinterpret_cast<const T*>(y), *reinterpret_cast<const T*>(z), 1.0);
 }
 
-static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const std::string& intensity_channel, const std::string& ring_channel) {
+// `epoch_anchor_count` (default -1 = unused) is the number of leading points that
+// belong to the PRIMARY scan in a multi-LiDAR concatenated cloud (lidar_concat
+// copies primary bytes first, so they are the first epoch_anchor_count entries). The
+// epoch-axis safeguard below anchors its rebase offset on the minimum over just
+// these primary points instead of the global merged minimum, so an aux scan that
+// began before the primary does not drag the whole merged sweep late. For a
+// single sensor it is left at -1 and the global minimum is used (unchanged).
+static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const std::string& intensity_channel, const std::string& ring_channel, int epoch_anchor_count = -1) {
   int num_points = points_msg.width * points_msg.height;
 
   int x_type = 0;
@@ -114,7 +121,7 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
     return nullptr;
   }
 
-  if ((x_type != PointField::FLOAT32 && x_type != PointField::FLOAT64) || x_type != y_type || x_type != y_type) {
+  if ((x_type != PointField::FLOAT32 && x_type != PointField::FLOAT64) || x_type != y_type || x_type != z_type) {
     spdlog::warn("unsupported points type");
     return nullptr;
   }
@@ -205,9 +212,22 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
     // s-since-scan-start). GICP needs no equivalent: it anchors deskew at
     // header.stamp and uses only relative (ts - min_ts) offsets.
     if (!raw_points->times.empty()) {
-      const auto mm = std::minmax_element(raw_points->times.begin(), raw_points->times.end());
-      const double min_time = *mm.first;
-      const double max_time = *mm.second;
+      const double max_time = *std::max_element(raw_points->times.begin(), raw_points->times.end());
+      // Anchor the rebase on the PRIMARY scan's earliest time, NOT the global
+      // merged minimum. In a multi-LiDAR concat (lidar_concat) the primary points
+      // are the first `epoch_anchor_count` entries; an aux scan that began before
+      // the primary would otherwise become the global min and map onto the header
+      // stamp, shifting the whole merged sweep late by the aux-primary offset. The
+      // offset is applied to ALL points, so aux points keep their true relative
+      // timing to the primary (and TimeKeeper can then take the genuine earliest
+      // capture time across all sensors). For a single sensor epoch_anchor_count
+      // is < 0 / >= size and this reduces to the global min (unchanged). Mirrors
+      // the GICP deskew primary anchor.
+      const size_t anchor_n =
+        (epoch_anchor_count > 0 && static_cast<size_t>(epoch_anchor_count) <= raw_points->times.size())
+          ? static_cast<size_t>(epoch_anchor_count)
+          : raw_points->times.size();
+      const double min_time = *std::min_element(raw_points->times.begin(), raw_points->times.begin() + anchor_n);
       const double header_sec = to_sec(points_msg.header.stamp);
       if (max_time >= 1.0 && std::abs(header_sec - min_time) > 1.0) {
         const double offset = header_sec - min_time;
@@ -218,9 +238,9 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         if (!warned) {
           spdlog::warn(
             "ros_cloud_converter: per-point timestamps are on a different epoch than header.stamp "
-            "(min_point={:.6f}s header={:.6f}s diff={:.3f}s); rebasing onto the header epoch "
+            "(primary_min={:.6f}s header={:.6f}s diff={:.3f}s anchor={}); rebasing onto the header epoch "
             "(intra-scan span preserved). Likely an unsynced sensor clock -- confirm PTP lock.",
-            min_time, header_sec, offset);
+            min_time, header_sec, offset, (anchor_n < raw_points->times.size() ? "primary" : "global"));
           warned = true;
         }
       }

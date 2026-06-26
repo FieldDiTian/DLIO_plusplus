@@ -115,11 +115,11 @@ This is the authoritative description; if other comments disagree, this section 
 **GICP deskew — robust by construction.** `copyPointTimeFromCloud` (LUMINAR case in `localization.cc`) stores the raw `uint64` ns; `deskewPointcloud` then computes each point's capture time as
 
 ```
-t_point = scan_stamp.seconds()  +  (ts - min_ts) * 1e-9
-          └── header anchor ──┘     └── intra-scan relative offset ──┘
+t_point = scan_stamp.seconds()  +  (ts - anchor_ts) * 1e-9
+          └── header anchor ──┘     └── intra-sweep relative offset (signed) ──┘
 ```
 
-It uses **only the relative offset within the scan, anchored at the header stamp** — it never trusts the absolute epoch of `ts`. That makes GICP deskew **correct regardless of whether the per-point clock is on the Unix/INS epoch or a sensor-local/PTP axis**. The only way it could break is a driver emitting a bare 32-bit sub-second field that wraps mid-scan; the one-second-boundary check (Procedure C) confirms that does not happen. This is why GICP needs no timestamp repair and is the more trustworthy pipeline for deskew.
+It uses **only the relative offset within the sweep, anchored at the header stamp** — it never trusts the absolute epoch of `ts`. `anchor_ts` is the **earliest timestamp of the PRIMARY scan**, captured in `mergeAuxClouds()` before any aux cloud is appended (for a single-sensor scan this is just that scan's own minimum). Anchoring on the primary — rather than the global merged minimum — keeps a multi-LiDAR sweep correctly timed when an aux scan started *before* the primary: such aux points get correctly **negative** offsets (hence the **signed** `int64` subtraction), instead of being collapsed onto the header stamp and shifting the whole sweep late. That makes GICP deskew **correct regardless of whether the per-point clock is on the Unix/INS epoch or a sensor-local/PTP axis**. The only way it could break is a driver emitting a bare 32-bit sub-second field that wraps mid-scan; the one-second-boundary check (Procedure C) confirms that does not happen. This is why GICP needs no timestamp repair and is the more trustworthy pipeline for deskew.
 
 **GLIM deskew — correct, but requires epoch alignment.** `ros_cloud_converter.hpp` reads `UINT8[8]` as little-endian `uint64` and divides by `1e9` → epoch *seconds* (~1.78e9). `TimeKeeper::replace_points_stamp` then sees `max_time ≥ 1.0`, takes the *absolute → relative* branch, and (with `prefer_frame_time=false`) **overwrites the frame stamp with the first point time** while making per-point times relative; `point_time_scale` stays `1.0`. Because GLIM *trusts the absolute point-time epoch*, that epoch must match the IMU/header epoch. Raw bags were observed with point times on the sensor/PTP axis (~2e13 ns) while the header/IMU were on the ROS/INS epoch — GLIM then overwrote the frame stamp with a sensor-clock value and dropped every scan as unsynchronized. Two complementary repairs close this:
 
@@ -134,7 +134,7 @@ GICP requires neither because of the header-anchored relative-offset design abov
 
 | `localization/sensor_type` | Field encodings handled | Notes |
 |---|---|---|
-| `luminar` | `UINT8[8]` (uint64 epoch ns; validated default — field `timestamp`, offset 0, point_step 56), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper), `UINT32` (32-bit ns) | Iris PTP-synced output, reconstructed to full epoch ns by the driver (see the definitive account above). The validated default is `UINT8[8]`; the others cover driver-version variants. |
+| `luminar` | `UINT8[8]` (uint64 epoch ns; validated default — field `timestamp`, offset 0, point_step 56), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper) | Iris PTP-synced output, reconstructed to full epoch ns by the driver (see the definitive account above). Only these two **8-byte absolute-epoch** carriers are accepted; `UINT32` is **intentionally rejected** — 32 bits cannot hold an absolute epoch (it wraps every ~4.29 s), so it would be a scan-relative counter the absolute path would misread. A `UINT32` Luminar therefore degrades to no per-point time (rigid transform) rather than corrupting deskew. |
 | `ouster` | `UINT32`, `FLOAT32`, `FLOAT64` (all scan-relative ns or s) | Standard Ouster ROS driver layouts. |
 | `velodyne` | `FLOAT32`, `UINT32` (scan-relative s or ns) | VLP-16/32 and similar. |
 | `hesai` | `FLOAT64`, `FLOAT32` (absolute or relative seconds) | Pandar / XT line. |

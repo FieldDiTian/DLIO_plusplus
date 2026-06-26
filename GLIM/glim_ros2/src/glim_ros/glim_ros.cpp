@@ -374,25 +374,30 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
   // -> luminar_front frame), then hand the result to the estimator. The mutex
   // guards the aux buffers, which merge_clouds() reads via find_nearest().
   if (aux_concat.enabled && !aux_concat.aux_sensors.empty()) {
+    // Primary point count BEFORE merge: lidar_concat appends aux bytes after the
+    // primary, so these are the first points in the merged cloud. Pass it as the
+    // epoch-rebase anchor so a multi-LiDAR sweep is not shifted late when an aux
+    // scan started before the primary.
+    const int primary_count = static_cast<int>(msg->width * msg->height);
     sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
     {
       std::lock_guard<std::mutex> lock(aux_buffers_mutex);
       merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold);
     }
-    points_callback(merged);
+    points_callback(merged, primary_count);
   } else {
     points_callback(msg);
   }
 }
 
-size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
   }
 
-  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field);
+  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count);
   if (raw_points == nullptr) {
     spdlog::warn("failed to extract points from message");
     return 0;

@@ -39,7 +39,11 @@ public:
 #ifdef BUILD_WITH_CV_BRIDGE
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg);
 #endif
-  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  // `epoch_anchor_count` (-1 = single sensor / unused) is the primary scan's
+  // point count in a concatenated multi-LiDAR cloud; forwarded to
+  // extract_raw_points() so the epoch-axis rebase anchors on the primary scan's
+  // earliest time rather than the global merged minimum. See points_callback_live().
+  size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count = -1);
   void external_odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
 
   // Live subscription entry point for the primary LiDAR. Merges any buffered

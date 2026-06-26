@@ -430,25 +430,47 @@ inline void clearPointTimeUnion(PointType& pt) {
   std::memcpy(&pt.timestamp, &zero, sizeof(uint64_t));
 }
 
+// Decode a Luminar per-point ABSOLUTE epoch timestamp (uint64 ns) directly from
+// PointCloud2 bytes. Single source of truth for which Luminar time encodings are
+// accepted, shared by copyPointTimeFromCloud() (the per-point reader) and the
+// multi-LiDAR deskew anchor capture in mergeAuxClouds(), so the two can never
+// diverge on accepted formats. Returns false for an unsupported datatype.
+//   * UINT8[8] / FLOAT64 -> raw uint64 epoch ns (8 bytes, little-endian)
+//
+// Only 8-byte carriers are accepted because the whole Luminar path treats these
+// times as ABSOLUTE epoch ns: mergeAuxClouds() leaves them unshifted and
+// deskewPointcloud() anchors on (ts - primary_min). A 32-bit field (UINT32)
+// cannot hold an absolute epoch (it wraps every ~4.29 s) -- it would be a
+// scan-relative counter, which this absolute path would silently misinterpret
+// (dropping the inter-scan offset between aux and primary). So UINT32 is
+// intentionally REJECTED here: a Luminar driver emitting UINT32 is unsupported
+// and degrades to "no per-point time" (rigid transform) rather than corrupting
+// deskew. `bytes_avail` (the field's room within point_step) guards the 8-byte
+// read against a malformed/short time field.
+inline bool luminarRawTimestampNsFromBytes(const uint8_t* tp, uint8_t datatype, int count, size_t bytes_avail, uint64_t& out) {
+  if ((datatype == sensor_msgs::msg::PointField::FLOAT64 ||
+       (datatype == sensor_msgs::msg::PointField::UINT8 && count == 8)) &&
+      bytes_avail >= sizeof(uint64_t)) {
+    std::memcpy(&out, tp, sizeof(uint64_t));
+    return true;
+  }
+  return false;
+}
+
 // Copy per-point time from PointCloud2 into the dlio::Point union for the configured sensor.
+// `point_step` bounds the field read so a malformed/short time field cannot read past the point.
 void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datatype, int time_count,
-                           dlio::SensorType sensor, PointType& dst) {
-  if (time_off < 0) {
+                           uint32_t point_step, dlio::SensorType sensor, PointType& dst) {
+  if (time_off < 0 || static_cast<uint32_t>(time_off) >= point_step) {
     return;
   }
   const uint8_t* tp = src + time_off;
+  const size_t bytes_avail = point_step - static_cast<uint32_t>(time_off);
 
   switch (sensor) {
     case dlio::SensorType::LUMINAR: {
       uint64_t ts_raw = 0;
-      if (time_datatype == sensor_msgs::msg::PointField::FLOAT64 ||
-          (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8)) {
-        std::memcpy(&ts_raw, tp, sizeof(uint64_t));
-      } else if (time_datatype == sensor_msgs::msg::PointField::UINT32) {
-        uint32_t ts_ns32 = 0;
-        std::memcpy(&ts_ns32, tp, sizeof(uint32_t));
-        ts_raw = static_cast<uint64_t>(ts_ns32);
-      } else {
+      if (!luminarRawTimestampNsFromBytes(tp, time_datatype, time_count, bytes_avail, ts_raw)) {
         return;
       }
       std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
@@ -861,13 +883,13 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       }
       RCLCPP_FATAL(this->get_logger(),
                    "IMU topic hard guard triggered: resolved topic '%s' is not in allowlist [%s]. "
-                   "Expected fused NovAtel IMU path.",
+                   "Expected the fused Point One (Atlas) INS IMU path.",
                    resolved_imu_topic.c_str(), oss.str().c_str());
       throw std::runtime_error("IMU topic hard guard mismatch");
     }
   }
   RCLCPP_INFO(this->get_logger(),
-              "IMU input topic: %s (expect NovAtel INS IMU, frame='%s', strict_frame_match=%s)",
+              "IMU input topic: %s (expect Point One (Atlas) INS IMU, frame='%s', strict_frame_match=%s)",
               resolved_imu_topic.c_str(),
               this->imu_frame.c_str(),
               this->imu_require_frame_match_ ? "true" : "false");
@@ -1334,7 +1356,7 @@ void gicp_localization::LocalizationNode::getParams() {
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
   // Geometric Observer parameters. Position/orientation gains stay active, but
-  // online IMU bias adaptation defaults off for the fused NovAtel INS path; the
+  // online IMU bias adaptation defaults off for the fused Point One (Atlas) INS path; the
   // initial RTK/stationary calibration still seeds state.b once before
   // propagation.
   this->declare_parameter<double>("odom/geo/Kp", 4.5);
@@ -1841,7 +1863,7 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
       dst.intensity = read_intensity(src);
       clearPointTimeUnion(dst);
       if (has_time_field) {
-        copyPointTimeFromCloud(src, time_off, time_datatype, time_count, this->sensor, dst);
+        copyPointTimeFromCloud(src, time_off, time_datatype, time_count, point_step, this->sensor, dst);
       }
     }
   };
@@ -1905,6 +1927,15 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
                         ? this->scan_stamp.seconds() - this->prev_scan_stamp
                         : 0.0;
 
+  // Crop box filter in SENSOR frame, BEFORE deskew. deskewPointcloud()
+  // transforms points into the world frame, so cropping afterward (in
+  // preprocessPointCloud) would clip a box centered on the MAP ORIGIN, deleting
+  // the whole scan once the vehicle is more than crop_size_ from the origin. A
+  // crop box is inherently a sensor-relative near/far-field filter, so it must
+  // run here on the raw lidar-frame cloud. This also covers the deskew-fallback
+  // paths (which leave the scan in sensor frame).
+  this->cropBoxFilterSensorFrame(this->original_scan);
+
   // Deskew using IMU
   this->deskewPointcloud();
 
@@ -1965,7 +1996,42 @@ sensor_msgs::msg::PointCloud2::ConstSharedPtr
 gicp_localization::LocalizationNode::mergeAuxClouds(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
 
+  this->luminar_primary_min_ts_valid_ = false;
   if (this->aux_lidars_.empty()) return primary;
+
+  // Capture the PRIMARY scan's earliest per-point timestamp BEFORE appending any
+  // aux cloud. deskewPointcloud() anchors Luminar merged-cloud timing on this --
+  // NOT on the global merged minimum. An aux scan that began before the primary
+  // carries smaller absolute epoch timestamps; anchoring at the global min would
+  // map that aux point to the primary header stamp and deskew the entire merged
+  // sweep late (a real motion-prior/deskew bias at AV speeds).
+  if (this->sensor == dlio::SensorType::LUMINAR) {
+    int p_t_off;
+    uint8_t p_t_dt;
+    int p_t_cnt;
+    if (findTimeField(*primary, p_t_off, p_t_dt, p_t_cnt) && p_t_off >= 0 &&
+        static_cast<uint32_t>(p_t_off) < primary->point_step) {
+      const size_t n_primary = static_cast<size_t>(primary->width) * primary->height;
+      const size_t bytes_avail = primary->point_step - static_cast<uint32_t>(p_t_off);
+      uint64_t pmin = std::numeric_limits<uint64_t>::max();
+      bool any = false;
+      for (size_t i = 0; i < n_primary; i++) {
+        // Decode via the shared helper so the anchor matches the per-point reader
+        // (copyPointTimeFromCloud) on the accepted absolute encodings (UINT8[8] /
+        // FLOAT64). bytes_avail guards the 8-byte read against a short field.
+        uint64_t ts = 0;
+        if (luminarRawTimestampNsFromBytes(primary->data.data() + i * primary->point_step + p_t_off, p_t_dt, p_t_cnt,
+                                           bytes_avail, ts)) {
+          pmin = std::min(pmin, ts);
+          any = true;
+        }
+      }
+      if (any) {
+        this->luminar_primary_min_ts_ns_ = pmin;
+        this->luminar_primary_min_ts_valid_ = true;
+      }
+    }
+  }
 
   const double t_primary = rclcpp::Time(primary->header.stamp).seconds();
   const uint32_t point_step = primary->point_step;
@@ -1979,9 +2045,26 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     return primary;
   }
 
+  // Concatenation treats each cloud as a TIGHT array of point_step-sized points
+  // (it byte-appends aux data and re-counts by point_step). A row-padded cloud
+  // (row_step > width*point_step, i.e. data.size() != width*height*point_step)
+  // would make the byte-count include padding. Organized-but-tight (height>1, no
+  // padding) is fine to flatten; only padding is rejected. Reject the primary
+  // loudly rather than silently miscounting -- Luminar clouds are unorganized and
+  // tight (PCAP reader emits height=1, row_step=point_step*width).
+  if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "lidar_concat: primary cloud is organized/padded (data=%zu, width=%u, height=%u, step=%u); "
+                         "skipping concat (only tight clouds can be byte-appended)",
+                         primary->data.size(), primary->width, primary->height, point_step);
+    return primary;
+  }
+
   // Start the merged cloud as a copy of the primary; we'll append aux bytes.
   auto merged = std::make_shared<sensor_msgs::msg::PointCloud2>(*primary);
-  size_t total_points = static_cast<size_t>(primary->width) * primary->height;
+  // Count points from the byte buffer (equals width*height for the tight cloud
+  // validated above) so merged width/row_step always match the appended bytes.
+  size_t total_points = primary->data.size() / point_step;
   size_t merged_aux_count = 0;
 
   // Reserve once for primary + all aux clouds (assuming roughly equal sizes).
@@ -2055,6 +2138,17 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     // timestamps in place over the just-appended region. No intermediate copy.
     // If validation fails after the append, roll back the resize so a malformed
     // aux scan can't leak into the merged cloud in its own (un-transformed) frame.
+    // Reject an organized/padded or otherwise non-tight aux: byte-appending it
+    // (or counting by point_step) would desync points from the field layout.
+    // Requires data.size() == width*height*point_step (subsumes the multiple-of-
+    // point_step check). Organized-but-tight is acceptable; only padding fails.
+    if ((match->data.size() % point_step) != 0 ||
+        match->data.size() != static_cast<size_t>(match->width) * match->height * point_step) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "lidar_concat: skipping '%s' — non-tight cloud (data=%zu, width=%u, height=%u, step=%u)",
+                           aux.topic.c_str(), match->data.size(), match->width, match->height, point_step);
+      continue;
+    }
     const size_t old_size = merged->data.size();
     merged->data.insert(merged->data.end(), match->data.begin(), match->data.end());
     uint8_t* appended = merged->data.data() + old_size;
@@ -2091,7 +2185,9 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       continue;
     }
 
-    total_points += static_cast<size_t>(match->width) * match->height;
+    // Accumulate the byte-derived count (matches the bytes actually appended),
+    // not width*height, so merged->width/row_step stay consistent with data.
+    total_points += aux_pts;
     ++merged_aux_count;
   }
 
@@ -2176,24 +2272,42 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     // Per-point value is absolute PTP epoch ns (driver reconstruction of the
     // packet-header 48-bit seconds + per-ray 32-bit sub-second nanoseconds;
     // see Luminar Iris Data Output Specification v1.3.0 §2.1 and §2.2/§2.6.3).
-    // We deskew on the relative offset (ts - min_ts) anchored at the header
+    // We deskew on the relative offset (ts - anchor) anchored at the header
     // stamp, so the absolute epoch reference cancels. NOTE: this relies on the
     // driver supplying full epoch ns; a bare 32-bit ns field (sub-second, wraps
-    // every 1 s) would make (ts - min_ts) jump across a second boundary and
+    // every 1 s) would make (ts - anchor) jump across a second boundary and
     // corrupt deskew for scans that straddle the rollover.
-    uint64_t min_ts = std::numeric_limits<uint64_t>::max();
-    for (const auto& pt : this->original_scan->points) {
-      min_ts = std::min(min_ts, luminarPointTimestampNs(pt));
+    //
+    // ANCHOR: for a multi-LiDAR merged sweep, anchor on the PRIMARY scan's first
+    // timestamp (captured in mergeAuxClouds() BEFORE aux append), NOT the global
+    // merged minimum. An aux scan that began before the primary carries smaller
+    // epoch timestamps; anchoring at the global min would map that aux point to
+    // the header stamp (sweep_ref_time) and shift the entire merged sweep late.
+    // Aux points earlier than the primary anchor therefore get correctly NEGATIVE
+    // offsets -- which requires SIGNED subtraction below (uint64 underflow
+    // otherwise). For the single-primary path we fall back to the global min,
+    // which equals the primary min, so behavior is unchanged.
+    uint64_t anchor_ts;
+    if (this->luminar_primary_min_ts_valid_) {
+      anchor_ts = this->luminar_primary_min_ts_ns_;
+    } else {
+      anchor_ts = std::numeric_limits<uint64_t>::max();
+      for (const auto& pt : this->original_scan->points) {
+        anchor_ts = std::min(anchor_ts, luminarPointTimestampNs(pt));
+      }
     }
-    const uint64_t min_ts_captured = min_ts;
+    const uint64_t min_ts_captured = anchor_ts;
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "Luminar scan: min_ts=%lu ns, sweep_ref=%.3f s", min_ts_captured, sweep_ref_time);
+                         "Luminar scan: anchor_ts=%lu ns (%s), sweep_ref=%.3f s", min_ts_captured,
+                         this->luminar_primary_min_ts_valid_ ? "primary" : "global", sweep_ref_time);
     point_time_cmp = [](const PointType& p1, const PointType& p2) {
       return luminarPointTimestampNs(p1) < luminarPointTimestampNs(p2);
     };
     extract_point_time_from_point = [&sweep_ref_time, min_ts_captured](const PointType& pt) {
       const uint64_t ts = luminarPointTimestampNs(pt);
-      return sweep_ref_time + static_cast<double>(ts - min_ts_captured) * 1e-9;
+      // Signed difference: aux points earlier than the primary anchor are valid
+      // and must produce negative offsets (epoch ns fits in int64_t).
+      return sweep_ref_time + static_cast<double>(static_cast<int64_t>(ts) - static_cast<int64_t>(min_ts_captured)) * 1e-9;
     };
     deskew_time_ready = true;
   }
@@ -2234,6 +2348,17 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     RCLCPP_WARN(this->get_logger(), "No timestamps extracted from point cloud, skipping deskewing");
     this->current_scan = this->original_scan;
     return;
+  }
+
+  // A Luminar sweep that collapses to a single unique timestamp means every point
+  // shares one time, so deskew degenerates to a rigid transform (no motion
+  // compensation). This is the symptom of a wrong per-point time encoding (e.g.
+  // global_shutter/collapsed times) -- warn so the operator can fix the source.
+  if (this->sensor == dlio::SensorType::LUMINAR && this->deskew_ && timestamps.size() == 1) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Luminar deskew collapsed to a single timestamp (%zu points share one time); "
+                         "deskew reduced to a rigid transform. Check the per-point time encoding.",
+                         deskewed_scan_->points.size());
   }
 
   int median_pt_index = timestamps.size() / 2;
@@ -2341,19 +2466,32 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   this->prev_scan_stamp = this->scan_stamp.seconds();
 }
 
-void gicp_localization::LocalizationNode::preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud) {
-
-  size_t original_size = cloud->points.size();
-
-  // Crop box filter
+// Sensor-frame crop box. Applied to the raw lidar-frame cloud BEFORE deskew (see
+// the call site in the scan handler). The box is axis-aligned ±crop_size_ around
+// the lidar origin -- a near/far-field filter. It must NOT run after deskew,
+// where points are in the world frame and the box would be centered on the map
+// origin (clipping the whole scan far from origin).
+void gicp_localization::LocalizationNode::cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud) {
+  if (!cloud || cloud->points.empty()) return;
   if (this->crop_size_ > 0.0 && this->crop_size_ < 1000.0) {  // Only apply if reasonable size
+    const size_t original_size = cloud->points.size();
     pcl::CropBox<PointType> crop;
     crop.setMin(Eigen::Vector4f(-this->crop_size_, -this->crop_size_, -this->crop_size_, 1.0));
     crop.setMax(Eigen::Vector4f(this->crop_size_, this->crop_size_, this->crop_size_, 1.0));
     crop.setInputCloud(cloud);
     crop.filter(*cloud);
-    RCLCPP_DEBUG(this->get_logger(), "Crop box filter: %lu -> %lu points", original_size, cloud->points.size());
+    RCLCPP_DEBUG(this->get_logger(), "Crop box (sensor frame): %lu -> %lu points", original_size, cloud->points.size());
   }
+}
+
+void gicp_localization::LocalizationNode::preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud) {
+
+  size_t original_size = cloud->points.size();
+  (void)original_size;
+
+  // NOTE: the crop box is intentionally NOT applied here. After deskew the cloud
+  // is in the world frame, so an origin-centered box would clip the scan far from
+  // the map origin. Cropping happens in cropBoxFilterSensorFrame() before deskew.
 
   // Voxel filter
   if (this->vf_use_) {
@@ -4377,7 +4515,7 @@ void gicp_localization::LocalizationNode::updateState() {
   err_body = qhat.conjugate()._transformVector(err);
 
   // Optional online bias adaptation. Keep disabled by default for fused
-  // NovAtel INS input so GICP residuals do not chase drift by rewriting the
+  // Point One (Atlas) INS input so GICP residuals do not chase drift by rewriting the
   // trusted IMU bias estimate. Setting Kab/Kgb > 0 restores the upstream DLIO
   // adaptive observer behavior.
   if (this->geo_Kab_ > 0.0) {
