@@ -11,7 +11,20 @@
     "gnss_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
-    "enable_orientation_prior": false,
+    // Atlas attitude (dual-antenna HEADING) prior on each submap. Position
+    // anchoring (prior_inf_scale) pins WHERE a submap is, but not its yaw --
+    // the Atlas dual-antenna heading is a drift-free reference that LiDAR+IMU
+    // odometry lacks (slow yaw drift on feature-poor straights). With
+    // orientation_prior_inf_scale = [1e-6, 1e-6, 1e2] this constrains YAW only
+    // (~5.7 deg sigma) and leaves roll/pitch to gravity/LiDAR. This supersedes
+    // porting a separate INS attitude module -- it is the same PoseRotationPrior
+    // on X(submap), reusing the already-correct T_world_utm mapping and the
+    // lever-arm handling below. VALIDATE the yaw convention on a real bag before
+    // tightening the yaw precision (a wrong sign would twist the map; the loose
+    // default is safe). NOTE: this fires only on RTK-FIXED samples (the
+    // gnss_topic is the FIXED-filtered stream) -- see README for the FLOAT
+    // extension if you also want heading held through RTK-FLOAT dropouts.
+    "enable_orientation_prior": true,
     // Precisions (1/variance per axis) consumed by
     // gtsam::noiseModel::Diagonal::Precisions().  Reminder: precision is
     // information, NOT sigma -- higher = tighter constraint.  Equivalent

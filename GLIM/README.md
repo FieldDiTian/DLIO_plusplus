@@ -13,12 +13,53 @@ This directory is the GLIM workspace inside the [`augcog/DLIO_plusplus`](https:/
 
 ### Differences From Upstream GLIM
 
-- This fork keeps `glim`, `glim_ext`, and `glim_ros2` together inside the parent `DLIO_plusplus` monorepo instead of as separate sibling repositories.
-- `glim` includes optional `flip_points_y` preprocessing support for mirrored LiDAR clouds.
-- `glim` includes packed LiDAR per-point timestamp parsing support for `UINT8[8]` timestamp fields (the Luminar Iris layout).
-- `glim_ext` includes the GNSS-related modules and configs from the synced `glim_ws` copy.
-- `glim_ext` preserves export of the recovered GNSS-to-map SE(3) transform as `T_world_utm.txt` when GNSS alignment is initialized.
-- ROS2 and configuration defaults in this fork are sized for the Atlas dual-antenna INS and the AV-24 vehicle — covariance gates, GNSS prior precisions, IMU noise, and the LiDAR-IMU extrinsic all assume that specific stack.
+Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v1.2.1** (already carries upstream fixes #221, #234, #266, #275, #293 — no porting needed). The checked-in configs/source are authoritative; do not assume upstream defaults. Paths are relative to `GLIM/`.
+
+**Packaging**
+
+- `glim`, `glim_ext`, `glim_ros2` are vendored together in the `DLIO_plusplus` monorepo (not sibling repos, not git submodules). Upstream `glim_ext`'s ScanContext / DBoW / ORB-SLAM3 third-party submodules are intentionally absent (none enabled).
+
+**Sensor & platform adaptation — Point One Atlas LG69T + Luminar Iris, AV-24**
+
+- `glim/config/config_sensors.json`, `config_ros.json`: LiDAR-IMU extrinsic, topics (`/gps_p1/imu`, `/luminar_front/points`), `intensity_field=reflectance`, Atlas-tuned IMU noise (deliberately conservative vs measured stationary noise — see *Key Parameters*). Frame IDs / `acc_scale` auto-detected.
+- `glim/include/glim/util/ros_cloud_converter.hpp`: optional `flip_points_y` for mirrored clouds.
+
+**Luminar per-point timestamps & deskew** — `ros_cloud_converter.hpp`, `config_sensors.json`
+
+- Decode the Luminar `UINT8[8]` little-endian uint64 **epoch-nanosecond** per-point time field (`/1e9` → epoch seconds). Upstream handles only `UINT32`/`FLOAT32`/`FLOAT64` and would drop these scans as "unsupported time type".
+- **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), rebase them onto the header epoch (intra-scan span preserved) so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. Generalizes `scripts/prep_bag.py`'s offline repair to the live path; no-op on already-aligned or scan-relative data.
+- Full rationale + validation: root `README.md` → "Luminar Iris per-point timestamps — the definitive account".
+
+**Multi-LiDAR concatenation** — `glim_ros2/include/glim_ros/lidar_concat.hpp`, `glim_ros2/src/glim_ros/glim_ros.cpp`
+
+- Merge front+left+right Luminars into the primary `luminar_front` frame. UINT8[8] absolute times are left unshifted; scan-relative encodings are shifted by inter-scan `dt`.
+- **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
+- Live wiring: the live node subscribes to the aux topics, buffers them, and merges on primary-cloud arrival (`points_callback_live`), matching the offline `glim_rosbag` / `glim_pcap_rosbag` merge path.
+
+**GNSS / RTK global anchoring** — `glim_ext/modules/mapping/gnss_global`, `config_gnss_global.json`, `config.json`
+
+- INS-tolerant design: LiDAR+IMU (`libodometry_estimation_gpu.so`) is the *primary* trajectory; `libgnss_global.so` adds RTK-FIXED **position-prior** factors to the iSAM2 graph. The INS-driven `config_odometry_ins.json` path (which pauses on RTK loss) is left in tree but not selected.
+- RTK-FIXED-only gating via the `gicp_localization/scripts/rtk_fixed_odom_filter.py` pre-filter; factors go silent during dropouts and re-anchor on reacquisition (iSAM2 retroactively smooths the gap).
+- **Atlas dual-antenna heading prior**: `enable_orientation_prior=true`, `orientation_prior_inf_scale=[1e-6,1e-6,1e2]` → a **yaw-only** `PoseRotationPrior` per submap (roll/pitch left free), pinning heading the position prior can't. Lever-arm compensation disabled (Atlas firmware already projects to the antenna phase centre). *Validate the yaw convention before tightening.*
+- `T_world_utm.txt` export of the odom→UTM SE(3) transform for downstream GICP localization / post-processing.
+
+**Mapping / optimization — offline whole-track refinement** — `config_global_mapping_gpu.json`
+
+- Loop closure **enabled** (`max_implicit_loop_distance: 200`, was `0` = off), `min_implicit_loop_overlap: 0.1`, `create_between_factors: true`, tighter `isam2_relinearize_thresh: 0.01`; all submaps retained at full density. Tuned for offline full-graph forward/backward refinement over the entire track (lap-over-lap closure on a closed circuit).
+
+**Offline-only operation** — `config_ros.json`, `glim_ros.cpp`, `glim_rosnode.cpp`
+
+- `enable_online_mapping: false` (default): the constructor creates **no** live subscriptions or wall timer, and `glim_rosnode` refuses to run with a message pointing at the offline tools. Maps are built only via `glim_rosbag` / `glim_pcap_rosbag` (which feed the callbacks directly). Flip the flag to restore the legacy live path.
+
+**Robustness** — `glim_ros.cpp`
+
+- Multi-stage bag-playback throttle: `points_callback` returns `max(odom, sub_mapping, global_mapping)` workload so playback waits on the slowest stage, preventing sub/global-mapping input queues from growing unbounded and OOMing.
+- `cv_bridge::toCvCopy` wrapped in try/catch — malformed image frames are dropped, not fatal.
+
+**Tooling**
+
+- `glim_ros2/src/iris_pcap_reader.cpp` + `scripts/merge_luminar_pcap.py`: raw Luminar PCAP → merged `PointCloud2` ingestion (`glim_pcap_rosbag`), byte-identical layout between the C++ and Python paths.
+- `glim_ros2/src/glim_dump_to_pcd.cpp`: headless GLIM dump → PCD exporter.
 
 ### Key Features
 
@@ -508,14 +549,7 @@ See individual package directories for full license texts.
 
 ## Modifications
 
-This fork includes:
-- **Point One Atlas dual-antenna RTK-INS integration** — all GNSS/RTK/IMU input from `/gps_p1/*`, both IMU and pose projected to `gps_antenna_top` by Atlas firmware (no software lever-arm needed).
-- **RTK-FIXED-only covariance gate** — `gicp_localization/scripts/rtk_fixed_odom_filter.py` pre-filters Atlas's `/gps_p1/filtered_odom` to admit only FIXED-integer quality before feeding GLIM's GNSS factor source.
-- **GNSS-denied terrain continuity** — LiDAR+IMU odometry (`libodometry_estimation_gpu.so`) runs continuously; GNSS factors are sparse and optional. Mapping never pauses or develops holes; iSAM2 retroactively smooths trajectory through dropouts once RTK reacquires.
-- **Atlas-derived precision tuning** — `prior_inf_scale`, `imu_*_noise`, and `fix_imu_bias` are all sized against the measured noise envelope of Atlas RTK-FIXED on AV-24 (see *Key Parameters* above).
-- Automatic SE(3) transformation saving (`T_world_utm.txt`).
-- GNSS module fixes for ROS2 compatibility.
-- Enhanced logging for debugging RTK transitions and dropout/recovery behaviour.
+The complete, reviewer-oriented list of every functional change from upstream koide3 GLIM is in **[Differences From Upstream GLIM](#differences-from-upstream-glim)** above (grouped by area, with file pointers). In brief, this fork adds: Atlas dual-antenna RTK-INS integration, Luminar Iris `UINT8[8]` timestamp decode + epoch-axis safeguard, multi-LiDAR concatenation with schema-equality validation, RTK-FIXED position + dual-antenna heading anchoring (INS-tolerant, never stalls on GNSS loss), offline-only operation, whole-track loop-closure/optimization tuning, playback-throttle and image-decode hardening, and the PCAP / dump-to-PCD tooling. `T_world_utm.txt` SE(3) export and Atlas-derived precision tuning are preserved.
 
 ## Citation
 
