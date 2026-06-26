@@ -168,6 +168,20 @@ public:
     }
   }
 
+  // Report pending work so GlimROS::save() drains us before the final global
+  // optimize. The backend produces position/heading factors on its own thread
+  // and delivers them only through on_smoother_update(); if save() ran while we
+  // still had undelivered factors they would never reach the serialized graph.
+  // We are NOT done while: a batch is mid-process (processing_); submaps or GNSS
+  // are still queued for us (input_*_queue -- the latter closes the bag-EOF race
+  // where the GNSS that brackets the last submap hasn't been drained yet); or a
+  // submap in our local queue is still bracketable by available GNSS
+  // (pending_associable_). Un-bracketable trailing submaps are excluded so we
+  // don't block save() on factors that can never be produced.
+  virtual bool needs_wait() const override {
+    return processing_ || !input_submap_queue.empty() || !input_gnss_queue.empty() || pending_associable_;
+  }
+
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
     if (gnss_msg_type == "nav_msgs/msg/Odometry") {
       const auto sub = std::make_shared<TopicSubscription<Odometry>>(gnss_topic, gnss_msg_type, [this](const OdometryConstPtr msg) { gnss_callback(msg); });
@@ -209,17 +223,30 @@ public:
     std::deque<SubMap::ConstPtr> submap_queue;
 
     while (!kill_switch) {
+      // Bound the loop rate so re-attempting association on every GNSS arrival
+      // (below) cannot busy-spin while a submap waits to be bracketed.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
       // Convert GeoPoint(lat/lon) to UTM
       const auto gnss_data = input_gnss_queue.get_all_and_clear();
       utm_queue.insert(utm_queue.end(), gnss_data.begin(), gnss_data.end());
 
-      // Add new submaps
+      // Add new submaps to the local queue.
       const auto new_submaps = input_submap_queue.get_all_and_clear();
-      if (new_submaps.empty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
+
+      // Attempt association whenever there is a pending submap AND something new
+      // arrived this cycle: new submaps to place, OR new GNSS that may have just
+      // bracketed a submap already waiting in submap_queue. The old code skipped
+      // the pass whenever new_submaps was empty, which stranded the last submap
+      // at bag EOF -- its bracketing GNSS arrives with no accompanying submap.
+      if (submap_queue.empty() || (gnss_data.empty() && new_submaps.empty())) {
+        pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
+                              submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
+        processing_ = false;
         continue;
       }
-      submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
+      processing_ = true;  // busy until this batch is associated + factored
 
       // Remove submaps that are created earlier than the oldest GNSS data
       while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front().stamp) {
@@ -294,28 +321,46 @@ public:
         transformation_initialized = true;
       }
 
-      // Add GNSS prior factors
+      // Add GNSS prior factors for EVERY associated submap that doesn't have
+      // them yet, not just submaps.back(). The association loop above banks all
+      // eligible submaps (offline replay associates many per cycle), and the
+      // whole backlog accumulated before T_world_utm initialized is still
+      // unfactored at the moment it does. Emitting only for .back() silently
+      // skips position + yaw priors for all but the newest submap in a batch
+      // (including most pre-baseline submaps). Backfill from the cursor instead.
       if (transformation_initialized) {
-        const GNSSData& gnss = submap_coords.back();
-        const Eigen::Vector3d xyz = T_world_utm * gnss.position;
-        logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
+        for (size_t i = factored_submap_count; i < submaps.size(); i++) {
+          const GNSSData& gnss = submap_coords[i];
+          const auto& submap = submaps[i];
+          const Eigen::Vector3d xyz = T_world_utm * gnss.position;
+          logger->debug("submap={} gnss={}", convert_to_string(submap->T_world_origin.translation().eval()), convert_to_string(xyz));
 
-        const auto& submap = submaps.back();
-        // note: should use a more accurate information matrix
-        const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
-        gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
-        output_factors.push_back(factor);
+          // note: should use a more accurate information matrix
+          const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
+          output_factors.push_back(
+            gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model)));
 
-        if (enable_orientation_prior && gnss.has_orientation) {
-          const Eigen::Matrix3d R_world_gnss = T_world_utm.linear() * gnss.orientation.toRotationMatrix();
-          const auto rotation_model = gtsam::noiseModel::Diagonal::Precisions(orientation_prior_inf_scale);
-          gtsam::NonlinearFactor::shared_ptr rotation_factor(new gtsam::PoseRotationPrior<gtsam::Pose3>(X(submap->id), gtsam::Rot3(R_world_gnss), rotation_model));
-          output_factors.push_back(rotation_factor);
-        } else if (enable_orientation_prior && !warned_missing_orientation) {
-          logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
-          warned_missing_orientation = true;
+          if (enable_orientation_prior && gnss.has_orientation) {
+            const Eigen::Matrix3d R_world_gnss = T_world_utm.linear() * gnss.orientation.toRotationMatrix();
+            const auto rotation_model = gtsam::noiseModel::Diagonal::Precisions(orientation_prior_inf_scale);
+            output_factors.push_back(
+              gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseRotationPrior<gtsam::Pose3>(X(submap->id), gtsam::Rot3(R_world_gnss), rotation_model)));
+          } else if (enable_orientation_prior && !warned_missing_orientation) {
+            logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
+            warned_missing_orientation = true;
+          }
         }
+        factored_submap_count = submaps.size();
       }
+
+      // Pending state for needs_wait(): an associable submap still remains while
+      // the front of submap_queue has a GNSS sample after it (so it can be
+      // bracketed/interpolated). Trailing submaps with NO GNSS after them are
+      // genuinely un-factorable, so they are NOT counted -- save() must not block
+      // waiting on them.
+      pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
+                            submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
+      processing_ = false;
     }
   }
 
@@ -396,6 +441,13 @@ private:
   }
 
   std::atomic_bool kill_switch;
+  // True while the backend is actively associating/factoring a batch of submaps.
+  std::atomic_bool processing_{false};
+  // True while a submap waiting in the backend's local submap_queue can still be
+  // bracketed by available GNSS (i.e. its prior factors are not yet produced).
+  // Lets needs_wait() block save() until that submap is factored, without
+  // blocking on un-bracketable trailing submaps.
+  std::atomic_bool pending_associable_{false};
   std::thread thread;
 
   ConcurrentVector<GNSSData, Eigen::aligned_allocator<GNSSData>> input_gnss_queue;
@@ -404,6 +456,11 @@ private:
 
   std::vector<SubMap::ConstPtr> submaps;
   std::vector<GNSSData, Eigen::aligned_allocator<GNSSData>> submap_coords;
+  // Number of associated submaps that have already had GNSS prior factors
+  // emitted. Everything in [factored_submap_count, submaps.size()) still needs
+  // factors -- this backfills the pre-T_world_utm backlog and every submap in a
+  // multi-submap offline batch, not just submaps.back().
+  size_t factored_submap_count = 0;
 
   std::string gnss_topic;
   std::string gnss_msg_type;

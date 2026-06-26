@@ -521,7 +521,32 @@ void GlimROS::wait(bool auto_quit) {
 }
 
 void GlimROS::save(const std::string& path) {
-  if (global_mapping) global_mapping->save(path);
+  if (global_mapping) {
+    // TODO(follow-up refactor): replace this needs_wait() quiescence-inference
+    // flush with an explicit ExtensionModule::flush_at_end_of_sequence() hook
+    // (a join()-equivalent for extensions, mirroring the core async stages).
+    // An EOS signal lets the GNSS backend drain synchronously to completion and
+    // resolves the "waiting for more GNSS" vs "permanently un-bracketable"
+    // ambiguity directly -- removing pending_associable_ and the timeout below.
+    // Ideally upstreamed to koide3 (its extensions share this latent save-race).
+    //
+    // Flush extension backends (e.g. gnss_global) that produce factors on their
+    // own threads and deliver them only via on_smoother_update(). Wait until no
+    // extension reports pending work, so their FINAL position/heading factors
+    // are queued before we serialize. global_mapping->save() then runs a final
+    // optimize() -- which fires on_smoother_update() and injects those queued
+    // factors into the graph -- so they actually reach graph.bin / trajectories.
+    // Bounded so a perpetually-busy extension can't hang the save.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (needs_wait() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (needs_wait()) {
+      spdlog::warn("save(): extension still reports pending work after flush timeout; some final factors may be missing");
+    }
+
+    global_mapping->save(path);
+  }
   for (auto& module : extension_modules) {
     module->at_exit(path);
   }

@@ -391,14 +391,15 @@ Loosen these to admit RTK-FLOAT if your sky view is poor; tighten to reject Atla
     "gnss_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
-    "enable_orientation_prior": false,
+    "enable_orientation_prior": true,
+    "orientation_prior_inf_scale": [1e-6, 1e-6, 1e2],
     "prior_inf_scale": [1e4, 1e4, 1e3],
     "enable_lever_arm": false
   }
 }
 ```
 - `prior_inf_scale` is **precision** (1/variance), not sigma. Equivalent sigmas: σ_x = σ_y ≈ 1 cm, σ_z ≈ 3 cm — about 2× looser than Atlas's reported precision.
-- `enable_orientation_prior: false` because Atlas does not populate the `sensor_msgs/Imu.orientation` field; INS attitude comes through IMU preintegration on the LiDAR+IMU side instead.
+- `enable_orientation_prior: true` adds a **yaw-only** heading prior per submap from the Atlas dual-antenna heading carried in the GNSS `Odometry.pose.orientation` (this is the INS pose orientation, *not* the `sensor_msgs/Imu.orientation` field, which Atlas leaves unpopulated). `orientation_prior_inf_scale: [1e-6, 1e-6, 1e2]` constrains only yaw (σ ≈ 5.7°) and leaves roll/pitch to gravity/LiDAR. It pins heading against the slow LiDAR-IMU yaw drift that the position prior alone cannot fix. Fires only on RTK-FIXED samples; validate the yaw convention on a bag before tightening the yaw precision.
 - `enable_lever_arm: false` because Atlas firmware already projects to `gps_antenna_top`. Software-side lever-arm would double-compensate.
 
 **IMU noise** (`config_sensors.json`, tuned for Atlas `imu_calibrated`):

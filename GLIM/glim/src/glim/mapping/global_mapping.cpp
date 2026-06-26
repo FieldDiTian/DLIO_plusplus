@@ -472,7 +472,15 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_cost
     }
   }
 
-  if (previous_overlap < std::max(0.25, params.min_implicit_loop_overlap)) {
+  // Isolation-prevention fallback: if the immediately-preceding submap barely
+  // overlaps the current one, no matching-cost factor ties them, so add a
+  // between factor to keep the submap from floating free. Skip it when
+  // create_between_factors is enabled -- create_between_factors() already adds a
+  // BetweenFactor on the same X(last)->X(current) edge with the same 1e6
+  // precision for every consecutive pair, so adding it again here would DOUBLE
+  // that local constraint, overweighting a weak adjacent edge and letting it
+  // fight loop-closure / GNSS corrections.
+  if (!params.enable_between_factors && previous_overlap < std::max(0.25, params.min_implicit_loop_overlap)) {
     logger->warn("previous submap has only a small overlap with the current submap ({})", previous_overlap);
     logger->warn("create a between factor to prevent the submap from being isolated");
     const int last = current - 1;

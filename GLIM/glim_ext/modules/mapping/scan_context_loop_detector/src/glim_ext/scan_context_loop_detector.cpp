@@ -147,6 +147,15 @@ public:
 
       // Validate loop candidates
       while (!loop_candidates.empty()) {
+        // No submaps inserted yet -- there is nothing to validate against, and
+        // submaps.back() below would dereference end(). ScanContext can produce
+        // candidates from early odometry frames before the first submap arrives,
+        // so guard it. Leave the candidates queued; they are validated once a
+        // submap exists.
+        if (submaps.empty()) {
+          break;
+        }
+
         const auto loop_candidate = loop_candidates.front();
         const int frame_id1 = frame_index_map[std::get<0>(loop_candidate)];
         const int frame_id2 = frame_index_map[std::get<1>(loop_candidate)];
