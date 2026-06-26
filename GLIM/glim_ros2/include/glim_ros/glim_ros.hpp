@@ -54,6 +54,10 @@ public:
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 
+  // True only when the live subscription-based mapping passway is enabled
+  // (glim_ros/enable_online_mapping). Default false: GLIM maps offline only.
+  bool online_mapping_enabled() const { return online_mapping_enabled_; }
+
 private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;
@@ -76,6 +80,7 @@ private:
   std::vector<std::shared_ptr<GenericTopicSubscription>> extension_subs;
 
   // ROS-related
+  bool online_mapping_enabled_ = false;
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;

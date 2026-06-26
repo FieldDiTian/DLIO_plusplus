@@ -13,6 +13,16 @@ int main(int argc, char** argv) {
 
   auto glim = std::make_shared<glim::GlimROS>(options);
 
+  // Online (live) mapping has been removed: GLIM builds maps OFFLINE only.
+  if (!glim->online_mapping_enabled()) {
+    spdlog::error(
+      "Online GLIM mapping is disabled. GLIM builds maps OFFLINE only -- run "
+      "'glim_rosbag <bag>' or 'glim_pcap_rosbag <pcap>'. "
+      "(Set glim_ros/enable_online_mapping=true in config_ros.json to override.)");
+    rclcpp::shutdown();
+    return 1;
+  }
+
   rclcpp::spin(glim);
   rclcpp::shutdown();
 

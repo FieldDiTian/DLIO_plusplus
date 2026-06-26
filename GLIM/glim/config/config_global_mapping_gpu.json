@@ -26,11 +26,22 @@
   "global_mapping": {
     "so_name": "libglobal_mapping.so",
     // General settings
+    // OFFLINE WHOLE-TRACK OPTIMIZATION (max-refinement profile). The offline
+    // tools (glim_rosbag / glim_pcap_rosbag) replay the entire session and run
+    // a full global iSAM2 optimization, so we turn every refinement knob up:
+    // loop closure ON, all submaps retained at full density (no max_full_submaps
+    // bound), aggressive relinearization. Loop closures and relinearization
+    // propagate corrections BOTH backward and forward through the pose graph,
+    // refining the whole trajectory each time the car re-crosses earlier ground
+    // (lap-over-lap on a closed circuit). Compute/RAM are higher than an online
+    // profile -- intended for offline runs.
     "enable_imu": false,
     "enable_optimization": true,
     "init_pose_damping_scale": 1e10,
-    // Relative pose factors
-    "create_between_factors": false,
+    // Relative pose factors -- enable odom-style between factors (GICP info) so
+    // consecutive submaps are stiffly constrained, giving the loop factors a
+    // well-conditioned graph to pull on.
+    "create_between_factors": true,
     "between_registration_type": "GICP",
     // Registration error factors
     "registration_error_factor_type": "VGICP_GPU",
@@ -41,11 +52,17 @@
     "submap_voxel_resolution_dmax": 20.0,
     "submap_voxelmap_levels": 2,
     "submap_voxelmap_scaling_factor": 2.0,
-    "max_implicit_loop_distance": 0.0,
-    "min_implicit_loop_overlap": 0.2,
-    // Optimizer settings
+    // Loop closure ENABLED (was 0.0 = off). Submap pairs within this spatial
+    // distance get registration-error (loop) factors -- on a race circuit the
+    // same physical location on different laps is ~0 m apart, so a generous
+    // radius closes every lap loop and ties the whole track together. Lower the
+    // overlap threshold to admit more loop candidates.
+    "max_implicit_loop_distance": 200.0,
+    "min_implicit_loop_overlap": 0.1,
+    // Optimizer settings -- relinearize more aggressively (smaller thresh) for
+    // thorough whole-track convergence offline.
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,
-    "isam2_relinearize_thresh": 0.1
+    "isam2_relinearize_thresh": 0.01
   }
 }

@@ -205,56 +205,71 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // ROS-related
   using std::placeholders::_1;
-  const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
-  const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
-  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
-  // Subscribers
-  rclcpp::SensorDataQoS default_imu_qos;
-  default_imu_qos.get_rmw_qos_profile().depth = 1000;
-  auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
-  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+  // Online (live subscription) mapping passway. GLIM builds maps OFFLINE only
+  // (glim_rosbag / glim_pcap_rosbag feed the callbacks directly and drive
+  // timer_callback() manually), so by default we create NO live subscriptions
+  // and NO wall timer. The offline tools do not use any of these. Set
+  // glim_ros/enable_online_mapping=true to restore the legacy live path.
+  this->online_mapping_enabled_ = config_ros.param<bool>("glim_ros", "enable_online_mapping", false);
 
-  qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  // Route the primary cloud through points_callback_live() so buffered aux
-  // clouds are merged in before odometry sees the scan (parity with offline).
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
+  if (this->online_mapping_enabled_) {
+    const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
+    const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
+    const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
-  // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
-  // merged into the primary scan on arrival of a primary cloud.
-  if (aux_concat.enabled) {
-    auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-    for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
-      const std::string aux_topic = aux_concat.aux_sensors[i].topic;
-      auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        aux_topic, aux_qos,
-        [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
-      aux_points_subs.push_back(sub);
-      spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
+    // Subscribers
+    rclcpp::SensorDataQoS default_imu_qos;
+    default_imu_qos.get_rmw_qos_profile().depth = 1000;
+    auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
+    imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+
+    qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
+    // Route the primary cloud through points_callback_live() so buffered aux
+    // clouds are merged in before odometry sees the scan (parity with offline).
+    points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
+
+    // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
+    // merged into the primary scan on arrival of a primary cloud.
+    if (aux_concat.enabled) {
+      auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
+      for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
+        const std::string aux_topic = aux_concat.aux_sensors[i].topic;
+        auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+          aux_topic, aux_qos,
+          [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
+        aux_points_subs.push_back(sub);
+        spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
+      }
     }
-  }
 #ifdef BUILD_WITH_CV_BRIDGE
-  qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
-  image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
+    qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
+    image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
 #endif
 
-  const std::string external_odom_topic = config_ros.param<std::string>("glim_ros", "external_odom_topic", "");
-  if (!external_odom_topic.empty()) {
-    rclcpp::QoS default_external_odom_qos(100);
-    auto external_odom_qos = get_qos_settings(config_ros, "glim_ros", "external_odom_qos", default_external_odom_qos);
-    external_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
-      external_odom_topic, external_odom_qos, std::bind(&GlimROS::external_odom_callback, this, _1));
-    spdlog::info("subscribed to external odometry topic: {}", external_odom_topic);
-  }
+    const std::string external_odom_topic = config_ros.param<std::string>("glim_ros", "external_odom_topic", "");
+    if (!external_odom_topic.empty()) {
+      rclcpp::QoS default_external_odom_qos(100);
+      auto external_odom_qos = get_qos_settings(config_ros, "glim_ros", "external_odom_qos", default_external_odom_qos);
+      external_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
+        external_odom_topic, external_odom_qos, std::bind(&GlimROS::external_odom_callback, this, _1));
+      spdlog::info("subscribed to external odometry topic: {}", external_odom_topic);
+    }
 
-  for (const auto& sub : this->extension_subscriptions()) {
-    spdlog::debug("subscribe to {}", sub->topic);
-    sub->create_subscriber(*this);
-  }
+    for (const auto& sub : this->extension_subscriptions()) {
+      spdlog::debug("subscribe to {}", sub->topic);
+      sub->create_subscriber(*this);
+    }
 
-  // Start timer
-  timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+    // Start timer
+    timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+    spdlog::warn("ONLINE GLIM mapping ENABLED (glim_ros/enable_online_mapping=true) -- live subscriptions created");
+  } else {
+    spdlog::info(
+      "online GLIM mapping DISABLED -- no live subscriptions or wall timer created. "
+      "Build maps offline with glim_rosbag / glim_pcap_rosbag.");
+  }
 
   spdlog::debug("initialized");
 }
@@ -321,7 +336,15 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
     GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
   }
 
-  auto cv_image = cv_bridge::toCvCopy(msg, "bgr8");
+  cv_bridge::CvImagePtr cv_image;
+  try {
+    cv_image = cv_bridge::toCvCopy(msg, "bgr8");
+  } catch (const std::exception& e) {
+    // malformed frame (e.g. truncated capture assembly) -- skip, don't abort.
+    // (Port of airacingtech glim_ros2@8b454f8.)
+    spdlog::warn("dropping malformed image ({}x{}, {} bytes): {}", msg->width, msg->height, msg->data.size(), e.what());
+    return;
+  }
 
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
   odometry_estimation->insert_image(stamp, cv_image->image);
@@ -396,8 +419,18 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
 
   odometry_estimation->insert_frame(preprocessed);
 
-  const size_t workload = odometry_estimation->workload();
-  spdlog::debug("workload={}", workload);
+  // Throttle offline bag playback on the SLOWEST stage, not just odometry.
+  // glim_rosbag uses this return value to pace playback; reporting only the
+  // odometry workload lets a fast front-end drain its queue while the bag keeps
+  // flooding sub/global mapping, whose input queues (frames/submaps WITH points)
+  // then grow unbounded and OOM. Take the max across all stages so playback
+  // waits for the slowest. (Port of airacingtech glim_ros2@8b454f8.)
+  size_t workload = odometry_estimation->workload();
+  const size_t sub_wl = sub_mapping ? static_cast<size_t>(sub_mapping->workload()) : 0;
+  const size_t global_wl = global_mapping ? static_cast<size_t>(global_mapping->workload()) : 0;
+  if (sub_wl > workload) workload = sub_wl;
+  if (global_wl > workload) workload = global_wl;
+  spdlog::debug("workload={} (odom={} sub={} global={})", workload, odometry_estimation->workload(), sub_wl, global_wl);
 
   return workload;
 }
