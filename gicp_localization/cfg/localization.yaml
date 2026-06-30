@@ -39,8 +39,18 @@
     localization/imu_frame: "gps_antenna_top"
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
-    # Map downsampling for GICP (smaller = more accurate but slower)
-    localization/voxel_leaf_size: 0.25
+    # Static base_frame<-lidar_frame lever arm (row-major 4x4, p_base = T * p_lidar),
+    # used to resolve the extrinsic WITHOUT live TF so offline replay (no /tf_static
+    # or robot_state_publisher) still localizes. Resolution priority: URDF
+    # (lidar_concat/urdf_path, set by the launch) > this static matrix > live TF.
+    # Derived from av24.urdf (gps_antenna_top <- luminar_front); keep in sync with
+    # the URDF if mounts change, or set lidar_concat/urdf_path. [] disables (URDF/TF only).
+    localization/base_lidar_transform: [
+      1.0, 0.0, 0.0,  0.95065,
+      0.0, 1.0, 0.0,  0.00500,
+      0.0, 0.0, 1.0, -0.47194,
+      0.0, 0.0, 0.0,  1.0
+    ]
 
     # Optional map rotation (degrees) to correct sideways/up-axis issues from source map files.
     # If your map looks sideways, try roll +/-90 first.
@@ -48,7 +58,15 @@
     localization/map_rotation/pitch_deg: 0.0
     localization/map_rotation/yaw_deg: 0.0
 
-    # Map visualization
+    # GICP target-map downsampling. The map is voxel-downsampled (in place) at
+    # load, BEFORE the kd-tree is built. A dense map (e.g. a ~49M-point GLIM
+    # export) otherwise builds a multi-GB kd-tree that exhausts RAM/swap and
+    # stalls registration for seconds. ~0.3 m cuts point count / memory ~10x with
+    # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
+    # below, 0.5 m). Set to 0.0 to disable and register against the full-res map.
+    localization/map_voxel_size: 0.3
+
+    # Map visualization (separate, coarser downsample used only for RViz publishing)
     localization/visualize_map: true
     localization/map_voxel_size_vis: 1.5  # Downsample map for visualization (increase for faster RViz)
 
@@ -150,14 +168,46 @@
     # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
     # subscribes to each aux topic, buffers the latest scans, and on every primary
     # scan finds the nearest aux scan in time, transforms its XYZ into the primary
-    # sensor frame via TF (URDF), rebases per-point timestamps onto the primary clock,
-    # and appends the bytes to the primary PointCloud2. Downstream steps see a single
-    # cloud in primary frame with one coherent timebase.
+    # sensor frame, rebases per-point timestamps onto the primary clock, and appends
+    # the bytes to the primary PointCloud2. Downstream steps see a single cloud in
+    # primary frame with one coherent timebase.
     localization/lidar_concat/enabled: true
-    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]  
+    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
     localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans further than this from primary are dropped
     localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
+
+    # Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
+    # localize on fewer LiDARs if an aux fails to merge (missing topic/extrinsic,
+    # schema mismatch, timing). The node tolerates this many CONSECUTIVE incomplete
+    # merges (transient warmup/dropouts) and then errors out and shuts down.
+    localization/lidar_concat/require_all_aux: true
+    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # 0 = fail on first incomplete scan
+
+    # Aux-LiDAR extrinsic resolution (NO live TF required) -- resolved once at startup,
+    # so the merge works in offline replay without robot_state_publisher / /tf_static.
+    # Priority per aux: (1) URDF if urdf_path set, (2) the static matrices below,
+    # (3) live TF lookup as a last resort. This matches GLIM, which reads the same
+    # av24.urdf for its extrinsics.
+    localization/lidar_concat/primary_frame: "luminar_front"  # URDF link of the primary LiDAR
+    # Set to the absolute path of av24.urdf to use the URDF as the single source of
+    # truth (overrides the static matrices below). Empty = use the static matrices.
+    localization/lidar_concat/urdf_path: ""
+    # Static fallback: row-major 4x4 (p_primary = T * p_aux) per aux, in aux_frames
+    # order [luminar_right, luminar_left]. Derived from av24.urdf (rear_axle_middle
+    # parent); keep in sync with the URDF if mounts change, or set urdf_path instead.
+    localization/lidar_concat/aux_static_transforms: [
+      # luminar_right  (yaw -1.9634954 rad about primary)
+      -0.38268342,  0.92387954, 0.0, -0.648,
+      -0.92387954, -0.38268342, 0.0, -0.158,
+       0.0,         0.0,        1.0,  0.087,
+       0.0,         0.0,        0.0,  1.0,
+      # luminar_left   (yaw +1.9634954 rad about primary)
+      -0.38268342, -0.92387954, 0.0, -0.658,
+       0.92387954, -0.38268342, 0.0,  0.144,
+       0.0,         0.0,        1.0,  0.087,
+       0.0,         0.0,        0.0,  1.0
+    ]
 
     # LiDAR sensor type for per-point timestamp handling during deskewing
     # Options: ouster, velodyne, hesai, livox, luminar

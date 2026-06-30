@@ -91,10 +91,13 @@ def generate_launch_description():
     # Publish the full vehicle URDF via robot_state_publisher. This provides the
     # real base_link -> luminar_front and base_link -> gps_bottom/imu_bottom
     # transforms from the URDF, replacing the hand-maintained static TFs.
-    def make_robot_state_publisher(context):
+    # Resolve av24.urdf to an ABSOLUTE path so both robot_state_publisher AND the
+    # localization node's lidar_concat extrinsic resolution find it CWD-independently.
+    # If no explicit urdf_path arg is given, walk up from this launch file: av24.urdf
+    # now lives in the gicp_localization package root (and also at the repo root),
+    # so the walk finds it in both the source tree and the colcon install tree.
+    def resolve_urdf_path(context):
         urdf_file = LaunchConfiguration('urdf_path').perform(context).strip()
-        # If no explicit path was given, walk up from this launch file to find
-        # av24.urdf.  Works from both the source tree and the colcon install tree.
         if not urdf_file:
             d = os.path.dirname(os.path.abspath(__file__))
             for _ in range(10):
@@ -107,6 +110,10 @@ def generate_launch_description():
             raise RuntimeError(
                 f"URDF file not found at '{urdf_file}'. "
                 f"Pass a different path with urdf_path:=<abs-path>.")
+        return urdf_file
+
+    def make_robot_state_publisher(context):
+        urdf_file = resolve_urdf_path(context)
         with open(urdf_file, 'r') as f:
             robot_description = f.read()
         node = Node(
@@ -122,10 +129,15 @@ def generate_launch_description():
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
+        # Same av24.urdf the robot_state_publisher uses: hand the localization node
+        # the resolved ABSOLUTE path so lidar_concat resolves aux extrinsics from the
+        # URDF (single source of truth) instead of relying on CWD or the static fallback.
+        urdf_file = resolve_urdf_path(context)
         params = [
             localization_yaml_path,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
+            {'localization/lidar_concat/urdf_path': urdf_file},
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})

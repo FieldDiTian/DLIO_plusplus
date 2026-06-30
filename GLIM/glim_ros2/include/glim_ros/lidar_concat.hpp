@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -233,12 +235,21 @@ inline void shift_cloud_timestamps(
 // a mutable SharedPtr) and the live GlimROS points_callback (which receives a
 // ConstSharedPtr) can call this directly. The primary cloud is only read here;
 // the merged output is a fresh copy.
+// Strict merge guard (optional): when require_all_aux is set, a scan that fails to
+// merge every configured aux must not be silently localized on fewer LiDARs. The
+// caller passes a persistent counter (consec_fail); brief transient misses are
+// tolerated up to max_consec_fail, after which merge_clouds throws std::runtime_error
+// (stopping the node) rather than returning a degraded single-/partial-LiDAR cloud.
 inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary,
   std::vector<AuxLidarSensor>& aux_sensors,
-  double time_threshold) {
+  double time_threshold,
+  bool require_all_aux = false,
+  int max_consec_fail = 0,
+  int* consec_fail = nullptr) {
   const double t_primary = stamp_to_sec(primary->header.stamp);
   const uint32_t point_step = primary->point_step;
+  size_t merged_aux_count = 0;
 
   int x_off, y_off, z_off;
   if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
@@ -312,6 +323,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     // Accumulate the byte-derived count (matches the bytes actually appended),
     // not width*height, so merged->width/row_step stay consistent with data.
     total_points += aux_pts;
+    ++merged_aux_count;
 
     spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, std::abs(dt), aux_pts);
   }
@@ -319,6 +331,28 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   merged->width = total_points;
   merged->height = 1;
   merged->row_step = point_step * total_points;
+
+  // Strict guard: a REQUIRED multi-LiDAR merge that stays incomplete must not be
+  // silently localized on fewer LiDARs. Tolerate brief transient misses via a
+  // consecutive-failure budget, then throw (stopping the node) rather than degrade.
+  if (require_all_aux && consec_fail && merged_aux_count < aux_sensors.size()) {
+    ++(*consec_fail);
+    spdlog::error(
+      "lidar_concat: REQUIRED merge incomplete ({}/{} aux) for {} consecutive scan(s) (budget {}). "
+      "Check aux topics, extrinsics (URDF/static), schema, and timing.",
+      merged_aux_count, aux_sensors.size(), *consec_fail, max_consec_fail);
+    if (*consec_fail > max_consec_fail) {
+      const std::string msg =
+        "lidar_concat: multi-LiDAR merge REQUIRED but only " + std::to_string(merged_aux_count) + "/" +
+        std::to_string(aux_sensors.size()) + " aux merged for " + std::to_string(*consec_fail) +
+        " consecutive scans; refusing to localize on an incomplete cloud (set lidar_concat/require_all_aux=false to allow degraded merging)";
+      spdlog::critical(msg);
+      throw std::runtime_error(msg);
+    }
+  } else if (consec_fail) {
+    *consec_fail = 0;
+  }
+
   return merged;
 }
 
@@ -327,13 +361,44 @@ struct AuxConcatConfig {
   double time_threshold = 0.05;
   int buffer_size = 200;
   std::vector<AuxLidarSensor> aux_sensors;
+  // Strict merge guard (see merge_clouds). consecutive_merge_failures is mutable
+  // running state that the caller passes to merge_clouds each scan.
+  bool require_all_aux = true;
+  int max_consecutive_merge_failures = 10;
+  int consecutive_merge_failures = 0;
 };
+
+// Resolve a (possibly relative) urdf_path CWD-independently. parse_urdf_transforms
+// feeds the string straight to xmlReadFile() (CWD-relative), which silently fails
+// from a different working directory. Try, in order: as-given (absolute or CWD),
+// then relative to the GLIM config directory, then a walk UP from the config dir
+// looking for the file (av24.urdf is copied into the GLIM stack root, above the
+// config dir). Returns the original string if nothing is found, so the caller's
+// parse failure + startup guard still fire with a clear error.
+inline std::string resolve_urdf_path(const std::string& urdf_path) {
+  namespace fs = std::filesystem;
+  if (urdf_path.empty() || fs::exists(urdf_path)) {
+    return urdf_path;
+  }
+  const std::string config_dir = glim::GlobalConfig::instance()->param<std::string>("global", "config_path", ".");
+  const std::string basename = fs::path(urdf_path).filename().string();
+  fs::path d = config_dir;
+  for (int i = 0; i < 10; ++i) {
+    if (fs::exists(d / urdf_path)) return (d / urdf_path).string();
+    if (fs::exists(d / basename)) return (d / basename).string();
+    if (!d.has_parent_path() || d.parent_path() == d) break;
+    d = d.parent_path();
+  }
+  return urdf_path;
+}
 
 inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_sensors) {
   AuxConcatConfig out;
   out.enabled = config_sensors.param<bool>("lidar_concat", "enabled", false);
   out.time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
   out.buffer_size = config_sensors.param<int>("lidar_concat", "buffer_size", 200);
+  out.require_all_aux = config_sensors.param<bool>("lidar_concat", "require_all_aux", true);
+  out.max_consecutive_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_merge_failures", 10);
 
   if (!out.enabled) {
     return out;
@@ -347,11 +412,13 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   bool use_urdf = !urdf_path.empty() && !primary_frame.empty();
 
   if (use_urdf) {
+    const std::string resolved_urdf = resolve_urdf_path(urdf_path);
     try {
-      urdf_transforms = glim::parse_urdf_transforms(urdf_path);
-      spdlog::info("lidar_concat: loaded URDF from {} (primary_frame={})", urdf_path, primary_frame);
+      urdf_transforms = glim::parse_urdf_transforms(resolved_urdf);
+      spdlog::info("lidar_concat: loaded URDF from '{}' (config urdf_path='{}', primary_frame={})",
+                   resolved_urdf, urdf_path, primary_frame);
     } catch (const std::exception& e) {
-      spdlog::error("lidar_concat: failed to parse URDF: {}", e.what());
+      spdlog::error("lidar_concat: failed to parse URDF '{}' (from urdf_path='{}'): {}", resolved_urdf, urdf_path, e.what());
       use_urdf = false;
     }
   }
@@ -404,6 +471,18 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     out.aux_sensors.push_back(std::move(sensor));
   }
   spdlog::info("lidar_concat: {} auxiliary sensors, threshold={:.3f}s", out.aux_sensors.size(), out.time_threshold);
+
+  // Startup strict guard: if a complete multi-LiDAR merge is REQUIRED but some aux
+  // sensors could not even be set up (missing/!invalid extrinsic, bad URDF chain),
+  // fail loudly at load instead of silently running on fewer LiDARs.
+  if (out.require_all_aux && out.aux_sensors.size() < aux_topics.size()) {
+    const std::string msg =
+      "lidar_concat: require_all_aux=true but only " + std::to_string(out.aux_sensors.size()) + "/" +
+      std::to_string(aux_topics.size()) + " aux sensors resolved at startup (check URDF/static extrinsics and aux_frames). Refusing to start.";
+    spdlog::critical(msg);
+    throw std::runtime_error(msg);
+  }
+
   return out;
 }
 

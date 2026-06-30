@@ -586,7 +586,9 @@ int main(int argc, char** argv) {
           // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
           // scan started before the primary.
           epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
-          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold);
+          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
+                                                concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
+                                                &concat_config.consecutive_merge_failures);
         }
         const size_t workload = glim->points_callback(final_points, epoch_anchor_count);
         cnt_pcap_primary++;
@@ -639,7 +641,9 @@ int main(int argc, char** argv) {
         int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
           epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
-          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold);
+          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
+                                                concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
+                                                &concat_config.consecutive_merge_failures);
         }
         glim->points_callback(final_points, epoch_anchor_count);
       }

@@ -28,6 +28,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(PCL REQUIRED)
 find_package( Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
+find_package(LibXml2 REQUIRED)  # URDF parsing for offline aux-LiDAR extrinsics (lidar_concat)
 
 set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_STANDARD 17)
@@ -64,7 +65,8 @@ ament_target_dependencies(nano_gicp)
 
 # Localization Node
 add_executable(gicp_localization_node src/localization_node.cc src/localization.cc)
-target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp)
+target_include_directories(gicp_localization_node PRIVATE ${LIBXML2_INCLUDE_DIR})
+target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${LIBXML2_LIBRARIES})
 ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
 
 ament_export_include_directories(include)
@@ -83,6 +85,14 @@ install( PROGRAMS
 )
 install( DIRECTORY cfg launch
          DESTINATION share/${PROJECT_NAME}
+)
+# Install the vehicle URDF alongside the package share so the launch's walk-up
+# (share/gicp_localization/launch -> share/gicp_localization) resolves av24.urdf
+# in the colcon install tree, not just the source tree. OPTIONAL: the source-tree
+# walk-up / static fallback still apply if the file isn't present at install time.
+install( FILES av24.urdf
+         DESTINATION share/${PROJECT_NAME}
+         OPTIONAL
 )
 
 link_directories(${PCL_LIBRARY_DIRS})

@@ -264,6 +264,11 @@ if(DEFINED ENV{ROS_VERSION})
     # ROS2
     find_package(ament_cmake REQUIRED)
     install(DIRECTORY config DESTINATION share/glim)
+    # Install the vehicle URDF into the config dir so lidar_concat's resolve_urdf_path()
+    # finds it in the colcon install tree (config_path -> share/glim/config -> av24.urdf),
+    # not just the source tree. av24.urdf lives at the GLIM stack root (one above this
+    # package). OPTIONAL so the build still succeeds if the file isn't present.
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../av24.urdf DESTINATION share/glim/config OPTIONAL)
     ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
     ament_export_libraries(${glim_LIBRARIES} ${GTSAM_LIBRARIES} fmt spdlog::spdlog)
     ament_export_targets(glim-targets HAS_LIBRARY_TARGET)

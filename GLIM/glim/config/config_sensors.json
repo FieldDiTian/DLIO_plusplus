@@ -12,7 +12,13 @@
     "enabled": true,
     "primary_frame": "luminar_front",
     "time_threshold": 0.01,
-    "urdf_path": "av24.urdf"
+    "urdf_path": "av24.urdf",
+    // Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
+    // run on fewer LiDARs if an aux fails to merge. Tolerates this many CONSECUTIVE
+    // incomplete merges (transient warmup/dropouts) then throws and stops. A
+    // startup check also fails if any aux extrinsic can't be resolved at load.
+    "require_all_aux": true,
+    "max_consecutive_merge_failures": 10
   },
   "sensors": {
     "T_lidar_camera": [

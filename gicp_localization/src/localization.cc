@@ -11,6 +11,7 @@
  ***********************************************************/
 
 #include "gicp_localization/localization.h"
+#include "gicp_localization/urdf_transforms.hpp"
 #include "dlio/utils.h"
 
 #include <Eigen/Geometry>
@@ -1088,20 +1089,30 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<std::string>("odom/odom_frame", "odom");
   this->declare_parameter<std::string>("localization/imu_frame", "imu");
   this->declare_parameter<std::string>("localization/lidar_frame", "lidar");
+  // Static base_frame<-lidar_frame lever arm (row-major 4x4) used to resolve the
+  // extrinsic WITHOUT live TF in offline replay. Empty = rely on URDF
+  // (lidar_concat/urdf_path) then live TF. See resolveBaseLidarExtrinsicOffline().
+  this->declare_parameter<std::vector<double>>("localization/base_lidar_transform", std::vector<double>{});
 
   this->get_parameter("localization/map_frame", this->map_frame);
   this->get_parameter("localization/base_frame", this->base_frame);
   this->get_parameter("odom/odom_frame", this->odom_frame);
   this->get_parameter("localization/imu_frame", this->imu_frame);
   this->get_parameter("localization/lidar_frame", this->lidar_frame);
+  this->get_parameter("localization/base_lidar_transform", this->base_lidar_static_);
 
   // Map parameters
   this->declare_parameter<std::string>("localization/map_path", "");
   this->declare_parameter<std::string>("localization/utm_transform_path", "");
   this->declare_parameter<std::string>("localization/utm_frame", "utm");
-  this->declare_parameter<double>("localization/voxel_leaf_size", 0.25);
   this->declare_parameter<bool>("localization/visualize_map", true);
   this->declare_parameter<double>("localization/map_voxel_size_vis", 0.5);
+  // Voxel leaf size (m) for the GICP TARGET map / kd-tree. A dense map (e.g. a
+  // 49M-point GLIM export) builds a huge kd-tree -> >10 GiB RSS and swap thrash
+  // that stalls registration. Downsampling the target to ~0.3 m cuts memory and
+  // per-scan search cost with negligible accuracy loss at 0.5 m scan voxels.
+  // 0.0 disables (use the full-resolution map).
+  this->declare_parameter<double>("localization/map_voxel_size", 0.3);
   this->declare_parameter<double>("localization/map_rotation/roll_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/pitch_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/yaw_deg", 0.0);
@@ -1116,9 +1127,9 @@ void gicp_localization::LocalizationNode::getParams() {
   if (!utm_transform_path.empty()) {
     this->utm_enabled_ = loadUTMTransform(utm_transform_path);
   }
-  this->get_parameter("localization/voxel_leaf_size", this->voxel_leaf_size_);
   this->get_parameter("localization/visualize_map", this->visualize_map_);
   this->get_parameter("localization/map_voxel_size_vis", this->map_voxel_size_vis_);
+  this->get_parameter("localization/map_voxel_size", this->map_voxel_size_);
   this->get_parameter("localization/map_rotation/roll_deg", this->map_roll_deg_);
   this->get_parameter("localization/map_rotation/pitch_deg", this->map_pitch_deg_);
   this->get_parameter("localization/map_rotation/yaw_deg", this->map_yaw_deg_);
@@ -1258,6 +1269,16 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
   this->declare_parameter<double>("localization/lidar_concat/time_threshold", 0.05);
   this->declare_parameter<int>("localization/lidar_concat/buffer_size", 20);
+  // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
+  this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
+  this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
+  this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_static_transforms", std::vector<double>{});
+  // Strict merge guard: when the multi-LiDAR merge is REQUIRED, a scan that fails
+  // to merge every configured aux must not be silently localized on fewer LiDARs.
+  // Brief transient misses (buffers warming up, a dropped aux frame) are tolerated
+  // up to max_consecutive_aux_merge_failures, after which the node errors out.
+  this->declare_parameter<bool>("localization/lidar_concat/require_all_aux", true);
+  this->declare_parameter<int>("localization/lidar_concat/max_consecutive_aux_merge_failures", 10);
 
   this->get_parameter("localization/lidar_concat/enabled", this->concat_enabled_);
   std::vector<std::string> aux_topics_param, aux_frames_param;
@@ -1267,6 +1288,12 @@ void gicp_localization::LocalizationNode::getParams() {
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
+  this->get_parameter("localization/lidar_concat/primary_frame", this->concat_primary_frame_);
+  this->get_parameter("localization/lidar_concat/urdf_path", this->concat_urdf_path_);
+  this->get_parameter("localization/lidar_concat/require_all_aux", this->concat_require_all_aux_);
+  this->get_parameter("localization/lidar_concat/max_consecutive_aux_merge_failures", this->concat_max_consec_fail_);
+  std::vector<double> aux_static_flat;
+  this->get_parameter("localization/lidar_concat/aux_static_transforms", aux_static_flat);
 
   if (this->concat_enabled_) {
     if (aux_topics_param.size() != aux_frames_param.size()) {
@@ -1293,6 +1320,25 @@ void gicp_localization::LocalizationNode::getParams() {
         RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
                     a->topic.c_str(), a->frame.c_str());
       }
+
+      // Split the flat static-transform array (16 row-major doubles per aux, in
+      // aux order) into per-aux 4x4 matrices for the offline resolver.
+      std::vector<std::vector<double>> aux_static_transforms;
+      if (!aux_static_flat.empty()) {
+        if (aux_static_flat.size() == 16 * this->aux_lidars_.size()) {
+          aux_static_transforms.resize(this->aux_lidars_.size());
+          for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+            aux_static_transforms[i].assign(aux_static_flat.begin() + 16 * i, aux_static_flat.begin() + 16 * (i + 1));
+          }
+        } else {
+          RCLCPP_WARN(this->get_logger(),
+                      "lidar_concat: aux_static_transforms has %zu values, expected %zu (16 x %zu aux); ignoring",
+                      aux_static_flat.size(), 16 * this->aux_lidars_.size(), this->aux_lidars_.size());
+        }
+      }
+
+      // Resolve aux extrinsics now, without live TF (URDF > static > TF-at-runtime).
+      this->resolveAuxExtrinsicsOffline(aux_static_transforms);
     }
   }
 
@@ -1495,6 +1541,33 @@ bool gicp_localization::LocalizationNode::loadMap() {
   }
 
   RCLCPP_INFO(this->get_logger(), "Map loaded successfully with %lu points", this->map_cloud->points.size());
+
+  // Downsample the GICP TARGET map (in place) before it becomes the kd-tree.
+  // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
+  // kd-tree that exhausts RAM/swap and stalls registration for seconds. Voxel
+  // downsampling to ~0.3 m cuts the point count (and kd-tree memory) by ~10x
+  // with negligible accuracy impact at the 0.5 m scan voxel. The dense cloud is
+  // released as soon as the filter swaps in the downsampled result.
+  if (this->map_voxel_size_ > 0.0) {
+    const size_t before = this->map_cloud->points.size();
+    auto map_ds = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::VoxelGrid<PointType> vg;
+    vg.setLeafSize(static_cast<float>(this->map_voxel_size_),
+                   static_cast<float>(this->map_voxel_size_),
+                   static_cast<float>(this->map_voxel_size_));
+    vg.setInputCloud(this->map_cloud);
+    vg.filter(*map_ds);
+    if (map_ds->points.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "map_voxel_size=%.3f produced an empty map; keeping the full-resolution map",
+                  this->map_voxel_size_);
+    } else {
+      this->map_cloud = map_ds;  // releases the dense cloud
+      RCLCPP_INFO(this->get_logger(),
+                  "Downsampled GICP target map: %lu -> %lu points (voxel=%.3f m)",
+                  before, this->map_cloud->points.size(), this->map_voxel_size_);
+    }
+  }
 
   // Downsample map for visualization if needed
   if (this->visualize_map_) {
@@ -1730,32 +1803,42 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   // Deskewing below chains this as `frames[i] * baselink2lidar_T` so the
   // incoming points stay in their native LiDAR frame until then.
   if (!this->extrinsics_cached_) {
-    try {
-      auto tf_bl = this->tf_buffer->lookupTransform(
-          this->base_frame, pc->header.frame_id, tf2::TimePointZero);
-      Eigen::Quaternionf q_bl(
-          tf_bl.transform.rotation.w, tf_bl.transform.rotation.x,
-          tf_bl.transform.rotation.y, tf_bl.transform.rotation.z);
-      Eigen::Vector3f t_bl(
-          tf_bl.transform.translation.x, tf_bl.transform.translation.y,
-          tf_bl.transform.translation.z);
-      this->extrinsics.baselink2lidar.R = q_bl.toRotationMatrix();
-      this->extrinsics.baselink2lidar.t = t_bl;
-      this->extrinsics.baselink2lidar_T.setIdentity();
-      this->extrinsics.baselink2lidar_T.block<3, 3>(0, 0) = q_bl.toRotationMatrix();
-      this->extrinsics.baselink2lidar_T.block<3, 1>(0, 3) = t_bl;
+    // Resolve base_link -> lidar WITHOUT live TF first (URDF / static), so replay
+    // without /tf_static or robot_state_publisher still localizes. Only fall back
+    // to a live TF lookup if neither URDF nor a static transform is configured.
+    if (this->resolveBaseLidarExtrinsicOffline(pc->header.frame_id)) {
       this->extrinsics_cached_ = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "Cached baselink->lidar extrinsic from '%s': t=[%.3f,%.3f,%.3f]",
-                  pc->header.frame_id.c_str(), t_bl.x(), t_bl.y(), t_bl.z());
-      if (this->pending_initial_pose_) {
-        this->applyInitialPoseFromParams();
+    } else {
+      try {
+        auto tf_bl = this->tf_buffer->lookupTransform(
+            this->base_frame, pc->header.frame_id, tf2::TimePointZero);
+        Eigen::Quaternionf q_bl(
+            tf_bl.transform.rotation.w, tf_bl.transform.rotation.x,
+            tf_bl.transform.rotation.y, tf_bl.transform.rotation.z);
+        Eigen::Vector3f t_bl(
+            tf_bl.transform.translation.x, tf_bl.transform.translation.y,
+            tf_bl.transform.translation.z);
+        this->extrinsics.baselink2lidar.R = q_bl.toRotationMatrix();
+        this->extrinsics.baselink2lidar.t = t_bl;
+        this->extrinsics.baselink2lidar_T.setIdentity();
+        this->extrinsics.baselink2lidar_T.block<3, 3>(0, 0) = q_bl.toRotationMatrix();
+        this->extrinsics.baselink2lidar_T.block<3, 1>(0, 3) = t_bl;
+        this->extrinsics_cached_ = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "Cached baselink->lidar extrinsic from TF '%s': t=[%.3f,%.3f,%.3f]",
+                    pc->header.frame_id.c_str(), t_bl.x(), t_bl.y(), t_bl.z());
+      } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Waiting for baselink->lidar TF ('%s' -> '%s'): %s. "
+                             "Set localization/lidar_concat/urdf_path or localization/base_lidar_transform "
+                             "for offline replay without /tf_static.",
+                             this->base_frame.c_str(), pc->header.frame_id.c_str(), ex.what());
+        return;
       }
-    } catch (const tf2::TransformException& ex) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "Waiting for baselink->lidar TF ('%s' -> '%s'): %s",
-                           this->base_frame.c_str(), pc->header.frame_id.c_str(), ex.what());
-      return;
+    }
+    // Apply the configured initial pose once the lever arm is known (either path).
+    if (this->extrinsics_cached_ && this->pending_initial_pose_) {
+      this->applyInitialPoseFromParams();
     }
   }
 
@@ -1992,6 +2075,115 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
   }
 }
 
+// Resolve every aux LiDAR's T_primary_aux at startup WITHOUT live TF, so the
+// multi-LiDAR merge works in offline replay (no robot_state_publisher / no
+// /tf_static). Priority per aux: (1) URDF (the same av24.urdf GLIM reads, single
+// source of truth), (2) a static row-major 4x4 from yaml, (3) leave unresolved
+// so mergeAuxClouds() falls back to a runtime TF lookup. Any aux left unresolved
+// here still works online exactly as before.
+void gicp_localization::LocalizationNode::resolveAuxExtrinsicsOffline(
+    const std::vector<std::vector<double>>& static_transforms) {
+  // (1) URDF: parse once, resolve primary_frame <- aux.frame for each aux.
+  std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>> urdf_transforms;
+  bool urdf_ok = false;
+  if (!this->concat_urdf_path_.empty() && !this->concat_primary_frame_.empty()) {
+    try {
+      urdf_transforms = gicp_localization::parse_urdf_transforms(this->concat_urdf_path_);
+      urdf_ok = true;
+      RCLCPP_INFO(this->get_logger(), "lidar_concat: loaded URDF '%s' (primary_frame='%s')",
+                  this->concat_urdf_path_.c_str(), this->concat_primary_frame_.c_str());
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(this->get_logger(), "lidar_concat: URDF parse failed (%s); falling back to static/TF", e.what());
+    }
+  }
+
+  for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+    auto& aux = *this->aux_lidars_[i];
+
+    if (urdf_ok) {
+      try {
+        const Eigen::Isometry3d T = gicp_localization::compute_transform(
+            urdf_transforms, this->concat_primary_frame_, aux.frame);
+        aux.T_primary_aux = T.matrix().cast<float>();
+        aux.extrinsic_cached = true;
+        aux.extrinsic_source = "urdf";
+        const Eigen::Vector3f t = aux.T_primary_aux.block<3, 1>(0, 3);
+        RCLCPP_INFO(this->get_logger(), "lidar_concat: resolved T(%s <- %s) from URDF: t=[%.3f, %.3f, %.3f]",
+                    this->concat_primary_frame_.c_str(), aux.frame.c_str(), t.x(), t.y(), t.z());
+        continue;
+      } catch (const std::exception& e) {
+        RCLCPP_WARN(this->get_logger(), "lidar_concat: URDF has no %s <- %s chain (%s); trying static/TF",
+                    this->concat_primary_frame_.c_str(), aux.frame.c_str(), e.what());
+      }
+    }
+
+    // (2) Static row-major 4x4 from yaml.
+    if (i < static_transforms.size() && static_transforms[i].size() == 16) {
+      Eigen::Matrix4f M;
+      for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+          M(r, c) = static_cast<float>(static_transforms[i][r * 4 + c]);
+      aux.T_primary_aux = M;
+      aux.extrinsic_cached = true;
+      aux.extrinsic_source = "static";
+      RCLCPP_INFO(this->get_logger(), "lidar_concat: resolved T(primary <- %s) from static yaml: t=[%.3f, %.3f, %.3f]",
+                  aux.frame.c_str(), M(0, 3), M(1, 3), M(2, 3));
+      continue;
+    }
+
+    // (3) Unresolved -> runtime TF fallback (existing behavior in mergeAuxClouds).
+    aux.extrinsic_source = "tf";
+    RCLCPP_WARN(this->get_logger(),
+                "lidar_concat: aux '%s' has no URDF/static extrinsic; will rely on live TF '%s' <- '%s' "
+                "(requires /tf_static at runtime -- set urdf_path or aux_static_transforms for offline replay)",
+                aux.topic.c_str(), this->concat_primary_frame_.c_str(), aux.frame.c_str());
+  }
+}
+
+// Resolve the base_frame <- lidar_frame lever arm WITHOUT live TF, so full GICP
+// localization works in offline replay (no robot_state_publisher / /tf_static).
+// Priority: (1) URDF (the same av24.urdf used for aux extrinsics, via
+// lidar_concat/urdf_path), (2) a static row-major 4x4 from yaml. Returns false if
+// neither is available, leaving the caller to fall back to a live TF lookup.
+bool gicp_localization::LocalizationNode::resolveBaseLidarExtrinsicOffline(const std::string& lidar_frame) {
+  auto apply = [this](const Eigen::Matrix4f& T) {
+    this->extrinsics.baselink2lidar.R = T.block<3, 3>(0, 0);
+    this->extrinsics.baselink2lidar.t = T.block<3, 1>(0, 3);
+    this->extrinsics.baselink2lidar_T = T;
+  };
+
+  // (1) URDF.
+  if (!this->concat_urdf_path_.empty()) {
+    try {
+      auto urdf = gicp_localization::parse_urdf_transforms(this->concat_urdf_path_);
+      const Eigen::Matrix4f T = gicp_localization::compute_transform(urdf, this->base_frame, lidar_frame).matrix().cast<float>();
+      apply(T);
+      RCLCPP_INFO(this->get_logger(),
+                  "Resolved baselink->lidar (%s <- %s) from URDF: t=[%.3f, %.3f, %.3f]",
+                  this->base_frame.c_str(), lidar_frame.c_str(), T(0, 3), T(1, 3), T(2, 3));
+      return true;
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(this->get_logger(),
+                  "baselink->lidar URDF resolution failed (%s <- %s): %s; trying static/TF",
+                  this->base_frame.c_str(), lidar_frame.c_str(), e.what());
+    }
+  }
+
+  // (2) Static row-major 4x4 from yaml.
+  if (this->base_lidar_static_.size() == 16) {
+    Eigen::Matrix4f T;
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c)
+        T(r, c) = static_cast<float>(this->base_lidar_static_[r * 4 + c]);
+    apply(T);
+    RCLCPP_INFO(this->get_logger(),
+                "Resolved baselink->lidar from static yaml: t=[%.3f, %.3f, %.3f]", T(0, 3), T(1, 3), T(2, 3));
+    return true;
+  }
+
+  return false;
+}
+
 sensor_msgs::msg::PointCloud2::ConstSharedPtr
 gicp_localization::LocalizationNode::mergeAuxClouds(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
@@ -2200,6 +2392,31 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                        "lidar_concat: merged %zu/%zu aux scans, total %zu points",
                        merged_aux_count, this->aux_lidars_.size(), total_points);
+
+  // Strict guard: a REQUIRED multi-LiDAR merge that stays incomplete must not be
+  // silently localized on fewer LiDARs (the run_5 "merged 0/2" failure mode).
+  // Tolerate brief transient misses (buffers warming up, an occasional dropped
+  // aux frame) via a consecutive-failure budget, then stop the node with a fatal
+  // error rather than degrade to a single-LiDAR sweep.
+  if (this->concat_require_all_aux_ && merged_aux_count < this->aux_lidars_.size()) {
+    ++this->concat_consec_fail_;
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                          "lidar_concat: REQUIRED merge incomplete (%zu/%zu aux) for %d consecutive scan(s) "
+                          "(budget %d). Check aux topics, extrinsics (URDF/static/TF), schema, and timing.",
+                          merged_aux_count, this->aux_lidars_.size(),
+                          this->concat_consec_fail_, this->concat_max_consec_fail_);
+    if (this->concat_consec_fail_ > this->concat_max_consec_fail_) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "lidar_concat: multi-LiDAR merge REQUIRED but only %zu/%zu aux merged for %d consecutive "
+                   "scans; refusing to localize on an incomplete cloud. Set "
+                   "localization/lidar_concat/require_all_aux=false to allow degraded merging. Shutting down.",
+                   merged_aux_count, this->aux_lidars_.size(), this->concat_consec_fail_);
+      rclcpp::shutdown();
+      throw std::runtime_error("lidar_concat: required multi-LiDAR merge failed (incomplete aux merge)");
+    }
+  } else {
+    this->concat_consec_fail_ = 0;
+  }
 
   return merged;
 }

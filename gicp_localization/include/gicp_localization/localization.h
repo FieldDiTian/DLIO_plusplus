@@ -202,8 +202,9 @@ private:
   struct AuxLidar {
     std::string topic;
     std::string frame;                          // header.frame_id of the aux sensor (URDF link)
-    Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux, cached from TF
-    bool extrinsic_cached;
+    Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux
+    bool extrinsic_cached;                       // true once T_primary_aux is resolved
+    std::string extrinsic_source = "tf";        // "urdf" | "static" | "tf" (for logging)
     std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
     std::mutex mtx;
   };
@@ -213,6 +214,23 @@ private:
   bool concat_enabled_;
   double concat_time_threshold_;
   size_t concat_buffer_size_;
+  // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
+  // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,
+  // then a static per-aux matrix from yaml, then live TF as a last resort.
+  std::string concat_primary_frame_;            // URDF link name of the primary LiDAR
+  std::string concat_urdf_path_;                // path to av24.urdf ("" = skip URDF)
+  // Strict merge guard: error out if a required multi-LiDAR merge stays incomplete.
+  bool concat_require_all_aux_ = true;          // require every configured aux per scan
+  int concat_max_consec_fail_ = 10;             // tolerated consecutive incomplete merges (0 = immediate)
+  int concat_consec_fail_ = 0;                  // running counter of consecutive incomplete merges
+  // Resolve every aux's T_primary_aux without live TF; returns the count resolved.
+  void resolveAuxExtrinsicsOffline(const std::vector<std::vector<double>>& static_transforms);
+
+  // Offline base_frame<-lidar_frame lever arm (no live TF): URDF (lidar_concat/
+  // urdf_path) then a static yaml matrix. Sets extrinsics.baselink2lidar* and
+  // returns true on success; false leaves the caller to fall back to live TF.
+  std::vector<double> base_lidar_static_;       // row-major 4x4, "" = unset
+  bool resolveBaseLidarExtrinsicOffline(const std::string& lidar_frame);
 
   // Luminar multi-LiDAR deskew anchor. mergeAuxClouds() captures the PRIMARY
   // scan's earliest per-point timestamp BEFORE appending aux clouds; the deskew
@@ -415,7 +433,6 @@ private:
   double map_roll_deg_;
   double map_pitch_deg_;
   double map_yaw_deg_;
-  double voxel_leaf_size_;
   bool publish_tf_;
   bool imu_only_mode_;
   bool use_odom_init_;
@@ -511,6 +528,7 @@ private:
   // Map visualization
   bool visualize_map_;
   double map_voxel_size_vis_;
+  double map_voxel_size_ = 0.3;  // GICP target-map voxel leaf (m); 0 disables
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
   rclcpp::TimerBase::SharedPtr input_health_timer_;
 
