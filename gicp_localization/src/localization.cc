@@ -1297,11 +1297,25 @@ void gicp_localization::LocalizationNode::getParams() {
 
   if (this->concat_enabled_) {
     if (aux_topics_param.size() != aux_frames_param.size()) {
+      // A misconfigured REQUIRED merge must not silently degrade to primary-only.
+      if (this->concat_require_all_aux_) {
+        RCLCPP_FATAL(this->get_logger(),
+                     "lidar_concat: aux_topics size (%zu) != aux_frames size (%zu) and require_all_aux=true; "
+                     "refusing to start. Fix the config or set require_all_aux=false to allow primary-only.",
+                     aux_topics_param.size(), aux_frames_param.size());
+        throw std::runtime_error("lidar_concat: aux_topics/aux_frames size mismatch (require_all_aux)");
+      }
       RCLCPP_ERROR(this->get_logger(),
                    "lidar_concat: aux_topics size (%zu) != aux_frames size (%zu); disabling concat",
                    aux_topics_param.size(), aux_frames_param.size());
       this->concat_enabled_ = false;
     } else if (aux_topics_param.empty()) {
+      if (this->concat_require_all_aux_) {
+        RCLCPP_FATAL(this->get_logger(),
+                     "lidar_concat enabled with no aux_topics and require_all_aux=true; refusing to start. "
+                     "Configure aux_topics/aux_frames or set require_all_aux=false to allow primary-only.");
+        throw std::runtime_error("lidar_concat: enabled but no aux_topics configured (require_all_aux)");
+      }
       RCLCPP_WARN(this->get_logger(), "lidar_concat enabled but no aux_topics configured; disabling concat");
       this->concat_enabled_ = false;
     } else {
@@ -2191,6 +2205,31 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   this->luminar_primary_min_ts_valid_ = false;
   if (this->aux_lidars_.empty()) return primary;
 
+  // Strict-merge failure handler: route EVERY "required merge can't complete" path
+  // through one counter+throw -- incomplete aux merge AND primary-precondition
+  // failures (missing XYZ, non-tight/padded primary) that bail before the aux loop.
+  // Otherwise those early returns would silently localize a degraded (primary-only)
+  // scan despite require_all_aux=true. No-op when require_all_aux is false. Tolerates
+  // brief transients via the consecutive-failure budget, then stops the node.
+  auto note_required_failure = [this](size_t got, const char* reason) {
+    if (!this->concat_require_all_aux_) return;
+    ++this->concat_consec_fail_;
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                          "lidar_concat: REQUIRED merge incomplete (%zu/%zu aux): %s for %d consecutive scan(s) "
+                          "(budget %d). Check primary cloud, aux topics, extrinsics, schema, and timing.",
+                          got, this->aux_lidars_.size(), reason,
+                          this->concat_consec_fail_, this->concat_max_consec_fail_);
+    if (this->concat_consec_fail_ > this->concat_max_consec_fail_) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "lidar_concat: multi-LiDAR merge REQUIRED but could not complete (%s) for %d consecutive "
+                   "scans; refusing to localize on a degraded cloud. Set "
+                   "localization/lidar_concat/require_all_aux=false to allow degraded merging. Shutting down.",
+                   reason, this->concat_consec_fail_);
+      rclcpp::shutdown();
+      throw std::runtime_error("lidar_concat: required multi-LiDAR merge failed");
+    }
+  };
+
   // Capture the PRIMARY scan's earliest per-point timestamp BEFORE appending any
   // aux cloud. deskewPointcloud() anchors Luminar merged-cloud timing on this --
   // NOT on the global merged minimum. An aux scan that began before the primary
@@ -2234,6 +2273,7 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "lidar_concat: cannot find xyz fields in primary cloud (frame='%s')",
                          primary_frame.c_str());
+    note_required_failure(0, "primary cloud missing xyz fields");
     return primary;
   }
 
@@ -2249,6 +2289,7 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
                          "lidar_concat: primary cloud is organized/padded (data=%zu, width=%u, height=%u, step=%u); "
                          "skipping concat (only tight clouds can be byte-appended)",
                          primary->data.size(), primary->width, primary->height, point_step);
+    note_required_failure(0, "primary cloud organized/padded (non-tight)");
     return primary;
   }
 
@@ -2394,26 +2435,11 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
                        merged_aux_count, this->aux_lidars_.size(), total_points);
 
   // Strict guard: a REQUIRED multi-LiDAR merge that stays incomplete must not be
-  // silently localized on fewer LiDARs (the run_5 "merged 0/2" failure mode).
-  // Tolerate brief transient misses (buffers warming up, an occasional dropped
-  // aux frame) via a consecutive-failure budget, then stop the node with a fatal
-  // error rather than degrade to a single-LiDAR sweep.
-  if (this->concat_require_all_aux_ && merged_aux_count < this->aux_lidars_.size()) {
-    ++this->concat_consec_fail_;
-    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                          "lidar_concat: REQUIRED merge incomplete (%zu/%zu aux) for %d consecutive scan(s) "
-                          "(budget %d). Check aux topics, extrinsics (URDF/static/TF), schema, and timing.",
-                          merged_aux_count, this->aux_lidars_.size(),
-                          this->concat_consec_fail_, this->concat_max_consec_fail_);
-    if (this->concat_consec_fail_ > this->concat_max_consec_fail_) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "lidar_concat: multi-LiDAR merge REQUIRED but only %zu/%zu aux merged for %d consecutive "
-                   "scans; refusing to localize on an incomplete cloud. Set "
-                   "localization/lidar_concat/require_all_aux=false to allow degraded merging. Shutting down.",
-                   merged_aux_count, this->aux_lidars_.size(), this->concat_consec_fail_);
-      rclcpp::shutdown();
-      throw std::runtime_error("lidar_concat: required multi-LiDAR merge failed (incomplete aux merge)");
-    }
+  // silently localized on fewer LiDARs (the run_5 "merged 0/2" failure mode). The
+  // primary-precondition bail-outs above route through the same handler, so every
+  // degraded-merge path is enforced uniformly. A fully merged scan resets the budget.
+  if (merged_aux_count < this->aux_lidars_.size()) {
+    note_required_failure(merged_aux_count, "incomplete aux merge");
   } else {
     this->concat_consec_fail_ = 0;
   }

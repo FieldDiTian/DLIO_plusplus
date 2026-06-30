@@ -251,9 +251,32 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   const uint32_t point_step = primary->point_step;
   size_t merged_aux_count = 0;
 
+  // Strict-merge failure handler: route EVERY "required merge can't complete" path
+  // through one counter+throw -- incomplete aux merge AND primary-precondition
+  // failures (missing XYZ, non-tight/padded primary) that bail before the aux loop --
+  // so a degraded (primary-only) scan is never silently localized. No-op when
+  // require_all_aux is off. Tolerates brief transients via the budget, then throws.
+  auto note_required_failure = [&](size_t got, const char* reason) {
+    if (!require_all_aux || !consec_fail) return;
+    ++(*consec_fail);
+    spdlog::error(
+      "lidar_concat: REQUIRED merge incomplete ({}/{} aux): {} for {} consecutive scan(s) (budget {}). "
+      "Check primary cloud, aux topics, extrinsics, schema, and timing.",
+      got, aux_sensors.size(), reason, *consec_fail, max_consec_fail);
+    if (*consec_fail > max_consec_fail) {
+      const std::string msg =
+        std::string("lidar_concat: multi-LiDAR merge REQUIRED but could not complete (") + reason + ") for " +
+        std::to_string(*consec_fail) + " consecutive scans; refusing to localize on a degraded cloud "
+        "(set lidar_concat/require_all_aux=false to allow degraded merging)";
+      spdlog::critical(msg);
+      throw std::runtime_error(msg);
+    }
+  };
+
   int x_off, y_off, z_off;
   if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
     spdlog::warn("lidar_concat: cannot find xyz fields in primary cloud");
+    note_required_failure(0, "primary cloud missing xyz fields");
     return primary;
   }
 
@@ -266,6 +289,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
     spdlog::warn("lidar_concat: primary cloud is organized/padded (data={}, width={}, height={}, step={}); skipping concat",
                  primary->data.size(), primary->width, primary->height, point_step);
+    note_required_failure(0, "primary cloud organized/padded (non-tight)");
     return primary;
   }
 
@@ -333,22 +357,11 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   merged->row_step = point_step * total_points;
 
   // Strict guard: a REQUIRED multi-LiDAR merge that stays incomplete must not be
-  // silently localized on fewer LiDARs. Tolerate brief transient misses via a
-  // consecutive-failure budget, then throw (stopping the node) rather than degrade.
+  // silently localized on fewer LiDARs. The primary-precondition bail-outs above
+  // route through the same handler, so every degraded-merge path is enforced
+  // uniformly. A fully merged scan resets the budget.
   if (require_all_aux && consec_fail && merged_aux_count < aux_sensors.size()) {
-    ++(*consec_fail);
-    spdlog::error(
-      "lidar_concat: REQUIRED merge incomplete ({}/{} aux) for {} consecutive scan(s) (budget {}). "
-      "Check aux topics, extrinsics (URDF/static), schema, and timing.",
-      merged_aux_count, aux_sensors.size(), *consec_fail, max_consec_fail);
-    if (*consec_fail > max_consec_fail) {
-      const std::string msg =
-        "lidar_concat: multi-LiDAR merge REQUIRED but only " + std::to_string(merged_aux_count) + "/" +
-        std::to_string(aux_sensors.size()) + " aux merged for " + std::to_string(*consec_fail) +
-        " consecutive scans; refusing to localize on an incomplete cloud (set lidar_concat/require_all_aux=false to allow degraded merging)";
-      spdlog::critical(msg);
-      throw std::runtime_error(msg);
-    }
+    note_required_failure(merged_aux_count, "incomplete aux merge");
   } else if (consec_fail) {
     *consec_fail = 0;
   }
@@ -405,6 +418,14 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   }
 
   const auto aux_topics = config_sensors.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
+
+  // A REQUIRED merge that is enabled with no aux topics is a config error, not a
+  // silent primary-only run (mirrors the unresolved-extrinsics guard below).
+  if (out.require_all_aux && aux_topics.empty()) {
+    const std::string msg = "lidar_concat: enabled with require_all_aux=true but no aux_topics configured; refusing to start";
+    spdlog::critical(msg);
+    throw std::runtime_error(msg);
+  }
 
   const std::string urdf_path = config_sensors.param<std::string>("lidar_concat", "urdf_path", "");
   const std::string primary_frame = config_sensors.param<std::string>("lidar_concat", "primary_frame", "");
