@@ -9,6 +9,8 @@ This directory is the GLIM workspace inside the [`augcog/DLIO_plusplus`](https:/
 - `glim_ext` for extension modules
 - `glim_ros2` for ROS2 integration
 
+**Where GLIM sits in the four-stage pipeline.** GLIM is the offline-map stage of a four-stage flow: **adapter** (converts Atlas WGS84 → local-ENU, publishes `/gps_p1/*` and optional `/gnss*`) → **`scripts/prep_bag.py`** (writes a normalized bag: the small adapter streams plus the raw Luminar clouds copied unchanged) → **GLIM** (builds the offline PCD map) → **`gicp_localization`** (online localize against that PCD map). GLIM consumes the normalized bag: it expects `/gps_p1/*` **already in local ENU** from the adapter, so it does not perform any WGS84/UTM projection itself. See the `adapter` package and `scripts/prep_bag.py` for how these inputs are produced.
+
 **Target sensor stack:** AV-24 Cybertruck with three Luminar Iris LiDAR (front + left + right concatenated) and the **Point One Nav Atlas (LG69T) dual-antenna RTK-INS**. All GNSS, RTK, and IMU input comes from Atlas — Atlas projects its IMU output and INS pose solution to the primary GNSS antenna phase centre (URDF link `gps_antenna_top`) via firmware lever-arm, so GLIM consumes both at the same body frame with no second lever-arm step. IMU rate is 99 Hz, RTK is delivered at cm-level horizontal / sub-cm vertical when FIXED.
 
 ### Differences From Upstream GLIM
@@ -26,13 +28,21 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 
 **Luminar per-point timestamps & deskew** — `ros_cloud_converter.hpp`, `config_sensors.json`
 
-- Decode the Luminar `UINT8[8]` little-endian uint64 **epoch-nanosecond** per-point time field (`/1e9` → epoch seconds). Upstream handles only `UINT32`/`FLOAT32`/`FLOAT64` and would drop these scans as "unsupported time type".
-- **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), rebase them onto the header epoch (intra-scan span preserved) so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. Generalizes `scripts/prep_bag.py`'s offline repair to the live path; no-op on already-aligned or scan-relative data.
+- Decode the Luminar `UINT8[8]` little-endian uint64 **PTP epoch-nanosecond** per-point time field (`/1e9` → epoch seconds); deskew is ON. Upstream handles only `UINT32`/`FLOAT32`/`FLOAT64` and would drop these scans as "unsupported time type". Timestamp-format authority: **Luminar Iris Data Output Specification v1.3.0**.
+- **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), `ros_cloud_converter` rebases them onto the header epoch, **anchored on the primary scan** (intra-scan span preserved; threaded `epoch_anchor_count`), so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. Generalizes `scripts/prep_bag.py`'s offline repair to the live path; no-op on already-aligned or scan-relative data.
 - Full rationale + validation: root `README.md` → "Luminar Iris per-point timestamps — the definitive account".
 
 **Multi-LiDAR concatenation** — `glim_ros2/include/glim_ros/lidar_concat.hpp`, `glim_ros2/src/glim_ros/glim_ros.cpp`
 
-- Merge front+left+right Luminars into the primary `luminar_front` frame. UINT8[8] absolute times are left unshifted; scan-relative encodings are shifted by inter-scan `dt`.
+- Merge 3× Luminar Iris — `luminar_front` **primary** plus `luminar_left` / `luminar_right` aux — into the primary `luminar_front` frame. UINT8[8] absolute times are left unshifted; scan-relative encodings are shifted by inter-scan `dt`.
+- **Aux extrinsics are resolved OFFLINE** (no live `/tf_static` needed), in priority order: (1) **URDF** — `av24.urdf`, path from `lidar_concat/urdf_path`, resolved CWD-independently by walking up from the config directory (`av24.urdf` is installed into `share/glim/config`); (2) a **static per-aux 4×4 matrix** in config; (3) live TF as a last resort.
+- **Strict merge guard** (config in `glim/config/config_sensors.json` under `lidar_concat`; **identical semantics and defaults to GICP**):
+  - `require_all_aux` (default **false**) — false = build/localize on whatever LiDARs merged this scan; true = an incomplete merge **skips** the scan entirely rather than emitting a degraded cloud.
+  - `abort_on_merge_failure` (default **true**, only relevant when `require_all_aux=true`) — abort the node once past the failure budget vs. keep skipping non-fatally.
+  - `max_consecutive_merge_failures: 10`.
+  - `time_threshold: 0.1` (raised from 0.01 to capture aux-to-primary jitter).
+  - Startup guards also gate on `require_all_aux && abort_on_merge_failure`.
+- **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
 - **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
 - Live wiring: the live node subscribes to the aux topics, buffers them, and merges on primary-cloud arrival (`points_callback_live`), matching the offline `glim_rosbag` / `glim_pcap_rosbag` merge path.
 
@@ -41,7 +51,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 - INS-tolerant design: LiDAR+IMU (`libodometry_estimation_gpu.so`) is the *primary* trajectory; `libgnss_global.so` adds RTK-FIXED **position-prior** factors to the iSAM2 graph. The INS-driven `config_odometry_ins.json` path (which pauses on RTK loss) is left in tree but not selected.
 - RTK-FIXED-only gating via the `gicp_localization/scripts/rtk_fixed_odom_filter.py` pre-filter; factors go silent during dropouts and re-anchor on reacquisition (iSAM2 retroactively smooths the gap).
 - **Atlas dual-antenna heading prior**: `enable_orientation_prior=true`, `orientation_prior_inf_scale=[1e-6,1e-6,1e2]` → a **yaw-only** `PoseRotationPrior` per submap (roll/pitch left free), pinning heading the position prior can't. Lever-arm compensation disabled (Atlas firmware already projects to the antenna phase centre). *Validate the yaw convention before tightening.*
-- `T_world_utm.txt` export of the odom→UTM SE(3) transform for downstream GICP localization / post-processing.
+- `T_world_utm.txt` export of the odom→GNSS-input-frame SE(3) transform for downstream GICP localization / post-processing. `gnss_global` still aligns the map to the GNSS input frame via a 2D Umeyama fit and exports that SE(3) (the code still names the variable `T_world_utm` internally). The operational **contract is now local ENU** supplied by the adapter — since the adapter feeds `/gps_p1/*` already in ENU, the exported transform is effectively world↔ENU. UTM is not used.
 
 **Mapping / optimization — offline whole-track refinement** — `config_global_mapping_gpu.json`
 
@@ -66,7 +76,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 - **LiDAR+IMU tight fusion as primary odometry** — runs every scan via VGICP + GTSAM `CombinedImuFactor` preintegration. No external pose required; mapping cannot stall on GNSS loss.
 - **RTK-FIXED-only GNSS anchoring** — a small ROS2 pre-filter (`gicp_localization/scripts/rtk_fixed_odom_filter.py`) admits only Atlas samples whose pose covariance indicates a FIXED-integer solution. `libgnss_global.so` then turns each forwarded message into a position-prior factor on the iSAM2 graph.
 - **Seamless GNSS-denied continuity** — when RTK quality degrades, the filter stops forwarding and the GNSS factor stream goes silent. LiDAR+IMU odometry continues to extend the map perimeter; on RTK reacquisition the next factor anchors the post-dropout trajectory back to the global frame and iSAM2 retroactively smooths the dropout.
-- **Geo-referenced output** — `T_world_utm.txt` saves the SE(3) transform from the local odom frame to Atlas's reported map frame for downstream use (GICP localization, post-processing, etc.).
+- **Geo-referenced output** — `T_world_utm.txt` saves the SE(3) transform from the local odom frame to the GNSS input frame for downstream use (GICP localization, post-processing, etc.). Because the adapter feeds `/gps_p1/*` already in **local ENU**, that input frame *is* ENU and the exported transform is effectively world↔ENU. The variable keeps its historical `T_world_utm` name in code, but no UTM projection is performed.
 
 The exact behavior of this fork should be taken from the checked-in config and source files in this repository, not assumed to match upstream defaults.
 
@@ -167,6 +177,8 @@ source install/setup.bash
 ## Usage
 
 ### Mapping pipeline overview
+
+> **Inputs.** GLIM is stage 3 of the four-stage flow (**adapter → `scripts/prep_bag.py` → GLIM → `gicp_localization`**). Before mapping, run the **adapter** (WGS84 → local ENU, publishes `/gps_p1/*` in ENU) and **`scripts/prep_bag.py`** to produce the normalized bag GLIM consumes — the small adapter streams plus the raw Luminar clouds copied unchanged. GLIM expects `/gps_p1/*` **already in local ENU**; it does no projection itself.
 
 ```
                               ┌─────────────────────────────┐
@@ -341,7 +353,7 @@ Each directory contains:
 - `000000/`, `000001/`, ... - Submap directories with point clouds
 - `odom_lidar.txt` / `odom_imu.txt` - Odometry trajectories
 - `traj_lidar.txt` / `traj_imu.txt` - Optimized trajectories
-- `T_world_utm.txt` - **SE(3) transformation from GNSS/UTM to odom frame** (if GNSS enabled)
+- `T_world_utm.txt` - **SE(3) transformation between odom frame and the GNSS input frame (local ENU)** (if GNSS enabled; historical filename, no UTM projection)
 - `config/` - Configuration files used for this map
 
 ## Configuration
@@ -451,25 +463,27 @@ Sub/global mapping use library defaults; tune up if you have spare cores.
 
 ## Coordinate Transformation
 
-The GNSS module automatically computes the transformation between:
-- **SLAM world frame** (local mapping frame)
-- **GPS/UTM frame** (global coordinates)
+### Frame contract: local ENU (not UTM)
 
-**Transformation variable:** `T_world_utm`
+The operational coordinate contract is a **local ENU** tangent frame. The `map` frame is a local ENU frame anchored at a fixed datum (the **Putnam origin** from the `race_metadata` TTL). The **adapter is the single authority** that converts Atlas WGS84 → local ENU and feeds GLIM (and GICP) `/gps_p1/*` **already in ENU** — GLIM performs no WGS84/UTM projection of its own.
+
+`gnss_global` still aligns the map to the GNSS input frame via a **2D Umeyama fit** and can export that SE(3). The code still names the exported variable `T_world_utm` internally, but because the adapter supplies ENU input, the exported transform is effectively **world↔ENU**. UTM is not used.
+
+**Transformation variable:** `T_world_utm` (historical name; contract is world↔ENU)
 
 This transformation is:
 - Computed once per session after achieving `min_baseline` travel distance (currently `5.0 m` in `config_gnss_global.json`)
 - Remains static throughout the mapping run
 - **Automatically saved to `T_world_utm.txt` in the map directory**
 
-**Convert map point to GPS:**
+**Convert map point to ENU (GNSS input frame):**
 ```cpp
-Eigen::Vector3d gps_position = T_world_utm.inverse() * map_position;
+Eigen::Vector3d enu_position = T_world_utm.inverse() * map_position;
 ```
 
-**Convert GPS to map:**
+**Convert ENU to map:**
 ```cpp
-Eigen::Vector3d map_position = T_world_utm * gps_position;
+Eigen::Vector3d map_position = T_world_utm * enu_position;
 ```
 
 The transformation is logged when alignment initializes:

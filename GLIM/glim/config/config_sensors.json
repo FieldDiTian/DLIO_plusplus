@@ -11,13 +11,23 @@
     "buffer_size": 200,
     "enabled": true,
     "primary_frame": "luminar_front",
-    "time_threshold": 0.01,
+    "time_threshold": 0.1,
     "urdf_path": "av24.urdf",
-    // Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
-    // run on fewer LiDARs if an aux fails to merge. Tolerates this many CONSECUTIVE
-    // incomplete merges (transient warmup/dropouts) then throws and stops. A
-    // startup check also fails if any aux extrinsic can't be resolved at load.
-    "require_all_aux": true,
+    // Strict merge guard. Parity with GICP localization/lidar_concat/require_all_aux.
+    // false = OPERATIONAL default: build/localize on whatever LiDARs merged this scan
+    // (front + any available aux) instead of aborting when an aux is missing or late,
+    // avoiding the scan-gap behavior seen at a tight window. Set true only for a
+    // sync-validation pass: an incomplete required merge then SKIPS the scan, and past
+    // max_consecutive_merge_failures the node throws/stops only if
+    // abort_on_merge_failure=true (otherwise it keeps skipping non-fatally; the
+    // startup unresolved-extrinsics check is likewise gated on abort_on_merge_failure).
+    // time_threshold raised 0.01 -> 0.1 to match GICP and capture the aux-to-primary jitter.
+    "require_all_aux": false,
+    // When require_all_aux=true and merges keep failing past the budget:
+    //   true  = abort/stop (fail-fast; sync validation / bring-up)
+    //   false = keep skipping incomplete scans non-fatally (robust long replays)
+    // Ignored when require_all_aux=false. Parity with GICP abort_on_merge_failure.
+    "abort_on_merge_failure": true,
     "max_consecutive_merge_failures": 10
   },
   "sensors": {

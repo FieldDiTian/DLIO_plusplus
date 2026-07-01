@@ -179,12 +179,22 @@
                                                     #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
     localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
 
-    # Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
-    # localize on fewer LiDARs if an aux fails to merge (missing topic/extrinsic,
-    # schema mismatch, timing). The node tolerates this many CONSECUTIVE incomplete
-    # merges (transient warmup/dropouts) and then errors out and shuts down.
-    localization/lidar_concat/require_all_aux: true
-    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # 0 = fail on first incomplete scan
+    # Strict merge guard. false = OPERATIONAL default: localize on whatever LiDARs
+    # merged this scan (front + any available aux) instead of skipping/aborting when
+    # an aux is missing or late. This avoids the scan-gap / long-tail behavior seen
+    # on the Run3 bag, where require_all_aux=true dropped ~half the scans at a tight
+    # window and dead-reckoned through the gaps. Set true only for a sync-validation
+    # / bring-up pass: an incomplete required merge then SKIPS the scan, and past
+    # max_consecutive_aux_merge_failures the node shuts down only if
+    # abort_on_merge_failure=true (otherwise it keeps skipping non-fatally).
+    # Keep in parity with GLIM lidar_concat/require_all_aux.
+    localization/lidar_concat/require_all_aux: false
+    # When require_all_aux=true and merges keep failing past the budget below:
+    #   true  = abort the node (fail-fast; use for sync validation / bring-up)
+    #   false = keep skipping incomplete scans non-fatally (robust long replays)
+    # Ignored when require_all_aux=false. Keep in parity with GLIM abort_on_merge_failure.
+    localization/lidar_concat/abort_on_merge_failure: true
+    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # 0 = fail on first incomplete scan (only when require_all_aux=true)
 
     # Aux-LiDAR extrinsic resolution (NO live TF required) -- resolved once at startup,
     # so the merge works in offline replay without robot_state_publisher / /tf_static.

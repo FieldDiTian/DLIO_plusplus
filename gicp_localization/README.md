@@ -2,11 +2,31 @@
 
 GICP scan-to-map localization with IMU dead-reckoning and optional ground-truth-driven recovery. Locks onto a pre-built PCD map produced by GLIM (or any compatible source) and publishes pose at IMU rate. Designed for AV-24 Cybertruck-class platforms with multi-LiDAR setups.
 
+## Pipeline context
+
+GICP is the online-localization stage of a four-stage pipeline:
+
+```
+adapter (Atlas WGS84 → local-ENU, publishes /gps_p1/*)
+   → scripts/prep_bag.py (normalized bag)
+      → GLIM (offline map, PCD)
+         → gicp_localization (online localize)
+```
+
+The `adapter` package converts raw Atlas WGS84 fixes into a fixed local-ENU
+datum (Putnam origin from the `race_metadata` TTL) and republishes `/gps_p1/*`
+(including the ENU-framed seed `/gps_p1/filtered_odom`). `scripts/prep_bag.py`
+produces a normalized bag. GICP consumes the GLIM-built PCD map plus that
+ENU-framed seed. GICP is **frame-agnostic**: it localizes the scan against the
+PCD map and reports the pose in whatever frame the map is in — with the adapter,
+that frame is local ENU. See the `adapter` package and `scripts/prep_bag.py` for
+how the map inputs and the seed are produced.
+
 ## Features
 
 - **GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
-- **Multi-LiDAR concatenation** (`lidar_concat`): subscribes to N aux LiDARs, time-aligns to the primary, transforms via URDF, and concatenates per-point timestamps onto the primary clock.
+- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); time-aligns aux LiDARs to the primary, transforms them via offline-resolved extrinsics, and concatenates per-point timestamps onto the primary clock. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
 - **Layered rejection gates**:
   - Hard fitness reject (`gicp/fitnessRejectThreshold`)
   - Combined geometric-degeneracy gate (`hessianCondMax` AND any of `fitness`/`trans`/`rot` warn floors) — catches optimizer slides on feature-poor corners
@@ -15,7 +35,8 @@ GICP scan-to-map localization with IMU dead-reckoning and optional ground-truth-
 - **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]`, publishes deltas. Diagnostic only — never feeds back into accept/reject.
 - **GT-driven pose recovery** (optional): when GICP fails for N consecutive scans, snap pose+velocity to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Disabled by default; falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
-- **UTM-frame output** (optional): if `T_world_utm.txt` is provided, publish pose / odom / path in `utm` frame alongside `map`.
+- **Local-ENU output** (operational contract): the primary `map_frame` pose / odom / path are already in the map's frame, which — with the adapter — is a fixed local-ENU datum (Putnam origin from the `race_metadata` TTL). GICP itself is frame-agnostic and simply reports the pose in the map's frame.
+- **UTM-frame output** (optional legacy layer): only active if `localization/utm_transform_path` is set; when provided, publish pose / odom / path in `utm` frame alongside `map`. Not the default.
 - **RViz visualization** of map, aligned scan, pose, debug clouds and markers.
 
 ## Dependencies
@@ -60,7 +81,7 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
 | `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
-| `urdf_path` | (auto-found) | Path to the URDF that publishes sensor TFs. |
+| `urdf_path` | (auto-found) | Path to the URDF (`av24.urdf`) used for offline extrinsic resolution. The launch resolves it by walking up from the launch dir; `av24.urdf` is also installed into `share/gicp_localization`. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | Used by the bundled static-TF helper. |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
 
@@ -145,11 +166,18 @@ All parameters live in `cfg/localization.yaml`. The yaml has inline comments exp
 ### Frames
 
 ```yaml
-localization/map_frame:    "map"
+localization/map_frame:    "map"               # with the adapter, this IS a local-ENU frame (fixed datum)
 localization/base_frame:   "gps_antenna_top"  # body the node tracks; URDF link
 localization/imu_frame:    "gps_antenna_top"  # IMU URDF link (matches /gps_p1/imu header)
 localization/lidar_frame:  "luminar_front"    # primary LiDAR URDF link
 ```
+
+GICP is frame-agnostic: it reports the pose in whatever frame the map is in.
+With the adapter, `map` is a **local-ENU** frame (fixed datum, Putnam origin from
+the `race_metadata` TTL), and the seed `/gps_p1/filtered_odom` is in that same
+ENU frame. The `map`, the seed, and GICP must all share the one datum the adapter
+defines — a single-datum consistency requirement. UTM publishing is an optional
+legacy layer (see below), not the operational contract.
 
 ### GICP rejection gates
 
@@ -166,12 +194,32 @@ The combined hessian gate fires when condition number is high AND any of the thr
 
 ### Multi-LiDAR concatenation
 
+3x Luminar: `luminar_front` primary + `luminar_right`/`luminar_left` merged.
+
 ```yaml
 localization/lidar_concat/enabled:        true
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
-localization/lidar_concat/time_threshold: 0.05    # drop aux scans further than this from primary
+localization/lidar_concat/time_threshold: 0.1     # drop aux scans further than this from primary
+
+# Strict merge guard — IDENTICAL semantics + defaults to GLIM:
+localization/lidar_concat/require_all_aux:                    false  # false = localize on whatever LiDARs merged; true = incomplete merge SKIPS the scan (degraded cloud never registered; IMU propagation continues)
+localization/lidar_concat/abort_on_merge_failure:            true   # only relevant when require_all_aux=true: abort node past budget vs keep skipping non-fatally
+localization/lidar_concat/max_consecutive_aux_merge_failures: 10
 ```
+
+**Offline extrinsic resolution (no live `/tf_static` needed).** Aux extrinsics
+are resolved offline, in priority order: URDF (`av24.urdf` via
+`lidar_concat/urdf_path`, passed by the launch which resolves it by walking up
+from the launch dir; also installed into `share/gicp_localization`) > a static
+per-aux 4x4 (`aux_static_transforms`, baked from `av24.urdf`) > live TF as a last
+resort. The `base_frame ← lidar_frame` lever arm is resolved the same way
+(URDF > `localization/base_lidar_transform` static matrix > live TF), so full
+localization needs no `/tf_static`.
+
+**Map voxel downsample + crop box.** The GICP target map is voxel-downsampled at
+load (`localization/map_voxel_size: 0.3`) before building the kd-tree, to bound
+memory. The crop box runs in the **sensor frame** before deskew.
 
 ### Ground-truth diagnostics + recovery
 
@@ -204,6 +252,14 @@ odom/geo/Kgb: 0.0                  # Online gyro-bias adaptation disabled
 RTK/stationary calibration may still seed `state.b`, but GICP residuals do not
 continue rewriting IMU bias online unless these gains are explicitly raised.
 
+**Per-point timestamps and deskew.** Luminar per-point timestamps are `UINT8[8]`
+= a `uint64` PTP epoch in nanoseconds (per the *Luminar Iris Data Output
+Specification v1.3.0*); only 8-byte absolute carriers (`UINT8[8]` / `FLOAT64`)
+are accepted, and `UINT32` is intentionally rejected. With `dlio/deskew: true`,
+GICP deskew is header-anchored on the **primary** scan's earliest timestamp with
+a **signed** offset — so a merged aux scan that began before the primary gets a
+correct negative offset.
+
 ## Topics
 
 ### Subscribed
@@ -224,7 +280,7 @@ continue rewriting IMU bias online unless these gains are explicitly raised.
 | `localized_pose` (`gicp/localization/pose`) | `geometry_msgs/PoseStamped` | Localized pose (scan rate). |
 | `localized_odom` (`gicp/localization/odom`) | `nav_msgs/Odometry` | Localized odom propagated at IMU rate (~100 Hz). |
 | `localized_path` (`gicp/localization/path`) | `nav_msgs/Path` | Trajectory history. |
-| `gicp/localization/pose_utm` / `odom_utm` / `path_utm` | (same types) | UTM-frame mirrors when `utm_transform_path` is set. |
+| `gicp/localization/pose_utm` / `odom_utm` / `path_utm` | (same types) | Optional legacy UTM-frame mirrors, only when `utm_transform_path` is set (the primary `map`-frame outputs above are already local ENU with the adapter). |
 | `aligned_cloud` (`gicp/localization/aligned_cloud`) | `sensor_msgs/PointCloud2` | Aligned scan in `map`. |
 | `map` (`gicp/localization/map`) | `sensor_msgs/PointCloud2` | Downsampled visualization map. |
 | TF: `map → base_frame` | | Published when `publish_tf=true`. |
@@ -283,7 +339,12 @@ python3 gicp_localization/scripts/convert_ply_to_pcd.py \
     /path/to/output_map.pcd
 ```
 
-For UTM output, point `localization/utm_transform_path` at GLIM's `T_world_utm.txt` from the same dump.
+The operational contract is **local ENU**: with the adapter, the GLIM-built map,
+the seed `/gps_p1/filtered_odom`, and GICP all share the one ENU datum the adapter
+defines, and the primary `map`-frame outputs are already ENU — no extra transform
+is needed. UTM output is an **optional legacy layer**: only if you set
+`localization/utm_transform_path` (e.g. at GLIM's `T_world_utm.txt` from the same
+dump) does the node also publish the `utm`-frame mirrors. It is not the default.
 
 ## Troubleshooting
 
@@ -308,7 +369,7 @@ Look in the log for one of:
 
 ### Scan dropouts during sharp turns
 
-If you see SCAN DEBUG gaps > 200 ms during turns, `lidar_concat/time_threshold` is dropping aux scans that fell out of sync. Try raising it from `0.05` to `0.1`–`0.15`. The merged cloud will have slightly worse intra-frame alignment but that's almost always cheaper than a 600 ms scan-stream gap during cornering.
+If you see SCAN DEBUG gaps > 200 ms during turns, `lidar_concat/time_threshold` is dropping aux scans that fell out of sync. Try raising it from the default `0.1` toward `0.15`. The merged cloud will have slightly worse intra-frame alignment but that's almost always cheaper than a 600 ms scan-stream gap during cornering. (If `require_all_aux: true`, an out-of-sync aux instead SKIPS the whole scan rather than degrading it.)
 
 ### GICP slides at corners
 

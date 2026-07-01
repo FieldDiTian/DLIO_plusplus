@@ -384,7 +384,11 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
       std::lock_guard<std::mutex> lock(aux_buffers_mutex);
       merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold,
                                       aux_concat.require_all_aux, aux_concat.max_consecutive_merge_failures,
-                                      &aux_concat.consecutive_merge_failures);
+                                      &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure);
+    }
+    // nullptr = strict merge skipped this scan (require_all_aux); drop it.
+    if (!merged) {
+      return;
     }
     points_callback(merged, primary_count);
   } else {

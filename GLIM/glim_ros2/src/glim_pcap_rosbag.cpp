@@ -588,9 +588,13 @@ int main(int argc, char** argv) {
           epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
           final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
                                                 concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
-                                                &concat_config.consecutive_merge_failures);
+                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure);
         }
-        const size_t workload = glim->points_callback(final_points, epoch_anchor_count);
+        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
+        size_t workload = 0;
+        if (final_points) {
+          workload = glim->points_callback(final_points, epoch_anchor_count);
+        }
         cnt_pcap_primary++;
         if (s.cloud->header.stamp.sec + s.cloud->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");
@@ -643,9 +647,12 @@ int main(int argc, char** argv) {
           epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
           final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
                                                 concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
-                                                &concat_config.consecutive_merge_failures);
+                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure);
         }
-        glim->points_callback(final_points, epoch_anchor_count);
+        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
+        if (final_points) {
+          glim->points_callback(final_points, epoch_anchor_count);
+        }
       }
     } else {
       bag_dispatch_fanout(ev);

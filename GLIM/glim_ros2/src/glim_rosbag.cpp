@@ -374,9 +374,13 @@ int main(int argc, char** argv) {
           epoch_anchor_count = static_cast<int>(points_msg->width * points_msg->height);
           final_points = glim_ros::merge_clouds(points_msg, aux_sensors, concat_time_threshold,
                                                 concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
-                                                &concat_config.consecutive_merge_failures);
+                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure);
         }
-        const size_t workload = glim->points_callback(final_points, epoch_anchor_count);
+        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
+        size_t workload = 0;
+        if (final_points) {
+          workload = glim->points_callback(final_points, epoch_anchor_count);
+        }
 
         if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");

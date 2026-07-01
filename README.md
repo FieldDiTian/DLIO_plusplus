@@ -6,22 +6,54 @@ ROS 2 perception stack for the AV-24 Cybertruck autonomous race car. Pairs a GPU
 
 | Package | Upstream | Purpose in this fork |
 |---|---|---|
+| [`adapter/`](adapter/) | new in this repo | Point One Atlas normalization boundary. Converts raw Atlas WGS84 pose/IMU into the `/gps_p1/*` (and optional `/gnss*`) streams in a **local ENU** `map` frame consumed by GLIM/GICP. |
 | [`GLIM/`](GLIM/) | [`koide3/GLIM`](https://github.com/koide3/glim) (+ `glim_ext`, `glim_ros2`) | LiDAR-inertial SLAM. Builds a 3D map from IMU + multi-LiDAR + GNSS. |
 | [`gicp_localization/`](gicp_localization/) | Vendored from the `vectr-ucla` DLIO line (uses `nano_gicp`) | GICP scan-to-map localization against a PCD map produced by GLIM. |
-| [`dlio/`](dlio/) | new in this repo | Convenience metapackage that pulls both packages into a single colcon build. |
+| [`dlio/`](dlio/) | new in this repo | Convenience metapackage that pulls the packages into a single colcon build. |
 
-Each subpackage has its own README (`GLIM/README.md`, `gicp_localization/README.md`) covering installation, configuration, and per-knob tuning. **This top-level README focuses on what we changed versus upstream and why.**
+`scripts/prep_bag.py` ties the adapter to offline mapping: it runs the adapter's normalization on a raw bag/PCAP and copies the raw Luminar topics through untouched, producing a single normalized bag GLIM/GICP can consume.
+
+Each subpackage has its own README (`adapter/README.md`, `GLIM/README.md`, `gicp_localization/README.md`) covering installation, configuration, and per-knob tuning. **This top-level README focuses on what we changed versus upstream and why.**
+
+### Pipeline at a glance
+
+```
+adapter        Atlas WGS84 pose/IMU  ──►  /gps_p1/*  (+ /gnss*)   [local ENU, map frame]
+prep_bag.py    raw bag/PCAP          ──►  normalized bag         [adapter streams + raw Luminar]
+GLIM           normalized bag        ──►  offline 3D map (PCD)   [local ENU]
+gicp_localization  PCD map + ENU seed ──► online pose @ IMU rate [local ENU]
+```
 
 ## Sensor / Vehicle Target
 
 The configs target an AV-24 Cybertruck instrumented with:
 
-- **3× Luminar Iris LiDAR** — `luminar_front` is the primary sensor; `luminar_left` and `luminar_right` are concatenated into the primary cloud via URDF transforms.
+- **3× Luminar Iris LiDAR** — `luminar_front` is the primary sensor; `luminar_left` and `luminar_right` are merged into the primary cloud by `lidar_concat`. Aux extrinsics are resolved **offline** (no live `/tf_static` needed): priority **URDF** (`av24.urdf`) → **static 4×4 matrix** in config → live TF as last resort. GICP resolves the `base_frame ← luminar_front` lever arm the same way, so full localization also needs no `/tf_static`. A **strict merge guard** with identical semantics + defaults in GLIM and GICP governs incomplete merges — see [Multi-LiDAR merge policy](#multi-lidar-merge-policy) below.
 - **Point One Atlas (LG69T) INS** publishing IMU on `/gps_p1/imu` (`imu_calibrated`: sensor-level bias/scale/misalignment removed by FusionEngine firmware, gravity present, no fused orientation) and odometry on `/gps_p1/filtered_odom`. Atlas firmware projects both the IMU and the INS pose to the primary antenna phase centre, so the URDF link `gps_antenna_top` is used as both `base_frame` and `imu_frame` in the localization config. RTK quality is gated on the Atlas-reported pose covariance.
 - **RTK GPS** — the FusionEngine INS itself; no separate raw RTK topic is needed for localization.
 - Optional camera (used only by extension modules).
 
-All sensor extrinsics are resolved at runtime from [`av24.urdf`](av24.urdf); the `*_frame` strings in the configs are URDF link names, not free-form labels.
+All sensor extrinsics are resolved at startup from [`av24.urdf`](av24.urdf) (offline-safe, with a static-matrix fallback so no live TF is required); the `*_frame` strings in the configs are URDF link names, not free-form labels.
+
+### Coordinate frames — local ENU
+
+The `map` frame is a **local ENU** tangent frame anchored at a fixed geodetic **datum** (the Putnam origin read from `race_metadata`'s TTL), matching race_common's convention. The [`adapter`](adapter/) package is the **single authority** that converts raw Atlas WGS84 fixes into that ENU frame and republishes `/gps_p1/*` (and optional `/gnss*`) already in ENU, so GLIM and GICP consume ENU directly. GICP is **frame-agnostic** — it localizes the scan against the PCD map and reports the pose in whatever frame the map is in; because the map is built in ENU and the seed is ENU, its output is ENU with no extra transform.
+
+The one hard constraint is a **single shared datum**: the map, the seed (`/gps_p1/filtered_odom`), and GICP must all use the origin the adapter defines, or the frames silently disagree.
+
+This **replaces the earlier UTM contract**. GLIM's `gnss_global` still aligns the map to the GNSS input frame via a 2D Umeyama fit and can export that SE(3) (the file/variable are still named `T_world_utm` for historical reasons), but when fed ENU input that transform is effectively world↔ENU. GICP's `utm`-frame publishing is now an **optional legacy layer**, active only if `localization/utm_transform_path` is set.
+
+### Multi-LiDAR merge policy
+
+`lidar_concat` (in both GLIM and GICP) merges `luminar_left`/`luminar_right` into `luminar_front`. Two config flags — **identical names, semantics, and defaults in both pipelines** — govern what happens when an aux scan is missing or late:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `require_all_aux` | `false` | `false` = localize/map on whatever LiDARs merged this scan (front + available aux). `true` = an incomplete merge **skips** the scan (a degraded cloud is never registered; IMU propagation continues). |
+| `abort_on_merge_failure` | `true` | Only relevant when `require_all_aux=true`. Past `max_consecutive_(aux_)merge_failures` (default `10`): `true` = abort the node (fail-fast, for sync validation / bring-up); `false` = keep skipping non-fatally (robust long replays). |
+| `time_threshold` | `0.1 s` | Max aux-to-primary time offset to still merge. Raised from a tight window after Run3 data showed ~half the aux scans missed at 0.05 s, dropping scans and inflating the pose-error tail. |
+
+The operational default (`require_all_aux=false`) localizes on available LiDARs; strict mode (`require_all_aux=true`) is for a sync-validation pass. Merged-sweep deskew timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum. Config lives in `gicp_localization/cfg/localization.yaml` and `GLIM/glim/config/config_sensors.json`.
 
 Current localization scope is intentionally single-source Point One Atlas. Earlier
 project notes mention NovAtel and VectorNav GNSS integration, but
@@ -160,14 +192,19 @@ If you ever switch sensors and the deskew looks wrong, run the one-shot diagnost
 
 ## Workflow
 
-1. **Record** a bag containing IMU + LiDAR + GNSS topics during a driving session.
-2. **Map** offline with GLIM:
+1. **Record** a raw bag containing LiDAR + `/atlas/*` (and a Point One PCAP for IMU) during a driving session.
+2. **Normalize** the raw bag with the adapter via `prep_bag.py`: it converts Atlas pose/IMU into `/gps_p1/*` in the local-ENU `map` frame and copies the raw Luminar topics through unchanged.
    ```bash
-   ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=/tmp/dump
+   python3 scripts/prep_bag.py --input /path/to/raw_bag --output /path/to/normalized_bag \
+     --p1-imu-pcap /path/to/ins.pcap
    ```
-   Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` (GNSS-to-map SE(3)) into `dump_path`.
-3. **Convert** submaps into a single PCD map by opening the dump in `glim_ros offline_viewer` and exporting to PLY (then to PCD via `gicp_localization/scripts/convert_ply_to_pcd.py`). The GUI step is **intentional, not a gap** — see "Why the offline_viewer step is manual" below.
-4. **Localize** online against that PCD map with `gicp_localization`. Point the launch file at the PCD and (optionally) the matching `T_world_utm.txt`.
+3. **Map** offline with GLIM from the normalized bag:
+   ```bash
+   ros2 run glim_ros glim_rosbag <normalized_bag> --ros-args -p dump_path:=/tmp/dump
+   ```
+   Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` into `dump_path`. Fed ENU input, that exported SE(3) is world↔ENU (historical filename); the map itself is in local ENU.
+4. **Convert** submaps into a single PCD map by opening the dump in `glim_ros offline_viewer` and exporting (the GUI step is **intentional, not a gap** — see "Why the offline_viewer step is manual" below).
+5. **Localize** online against that PCD map with `gicp_localization`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. The map is already ENU; `utm_transform_path` is optional legacy.
 
 ### Why the offline_viewer step is manual
 
@@ -198,6 +235,12 @@ If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an 
 ## Quick Reference
 
 ```bash
+# Normalize a raw bag (Atlas -> local-ENU /gps_p1/*, raw Luminar copied through)
+python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag> --p1-imu-pcap <ins.pcap>
+
+# Run the Atlas adapter standalone (live or replay)
+ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>"
+
 # Live SLAM with real sensors
 ros2 launch glim_ros glim_ros.launch.py config_path:=config
 
@@ -230,8 +273,8 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **Sensor / preprocessing**
 
-- **Multi-LiDAR concatenation (`lidar_concat`).** New module in `glim_ros2` (`include/glim_ros/lidar_concat.hpp`) that subscribes to N aux LiDAR topics, time-aligns each scan to the primary clock, transforms aux points into the primary frame via URDF, **rebases per-point timestamps** so the concatenated cloud has a single monotonic time base, and emits a single merged cloud to the rest of the pipeline. Includes a validation step that **rolls back the aux-merge append** if the merged cloud fails sanity checks, instead of letting a malformed cloud poison odometry (commit `52f88cb`).
-- **URDF-based extrinsic resolution.** Sensor extrinsics (`T_lidar_imu`, inter-LiDAR transforms, IMU↔GNSS) are read from a runtime URDF instead of hand-edited JSON. The relevant configs (`config_sensors.json`) reference *URDF link names*; the loader walks the URDF at startup. Removes the previous hard-coded URDF path.
+- **Multi-LiDAR concatenation (`lidar_concat`).** New module in `glim_ros2` (`include/glim_ros/lidar_concat.hpp`) that subscribes to N aux LiDAR topics, time-aligns each scan to the primary clock, transforms aux points into the primary frame, **rebases per-point timestamps** so the concatenated cloud has a single monotonic time base (anchored on the primary scan's earliest timestamp), and emits a single merged cloud. Includes a validation step that **rolls back the aux-merge append** on a malformed cloud, and the shared **strict merge guard** (`require_all_aux` / `abort_on_merge_failure`, defaults matching GICP — see [Multi-LiDAR merge policy](#multi-lidar-merge-policy)).
+- **Offline extrinsic resolution.** Aux-LiDAR (and IMU/GNSS) extrinsics are read from `av24.urdf` — the configs reference *URDF link names* and the loader resolves the URDF at startup **CWD-independently** (walks up from the config dir; `av24.urdf` is installed into `share/glim/config`), with a static-matrix fallback. No live `/tf_static` is needed for offline replay.
 - **`flip_points_y` preprocessing** flag (`config_sensors.json` → `glim_ros.cpp`) for mirrored-installed LiDARs.
 - **Per-point timestamp rebasing fix** when merging multi-LiDAR clouds (commit `7f5a6d9`). Without this the merged cloud had a non-monotonic stamp field that broke deskewing.
 
@@ -242,7 +285,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **GNSS extension (`glim_ext/modules/mapping/gnss_global`)**
 
-- **`T_world_utm.txt` export** of the recovered GNSS-to-map SE(3) once GNSS alignment initializes. Downstream localizers (including `gicp_localization` here) consume this file to publish poses in a `utm` frame in addition to `map`.
+- **GNSS-to-map SE(3) export** (`T_world_utm.txt`) once GNSS alignment initializes, recovered by a 2D Umeyama fit of the submap trajectory to the GNSS input frame. With the adapter feeding **local ENU**, that transform is effectively world↔ENU (the filename/variable keep the historical `utm` name). Downstream `gicp_localization` can optionally consume it for a legacy `utm`-frame mirror, but the operational contract is local ENU — see [Coordinate frames](#coordinate-frames--local-enu).
 - **URDF lever-arm support** (commit `50ae6ae`/`50ae...50a...50aa50a` — see `git log`): the IMU→GNSS lever-arm is taken from the URDF rather than from a manual offset in the config.
 - **Orientation prior** mode: optionally constrain map yaw directly from GNSS heading.
 - **Strip stale GNSS rotation priors on graph reload** (commit `6a50632`) so a re-opened graph doesn't double-apply an orientation constraint that no longer matches the live frame.
@@ -260,7 +303,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 **Scan-to-map vs. scan-to-submap**
 
 - **Single pre-built PCD map.** No submap stitching at runtime — the map is loaded once and never grows. Trades adaptability for a small, predictable working set.
-- **Multi-LiDAR concatenation** (mirrors the GLIM-side feature). Subscribes to N aux LiDARs, transforms via URDF, concatenates onto the primary cloud's clock.
+- **Multi-LiDAR concatenation** (mirrors the GLIM-side feature, same strict-guard flags and defaults). Subscribes to N aux LiDARs, resolves extrinsics offline (URDF → static matrix → live TF), and concatenates onto the primary cloud's clock. The target map is voxel-downsampled at load (`localization/map_voxel_size: 0.3`) to bound the kd-tree memory, and the crop box runs in **sensor frame before deskew**.
 
 **Robustness against degenerate geometry**
 
@@ -283,7 +326,9 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **Output frames**
 
-- **UTM-frame publishing.** If `T_world_utm.txt` (from the GLIM run that built the map) is configured, the node publishes pose/odom/path in a `utm` frame alongside `map`. Lets downstream consumers consume world-referenced poses without re-deriving the transform.
+- **Local-ENU output (default).** The primary `map`-frame pose/odom/path are already in local ENU because the map and the adapter's seed are ENU — GICP is frame-agnostic and just reports in the map's frame. No transform step needed.
+- **Optional UTM mirror (legacy).** Only if `localization/utm_transform_path` points at a `T_world_utm.txt`, the node additionally publishes pose/odom/path in a `utm` frame. Off by default.
+- **Offline extrinsic resolution.** Both the aux-LiDAR transforms and the `base_frame ← lidar_frame` lever arm are resolved from `av24.urdf` (with a static-matrix fallback), so replay works without `robot_state_publisher` / `/tf_static`.
 - **TF policy:** the `map → base_link` TF broadcast is disabled by default (commit `9cc18d7`) to avoid fighting other publishers; downstream nodes consume the published `nav_msgs/msg/Odometry` instead.
 
 **Operational defaults**
@@ -296,11 +341,12 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 ```
 DLIO_plusplus/
+├── adapter/             # Atlas -> local-ENU /gps_p1/* normalization package
 ├── GLIM/                # SLAM workspace (glim, glim_ext, glim_ros2)
 ├── gicp_localization/   # Map-based localization package
 ├── dlio/                # Convenience metapackage
 ├── av24.urdf            # Vehicle URDF (drives all sensor extrinsics)
-├── scripts/             # Bag-prep, map-merge, and analysis helpers
+├── scripts/             # prep_bag.py (adapter normalization), map export, analysis
 ├── profiling_logs/      # Resource-profile CSVs + comparison plots
 ├── CLAUDE.md            # Developer-facing project summary
 ├── AGENTS.md            # Notes for AI reviewers (false positives, watch-conditions)
