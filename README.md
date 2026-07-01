@@ -80,11 +80,19 @@ If the module ever loads with this config, it logs `lever-arm compensation expli
 
 ### Recovery during GICP failures
 
-In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting, the node snaps pose and velocity to the latest Atlas INS sample that passed the pose-covariance quality gate. If the gate rejects (Atlas covariance above the configured thresholds), GT samples are dropped and the node stays on IMU dead-reckoning until either LiDAR geometry or RTK quality recovers.
+In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting (after `gt_recovery/min_consecutive_failures` non-accepts), the node snaps pose and velocity to the time-matched Atlas INS sample.
+
+**The RTK quality gate is applied per-consumer, not globally, and snap recovery is intentionally exempt.** `callbackGtOdom()` buffers *every* Atlas sample regardless of FIXED/FLOAT/dead-reckoning state; the covariance gate (`gtSampleIsRtkFixed`) is then applied at each consumer:
+
+- **Bias calibration / seed** (`tryRtkCalibrationStep`) → **requires RTK-FIXED**.
+- **GT divergence cross-check** (`gt_pos_err` diagnostic) → **requires RTK-FIXED**.
+- **Snap recovery** (`maybeSnapPoseToGT`) → **accepts any-quality Atlas sample**.
+
+The rationale is that Atlas FusionEngine already runs a coupled GNSS+IMU INS with calibrated sensors, so during RTK loss its degraded pose is still the better truth source than the node's own software IMU dead-reckoning. This means recovery can snap toward an RTK-float/GPS-only fix when GICP has failed — a deliberate trade. It is enabled by default (`gt_recovery/enable: true`, `min_consecutive_failures: 1`); raise `min_consecutive_failures`, or disable `gt_recovery` if you require the snap to be strictly RTK-gated. (`AGENTS.md` documents the joint GICP-fail + RTK-degraded watch condition.)
 
 ### Initialization: RTK-driven IMU calibration
 
-By default the localizer uses the post-gate Atlas GT odom stream to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first high-quality sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no gated GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the localizer inspects `pose.covariance` on every `/gps_p1/filtered_odom` sample and drops anything that exceeds `max_pose_var_xy` / `max_pose_var_z`. Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
+By default the localizer uses RTK-FIXED Atlas GT odom to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first high-quality sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no RTK-FIXED GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the calibration/seed and the divergence cross-check inspect `pose.covariance` on each `/gps_p1/filtered_odom` sample and use only those within `max_pose_var_xy` / `max_pose_var_z` (the buffer itself keeps every sample; the gate is per-consumer, and snap recovery is exempt — see above). Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
 
 ### GLIM mapping init — two sequenced conditions, both satisfied in the park position
 
@@ -120,7 +128,7 @@ A single-antenna INS receiver that aligns its heading from motion would create a
 
 Steps 3–5 happen concurrently inside the parked 30 s – 2 min RTK acquisition window; no extra wait is added by Phase 2 in normal operation. If Atlas never reaches FIXED while parked, that's a hardware/sky-view problem to resolve before driving — it should not be papered over by starting GLIM and "hoping" RTK lands later.
 
-Neither phase applies to `gicp_localization` — that pipeline does RTK-driven IMU calibration while the vehicle is moving and snaps from a single RTK-FIXED GT sample. Only GLIM mapping needs the two-phase sequenced startup.
+Neither phase applies to `gicp_localization` — that pipeline does RTK-driven IMU calibration while the vehicle is moving and **seeds** from a single RTK-FIXED GT sample (the initial seed and calibration are FIXED-gated; the failure-recovery snap is not — see [Recovery during GICP failures](#recovery-during-gicp-failures)). Only GLIM mapping needs the two-phase sequenced startup.
 
 ### Remaining tuning work
 
@@ -153,12 +161,9 @@ t_point = scan_stamp.seconds()  +  (ts - anchor_ts) * 1e-9
 
 It uses **only the relative offset within the sweep, anchored at the header stamp** — it never trusts the absolute epoch of `ts`. `anchor_ts` is the **earliest timestamp of the PRIMARY scan**, captured in `mergeAuxClouds()` before any aux cloud is appended (for a single-sensor scan this is just that scan's own minimum). Anchoring on the primary — rather than the global merged minimum — keeps a multi-LiDAR sweep correctly timed when an aux scan started *before* the primary: such aux points get correctly **negative** offsets (hence the **signed** `int64` subtraction), instead of being collapsed onto the header stamp and shifting the whole sweep late. That makes GICP deskew **correct regardless of whether the per-point clock is on the Unix/INS epoch or a sensor-local/PTP axis**. The only way it could break is a driver emitting a bare 32-bit sub-second field that wraps mid-scan; the one-second-boundary check (Procedure C) confirms that does not happen. This is why GICP needs no timestamp repair and is the more trustworthy pipeline for deskew.
 
-**GLIM deskew — correct, but requires epoch alignment.** `ros_cloud_converter.hpp` reads `UINT8[8]` as little-endian `uint64` and divides by `1e9` → epoch *seconds* (~1.78e9). `TimeKeeper::replace_points_stamp` then sees `max_time ≥ 1.0`, takes the *absolute → relative* branch, and (with `prefer_frame_time=false`) **overwrites the frame stamp with the first point time** while making per-point times relative; `point_time_scale` stays `1.0`. Because GLIM *trusts the absolute point-time epoch*, that epoch must match the IMU/header epoch. Raw bags were observed with point times on the sensor/PTP axis (~2e13 ns) while the header/IMU were on the ROS/INS epoch — GLIM then overwrote the frame stamp with a sensor-clock value and dropped every scan as unsynchronized. Two complementary repairs close this:
+**GLIM deskew — correct, but requires epoch alignment.** `ros_cloud_converter.hpp` reads `UINT8[8]` as little-endian `uint64` and divides by `1e9` → epoch *seconds* (~1.78e9). `TimeKeeper::replace_points_stamp` then sees `max_time ≥ 1.0`, takes the *absolute → relative* branch, and (with `prefer_frame_time=false`) **overwrites the frame stamp with the first point time** while making per-point times relative; `point_time_scale` stays `1.0`. Because GLIM *trusts the absolute point-time epoch*, that epoch must match the IMU/header epoch. Raw bags were observed with point times on the sensor/PTP axis (~2e13 ns) while the header/IMU were on the ROS/INS epoch — GLIM then overwrote the frame stamp with a sensor-clock value and dropped every scan as unsynchronized. The **live, in-pipeline safeguard** closes this: `ros_cloud_converter.hpp` rebases the absolute per-point times onto the header epoch (span preserved), anchored on the primary scan's earliest timestamp (`epoch_anchor_count`), and only when the times are absolute *and* `|header − min| > 1 s` — a no-op on already-aligned data and on scan-relative sensors.
 
-- **Offline:** `scripts/prep_bag.py` rebases each Luminar cloud by `header.stamp − min(point_time)` (span preserved) when building a prepped bag.
-- **Live:** `ros_cloud_converter.hpp` applies the same rebase in-pipeline — only when the times are absolute *and* `|header − min| > 1 s` (a no-op on already-aligned/prepped data and on scan-relative sensors).
-
-GICP requires neither because of the header-anchored relative-offset design above.
+Note: `scripts/prep_bag.py` deliberately does **not** rebase LiDAR — it copies the raw Luminar messages **byte-for-byte** (keeping the raw measurements unchanged) and only normalizes the small Atlas-derived streams. Timestamp handling is owned entirely by the runtime converter/TimeKeeper, so the offline path relies on the same live safeguard. GICP requires no rebase at all because of the header-anchored relative-offset design above.
 
 **Status.** Deskew is validated correct for all bagged/offline data in both stacks. The only open item is a **live-hardware PTP-lock repeat** (no live publishers were available during the final check). That item concerns absolute-epoch / GT time association, **not** GICP deskew geometry, which depends only on the (validated) intra-scan span. Previously both stacks ran with deskew effectively off because this encoding was ambiguous; it no longer is.
 
@@ -218,7 +223,7 @@ A blind `merge_glim_submaps.py` would skip all three and bake any unresolved dri
 
 ## Build
 
-ROS 2 Humble + colcon. Built and tested inside an Ubuntu 22.04 distrobox (`distrobox enter ros2-humble`).
+ROS 2 Jazzy + colcon on Ubuntu 24.04.
 
 ```bash
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
@@ -230,7 +235,7 @@ Headline dependencies (per-package READMEs go deeper):
 - GTSAM 4.2, gtsam_points (GPU factors), Eigen3, PCL, OpenMP, nlohmann::json, spdlog
 - Optional: CUDA 11.8+ (GPU acceleration), Iridescence (viewer), OpenCV
 
-If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-humble-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/humble/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
+If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-jazzy-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/jazzy/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 
 ## Quick Reference
 
@@ -238,11 +243,15 @@ If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an 
 # Normalize a raw bag (Atlas -> local-ENU /gps_p1/*, raw Luminar copied through)
 python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag> --p1-imu-pcap <ins.pcap>
 
-# Run the Atlas adapter standalone (live or replay)
-ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>"
+# Run the Atlas adapter standalone.
+# Default IMU source is a Point One PCAP (use_p1_imu_pcap:=true), so pass a pcap:
+ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>" p1_imu_pcap_path:=/path/to/ins.pcap
+# ...or use the live Atlas IMU ROS topic instead:
+ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>" use_p1_imu_pcap:=false
 
-# Live SLAM with real sensors
-ros2 launch glim_ros glim_ros.launch.py config_path:=config
+# GLIM builds maps OFFLINE only. There is no live `glim_ros.launch.py` — the live
+# node intentionally exits when `enable_online_mapping=false` (config_ros.json).
+# Use one of the offline entry points below.
 
 # Offline bag → map (ROS 2 mcap input)
 ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=<out_dir>

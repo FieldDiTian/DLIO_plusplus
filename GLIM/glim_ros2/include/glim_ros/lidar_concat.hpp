@@ -181,6 +181,24 @@ inline void shift_cloud_timestamps(
   double dt) {
   if (time_off < 0) return;
 
+  // UINT8[8] (Luminar Iris uint64 PTP epoch nanoseconds -- driver reconstruction of
+  // header seconds + per-ray nanoseconds) is ABSOLUTE and must never be shifted, so
+  // skip the whole per-point loop for it. The count check is done ONCE here (not per
+  // point): any UINT8 count != 8 is not a recognised timestamp encoding, so warn once
+  // -- mirroring extract_raw_points()'s `count != 8` rejection -- and leave untouched
+  // (there is no correct shift for an unknown layout).
+  if (time_datatype == sensor_msgs::msg::PointField::UINT8) {
+    if (time_count != 8) {
+      static bool warned_uint8_count = false;
+      if (!warned_uint8_count) {
+        spdlog::warn("shift_cloud_timestamps: UINT8 time field with count={} (expected 8 for Luminar epoch-ns); leaving unshifted", time_count);
+        warned_uint8_count = true;
+      }
+    }
+    (void)dt;
+    return;
+  }
+
   const size_t num_points = data.size() / point_step;
   for (size_t i = 0; i < num_points; i++) {
     uint8_t* time_ptr = &data[i * point_step + time_off];
@@ -205,24 +223,6 @@ inline void shift_cloud_timestamps(
         std::memcpy(&val, time_ptr, sizeof(double));
         val += dt;
         std::memcpy(time_ptr, &val, sizeof(double));
-        break;
-      }
-      case sensor_msgs::msg::PointField::UINT8: {
-        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds (driver
-        // reconstruction of header seconds + per-ray nanoseconds; see header
-        // comment). Absolute timestamps -- leave untouched. Any OTHER count is
-        // not a recognised timestamp encoding; mirror extract_raw_points()'s
-        // `count != 8` rejection by warning once rather than silently assuming
-        // Luminar (we still leave it untouched -- there is no correct shift for
-        // an unknown layout).
-        if (time_count != 8) {
-          static bool warned_uint8_count = false;
-          if (!warned_uint8_count) {
-            spdlog::warn("shift_cloud_timestamps: UINT8 time field with count={} (expected 8 for Luminar epoch-ns); leaving unshifted", time_count);
-            warned_uint8_count = true;
-          }
-        }
-        (void)dt;
         break;
       }
       default:
@@ -387,7 +387,7 @@ struct AuxConcatConfig {
   // running state that the caller passes to merge_clouds each scan.
   bool require_all_aux = false;               // false = build/localize on available LiDARs
   bool abort_on_merge_failure = true;         // true = stop past budget; false = keep skipping non-fatally
-  int max_consecutive_merge_failures = 10;
+  int max_consecutive_aux_merge_failures = 10;
   int consecutive_merge_failures = 0;
 };
 
@@ -422,7 +422,7 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   out.buffer_size = config_sensors.param<int>("lidar_concat", "buffer_size", 200);
   out.require_all_aux = config_sensors.param<bool>("lidar_concat", "require_all_aux", false);
   out.abort_on_merge_failure = config_sensors.param<bool>("lidar_concat", "abort_on_merge_failure", true);
-  out.max_consecutive_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_merge_failures", 10);
+  out.max_consecutive_aux_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_aux_merge_failures", 10);
 
   if (!out.enabled) {
     return out;

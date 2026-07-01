@@ -18,7 +18,7 @@
     // (front + any available aux) instead of aborting when an aux is missing or late,
     // avoiding the scan-gap behavior seen at a tight window. Set true only for a
     // sync-validation pass: an incomplete required merge then SKIPS the scan, and past
-    // max_consecutive_merge_failures the node throws/stops only if
+    // max_consecutive_aux_merge_failures the node throws/stops only if
     // abort_on_merge_failure=true (otherwise it keeps skipping non-fatally; the
     // startup unresolved-extrinsics check is likewise gated on abort_on_merge_failure).
     // time_threshold raised 0.01 -> 0.1 to match GICP and capture the aux-to-primary jitter.
@@ -28,7 +28,7 @@
     //   false = keep skipping incomplete scans non-fatally (robust long replays)
     // Ignored when require_all_aux=false. Parity with GICP abort_on_merge_failure.
     "abort_on_merge_failure": true,
-    "max_consecutive_merge_failures": 10
+    "max_consecutive_aux_merge_failures": 10
   },
   "sensors": {
     "T_lidar_camera": [

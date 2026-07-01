@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
           // scan started before the primary.
           epoch_anchor_count = static_cast<int>(points_msg->width * points_msg->height);
           final_points = glim_ros::merge_clouds(points_msg, aux_sensors, concat_time_threshold,
-                                                concat_config.require_all_aux, concat_config.max_consecutive_merge_failures,
+                                                concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
                                                 &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure);
         }
         // nullptr = strict merge skipped this scan (require_all_aux); drop it.

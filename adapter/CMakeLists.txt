@@ -64,6 +64,7 @@ install(DIRECTORY config launch
 
 install(FILES README.md
   DESTINATION share/${PROJECT_NAME}
+  OPTIONAL
 )
 
 ament_package()

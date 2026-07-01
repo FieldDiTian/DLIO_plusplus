@@ -41,7 +41,7 @@ how the map inputs and the seed are produced.
 
 ## Dependencies
 
-- ROS 2 Humble
+- ROS 2 Jazzy
 - PCL, Eigen3, OpenMP, nlohmann::json
 - `PointType` and a vendored copy of `nano_gicp` ship inside this package; no
   separate `direct_lidar_inertial_odometry` dependency is required.

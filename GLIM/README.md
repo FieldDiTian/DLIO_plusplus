@@ -29,7 +29,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 **Luminar per-point timestamps & deskew** — `ros_cloud_converter.hpp`, `config_sensors.json`
 
 - Decode the Luminar `UINT8[8]` little-endian uint64 **PTP epoch-nanosecond** per-point time field (`/1e9` → epoch seconds); deskew is ON. Upstream handles only `UINT32`/`FLOAT32`/`FLOAT64` and would drop these scans as "unsupported time type". Timestamp-format authority: **Luminar Iris Data Output Specification v1.3.0**.
-- **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), `ros_cloud_converter` rebases them onto the header epoch, **anchored on the primary scan** (intra-scan span preserved; threaded `epoch_anchor_count`), so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. Generalizes `scripts/prep_bag.py`'s offline repair to the live path; no-op on already-aligned or scan-relative data.
+- **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), `ros_cloud_converter` rebases them onto the header epoch, **anchored on the primary scan** (intra-scan span preserved; threaded `epoch_anchor_count`), so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. This live safeguard is the **sole** timestamp repair — `scripts/prep_bag.py` deliberately copies the raw Luminar clouds byte-for-byte (no offline restamp), so runtime owns epoch alignment. No-op on already-aligned or scan-relative data.
 - Full rationale + validation: root `README.md` → "Luminar Iris per-point timestamps — the definitive account".
 
 **Multi-LiDAR concatenation** — `glim_ros2/include/glim_ros/lidar_concat.hpp`, `glim_ros2/src/glim_ros/glim_ros.cpp`
@@ -39,7 +39,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 - **Strict merge guard** (config in `glim/config/config_sensors.json` under `lidar_concat`; **identical semantics and defaults to GICP**):
   - `require_all_aux` (default **false**) — false = build/localize on whatever LiDARs merged this scan; true = an incomplete merge **skips** the scan entirely rather than emitting a degraded cloud.
   - `abort_on_merge_failure` (default **true**, only relevant when `require_all_aux=true`) — abort the node once past the failure budget vs. keep skipping non-fatally.
-  - `max_consecutive_merge_failures: 10`.
+  - `max_consecutive_aux_merge_failures: 10`.
   - `time_threshold: 0.1` (raised from 0.01 to capture aux-to-primary jitter).
   - Startup guards also gate on `require_all_aux && abort_on_merge_failure`.
 - **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
@@ -101,8 +101,8 @@ The exact behavior of this fork should be taken from the checked-in config and s
 ## Dependencies
 
 ### System Requirements
-- Ubuntu 22.04 (recommended)
-- ROS2 Humble
+- Ubuntu 24.04 (recommended)
+- ROS 2 Jazzy
 - CUDA 11.8+ (optional, for GPU acceleration)
 
 ### Core Dependencies
@@ -114,8 +114,8 @@ sudo apt install -y \
   libfmt-dev \
   libomp-dev \
   libmetis-dev \
-  ros-humble-tf2-eigen \
-  ros-humble-pcl-ros
+  ros-jazzy-tf2-eigen \
+  ros-jazzy-pcl-ros
 ```
 
 ### GTSAM (Required)
@@ -225,16 +225,19 @@ First INS sample received at stamp=… cov=[…] -> FIXED
 ```
 If `-> NOT FIXED` instead, wait. The filter will log the transition the moment Atlas reaches FIXED.
 
-**Step 3 — Launch GLIM:**
-```bash
-# Live
-ros2 launch glim_ros glim_ros.launch.py config_path:=config
+**Step 3 — Record the session, then build the map offline:**
 
-# Or replay an existing bag
-ros2 launch glim_ros glim_ros.launch.py config_path:=config use_sim_time:=true
-ros2 bag play <your_bag_file.db3> --clock
+GLIM maps **offline only**, so the parked-init + drive sequence below is performed
+while **recording a bag** (the standstill and RTK-FIXED conditions govern the
+recorded data quality). Build the map afterward from that bag:
+```bash
+ros2 run glim_ros glim_rosbag <your_bag> --ros-args -p dump_path:=<out_dir>
 ```
-You should see `estimate initial IMU state` from the LiDAR+IMU loose-init within ~5 s, followed by the first GNSS-prior factor insertion from `gnss_global` once a FIXED sample lands. Map points appear in the viewer.
+During the offline run you should see `estimate initial IMU state` from the
+LiDAR+IMU loose-init within ~5 s of the bag's parked segment, followed by the
+first GNSS-prior factor insertion from `gnss_global` once a FIXED sample lands.
+Map points appear in the viewer. The two-phase init conditions below apply to the
+**recording**; the same standstill/RTK ordering is what the offline run replays.
 
 > ### Two sequenced init conditions — both completed in the park position
 >
@@ -284,37 +287,32 @@ If the dropout is long enough or feature-poor enough that residual error matters
 
 ### Running modes
 
-**Live mode (with real sensors):**
-```bash
-# Terminal 1: launch the RTK-FIXED pre-filter
-python3 gicp_localization/scripts/rtk_fixed_odom_filter.py
+**GLIM builds maps OFFLINE only.** `enable_online_mapping: false` (default), and
+the live node (`glim_rosnode`) exits by design when it is off — there is no
+`glim_ros.launch.py` shipped in this fork. Use one of the offline entry points.
 
-# Terminal 2: launch GLIM
-ros2 launch glim_ros glim_ros.launch.py config_path:=config
-```
-
-**Offline mode (rosbag processing):**
+**Offline — mcap bag:**
 ```bash
 ros2 run glim_ros glim_rosbag <rosbag_path> --ros-args -p dump_path:=<output_directory>
 ```
-Note: `glim_rosbag` plays the bag and processes it in one step. Run the pre-filter in a separate terminal first (it'll pick up the played `/gps_p1/filtered_odom`).
-
-**Offline mode (rosbag replay with launch):**
+`glim_rosbag` plays the bag and processes it in one step. If your bag carries the
+raw `/gps_p1/filtered_odom`, run the pre-filter in a separate terminal first so it
+publishes `/gps_p1/filtered_odom_rtk_fixed`:
 ```bash
-# Terminal 1: launch GLIM
-ros2 launch glim_ros glim_ros.launch.py config_path:=config use_sim_time:=true
-
-# Terminal 2: launch the pre-filter
 python3 gicp_localization/scripts/rtk_fixed_odom_filter.py --ros-args -p use_sim_time:=true
-
-# Terminal 3: play the rosbag
-ros2 bag play <your_bag_file.db3> --clock
 ```
 
-**With logging:**
+**Offline — raw Luminar pcap (+ sibling mcap for IMU/GNSS):**
 ```bash
-ros2 launch glim_ros glim_ros.launch.py config_path:=config use_sim_time:=true | tee /tmp/glim_live.log
+ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path:=<output_directory>
 ```
+
+**With logging:** append `| tee /tmp/glim_offline.log` to either command above.
+
+**Legacy live mode** (opt-in, unsupported here): set `glim_ros/enable_online_mapping=true`
+in `config_ros.json` and run the live node directly with `ros2 run glim_ros glim_rosnode`.
+This fork ships no live launch file and does not exercise this path; prefer recording
+a bag and mapping offline.
 
 ### Monitoring RTK and GNSS Alignment
 

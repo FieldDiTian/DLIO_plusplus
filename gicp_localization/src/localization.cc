@@ -2261,9 +2261,14 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     int p_t_off;
     uint8_t p_t_dt;
     int p_t_cnt;
+    const size_t n_primary = static_cast<size_t>(primary->width) * primary->height;
+    // Guard the raw 8-byte reads below: the time field must fit within point_step,
+    // AND the byte buffer must actually hold all n_primary points. This capture runs
+    // BEFORE the tight-cloud guard further down, so a truncated/malformed primary
+    // (data.size() < n_primary*point_step) would otherwise read past data.end().
     if (findTimeField(*primary, p_t_off, p_t_dt, p_t_cnt) && p_t_off >= 0 &&
-        static_cast<uint32_t>(p_t_off) < primary->point_step) {
-      const size_t n_primary = static_cast<size_t>(primary->width) * primary->height;
+        primary->point_step > 0 && static_cast<uint32_t>(p_t_off) < primary->point_step &&
+        primary->data.size() >= n_primary * static_cast<size_t>(primary->point_step)) {
       const size_t bytes_avail = primary->point_step - static_cast<uint32_t>(p_t_off);
       uint64_t pmin = std::numeric_limits<uint64_t>::max();
       bool any = false;
@@ -2446,10 +2451,12 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   }
 
   // The merged cloud is unorganized (height=1); width = total appended points.
+  // Compute row_step in size_t so the point_step*total_points multiply cannot
+  // overflow before the (message-mandated) uint32 assignment.
   merged->width = static_cast<uint32_t>(total_points);
   merged->height = 1;
   merged->is_dense = false;
-  merged->row_step = point_step * static_cast<uint32_t>(total_points);
+  merged->row_step = static_cast<uint32_t>(static_cast<size_t>(point_step) * total_points);
 
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                        "lidar_concat: merged %zu/%zu aux scans, total %zu points",

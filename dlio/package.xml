@@ -9,6 +9,7 @@
   <author email="logankm@berkeley.edu">Logan Kinajil-Moran</author>
   <license>LGPLv3</license>
 
+  <depend>adapter</depend>
   <depend>gicp_localization</depend>
   <depend>glim</depend>
   <depend>glim_ext</depend>
