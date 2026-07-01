@@ -61,7 +61,7 @@
     "points_time_offset": 0.0,
     "acc_scale": 0.0, // Auto-detect if zero
     // TF config
-    "imu_frame_id": "", // Auto-detect from /gps_p1/imu header (= gps_antenna_top; Atlas firmware projects IMU to antenna phase centre)
+    "imu_frame_id": "", // Auto-detect from /gps_p1/imu header (= gps_antenna_top; IMU is body-axis-rotated but device-located per FusionEngine Spec 3.4.1 -- treated as at the antenna, dropping a small accel lever-arm)
     "lidar_frame_id": "", // Auto-detect if blank
     "base_frame_id": "", // If blank, IMU frame ID is used
     "odom_frame_id": "odom",

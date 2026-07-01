@@ -124,9 +124,11 @@ correction will become biased. A startup warning was added in commit
 - `GLIM/glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp:361-368`
 
 **What it looks like**: the GNSS extension subtracts `R_world_imu * t_imu_gnss`
-from the reported GNSS position. If Atlas firmware also applies its IMU-to-antenna
-projection internally, both firmware and software would compensate, biasing
-the GNSS prior.
+from the reported GNSS position. Atlas already outputs its INS **position** at
+the antenna phase centre, so if the software also applied a nonzero antenna→body
+lever arm, both would compensate, biasing the GNSS prior. (The IMU stream being
+body-axis-rotated but device-located — FusionEngine Spec §3.4.1 — is a separate
+matter; `gnss_global` touches the position, not the IMU.)
 
 **Why it's actually fine on AV-24 today**:
 - `libgnss_global.so` is **commented out** in `config_ros.json`'s
@@ -154,42 +156,44 @@ the software side even if the extension is re-enabled.
 
 ---
 
-### 7. The GT-recovery RTK gating lives upstream, not in our code
+### 7. RTK gating is per-consumer, not at GT ingestion
 
-**File**: `gicp_localization/src/localization.cc:2289-2370` (`callbackGtOdom`).
+**File**: `gicp_localization/src/localization.cc:3359` (`callbackGtOdom`);
+gate `gtSampleIsRtkFixed` at `:3487`; consumers `tryRtkCalibrationStep`
+(`:3588`) and `maybeSnapPoseToGT` (`:3731`).
 
-**What it looks like**: `callbackGtOdom` ingests every odometry message it
-receives and pushes it into the buffer with no RTK / fix-status check.
-A reviewer might flag this as a missing guard — snap-back could fire from
-a degraded GNSS fix.
+**What it looks like**: `callbackGtOdom` ingests **every** `/gps_p1/filtered_odom`
+message and pushes it into the buffer with **no** RTK / fix-status check at
+ingestion — it only carries the Atlas-reported position covariance
+(`cov_pos_xx/yy/zz`) onto the buffered sample. A reviewer skimming the callback
+might flag this as a missing guard and assume snap-back can fire from a degraded
+GNSS fix. That is by design; the gate moved to the consumers.
 
-**Why it's mostly fine on AV-24** (under the all-P1 single-source design):
-`/gps_p1/filtered_odom` is published by race_common's
-`pointonenav_interface` node, which forwards Atlas FusionEngine's INS
-solution along with its native pose covariance. Combined with the 0.1 s
-`gt_odom/max_dt` window, a stalled or rejected upstream publisher
-cleanly defers snap-back (logged as
-`deferring snap — no GT sample within max_dt…`) rather than firing on
-stale data.
+**The gate runs per-consumer** (`gtSampleIsRtkFixed`, a covariance check on
+`msg->pose.covariance[0,7,14]` vs `localization/rtk_gate/max_pose_var_xy`
+default 0.25 m^2 and `.../max_pose_var_z` default 1.0 m^2):
+- **Bias calibration / seed** (`tryRtkCalibrationStep`) → **requires RTK-FIXED**.
+- **GT divergence cross-check** (`gt_pos_err` diagnostic) → **requires RTK-FIXED**.
+- **Snap recovery** (`maybeSnapPoseToGT`) → **intentionally accepts ANY-quality
+  Atlas sample** (no `gtSampleIsRtkFixed` call on this path).
 
-**RTK-quality gate enforced in code (P1-native)**: the localization node
-inspects `msg->pose.covariance[0,7,14]` (xx, yy, zz position variances)
-on every `/gps_p1/filtered_odom` sample and rejects anything that exceeds
-the configured thresholds (`localization/rtk_gate/max_pose_var_xy`,
-default 0.25 m^2; `localization/rtk_gate/max_pose_var_z`, default 1.0 m^2).
-This is the all-P1 replacement for the legacy NovAtel BESTGNSSPOS enum
-gate; the entire gate is now self-contained at the top of
-`callbackGtOdom` (no separate status topic, no extra subscription).
-Reference covariances from known-RTK-fixed AV-24 bag: median cov_xx
-≈ 2.8e-5 m^2; RTK-float lives in the 1e-2…1e-1 m^2 band; GPS-only ≥ 1 m^2.
-Reviewers should not flag the missing fix-status guard in the legacy
-code path — it now exists explicitly as a covariance check.
+The rationale (documented at `localization.cc:3372-3382` and root
+`README.md` "Recovery during GICP failures"): Atlas FusionEngine already runs a
+coupled GNSS+IMU INS with calibrated sensors, so during RTK loss its degraded
+pose is still a better truth source than the node's own software IMU
+dead-reckoning when GICP has failed to match the scan. This is the all-P1
+replacement for the legacy NovAtel BESTGNSSPOS enum gate — no separate status
+topic, no extra subscription. Reference covariances from a known-RTK-fixed AV-24
+bag: median cov_xx ≈ 2.8e-5 m^2; RTK-float 1e-2…1e-1 m^2; GPS-only ≥ 1 m^2. The
+0.1 s `gt_odom/max_dt` window still applies to all lookups, so a stalled upstream
+publisher cleanly defers snap (logged `deferring snap — no GT sample within
+max_dt…`) rather than firing on stale data.
 
-**Watch condition**: if the gate is disabled (`rtk_gate/enable=false`)
-or Atlas covariance population is broken on a particular bag, the joint
-failure mode to keep in mind is a low-feature LiDAR stretch coinciding
-with an RTK degradation: GICP can't recover geometrically and the snap
-pulls toward a degraded GNSS fix.
+**Watch condition**: because snap recovery is deliberately *not* RTK-gated, the
+joint failure mode to keep in mind is a low-feature LiDAR stretch coinciding with
+an RTK degradation — GICP can't recover geometrically and the snap pulls toward a
+degraded GNSS fix. To make snap strictly RTK-gated, raise
+`gt_recovery/min_consecutive_failures` or set `gt_recovery/enable=false`.
 
 ---
 

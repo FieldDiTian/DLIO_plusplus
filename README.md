@@ -29,7 +29,7 @@ gicp_localization  PCD map + ENU seed ──► online pose @ IMU rate [local EN
 The configs target an AV-24 Cybertruck instrumented with:
 
 - **3× Luminar Iris LiDAR** — `luminar_front` is the primary sensor; `luminar_left` and `luminar_right` are merged into the primary cloud by `lidar_concat`. Aux extrinsics are resolved **offline** (no live `/tf_static` needed): priority **URDF** (`av24.urdf`) → **static 4×4 matrix** in config → live TF as last resort. GICP resolves the `base_frame ← luminar_front` lever arm the same way, so full localization also needs no `/tf_static`. A **strict merge guard** with identical semantics + defaults in GLIM and GICP governs incomplete merges — see [Multi-LiDAR merge policy](#multi-lidar-merge-policy) below.
-- **Point One Atlas (LG69T) INS** publishing IMU on `/gps_p1/imu` (`imu_calibrated`: sensor-level bias/scale/misalignment removed by FusionEngine firmware, gravity present, no fused orientation) and odometry on `/gps_p1/filtered_odom`. Atlas firmware projects both the IMU and the INS pose to the primary antenna phase centre, so the URDF link `gps_antenna_top` is used as both `base_frame` and `imu_frame` in the localization config. RTK quality is gated on the Atlas-reported pose covariance.
+- **Point One Atlas (LG69T) INS** publishing IMU on `/gps_p1/imu` (`imu_calibrated`: sensor-level bias/scale/misalignment removed by FusionEngine firmware, gravity present, no fused orientation) and odometry on `/gps_p1/filtered_odom`. Per the FusionEngine Message Spec v0.21 §3.4.1, `IMUOutput` is bias/scale-corrected and **rotated into vehicle body axes but not lever-arm-projected** — the accelerometer stays at the physical device link `pointonenav`; only the INS **pose/position** output is referenced to the primary antenna phase centre (`gps_antenna_top`). The localization config sets both `base_frame` and `imu_frame` to `gps_antenna_top`: exact for the pose, and a deliberate approximation for the IMU that drops the small (~0.63 m) device→antenna accelerometer lever arm (`ω×(ω×r)`, negligible at mapping speeds; gyro unaffected). See [`localization.yaml`](gicp_localization/cfg/localization.yaml) and the [adapter README](adapter/README.md#imu-frame). RTK quality is gated on the Atlas-reported pose covariance.
 - **RTK GPS** — the FusionEngine INS itself; no separate raw RTK topic is needed for localization.
 - Optional camera (used only by extension modules).
 
@@ -63,7 +63,7 @@ topic remap.
 
 ### GNSS lever-arm policy
 
-Atlas firmware compensates the IMU-to-antenna lever arm internally, so the software side stays **off** to avoid double-compensation. The disable is explicit in three independent places — any one is sufficient:
+The Atlas INS **pose/position** solution is already output at the antenna phase centre (`gps_antenna_top`), and the mapping graph body frame is that same point, so the software GNSS **position** lever-arm stays **off** to avoid double-compensation. (This is a pose-frame argument, independent of the IMU stream — which is device-located, per the Sensor/Vehicle Target note above.) The disable is explicit in three independent places — any one is sufficient:
 
 1. **Config flag** — `GLIM/glim_ext/config/config_gnss_global.json` sets `"enable_lever_arm": false`. This is the grep-able single source of truth.
 2. **Empty antenna frame** — same file sets `"urdf_gnss_frame": ""`. With this empty, the URDF lookup is skipped and `t_imu_gnss` stays zero even if the flag check were bypassed.

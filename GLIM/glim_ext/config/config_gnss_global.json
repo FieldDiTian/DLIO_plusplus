@@ -71,11 +71,13 @@
     // position. The lever arm is then read from the URDF using
     // urdf_gnss_frame below.
     //
-    // Current vehicle (AV-24, Point One Atlas): Atlas FusionEngine projects
-    // both IMU and INS pose to the primary antenna phase centre internally,
-    // so the gnss_topic message's position is ALREADY at gps_antenna_top.
-    // Our LiDAR+IMU odometry runs in the same frame (urdf_imu_frame =
-    // "gps_antenna_top"), so the relative correction is zero. Leave false.
+    // Current vehicle (AV-24, Point One Atlas): Atlas FusionEngine outputs
+    // the INS pose/position at the primary antenna phase centre, so the
+    // gnss_topic message's position is ALREADY at gps_antenna_top. Our
+    // mapping graph body runs in the same frame (urdf_imu_frame =
+    // "gps_antenna_top"), so this position lever-arm is zero. Leave false.
+    // (The IMU stream is body-axis-rotated but device-located per FusionEngine
+    // Spec 3.4.1 -- a separate, small accel lever-arm, not this one.)
     "enable_lever_arm": false,
     // URDF link name of the GNSS antenna. Only consulted when
     // enable_lever_arm is true. Empty string means "no lever arm".

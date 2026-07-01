@@ -18,16 +18,25 @@
     # FusionEngine firmware, gravity still PRESENT, no fused orientation).
     #
     # IMU frame note: the Atlas LG69T physically sits at the chassis link
-    # "pointonenav" (URDF xyz=1.898, 0.027, 0.450) but the firmware applies
-    # a lever-arm projection internally so that the published IMU and pose
-    # outputs both refer to the primary GNSS antenna phase centre, the
-    # URDF link "gps_antenna_top" (xyz=1.27135, 0.0, 0.91994). The
-    # pointonenav_interface therefore correctly tags /gps_p1/imu with
-    # frame_id="gps_antenna_top" -- it is NOT a mislabel.
-    # imu_frame and base_frame are both set to gps_antenna_top so that
-    # callbackImu's baselink2imu_T degenerates to identity and no
-    # second lever-arm work happens here (avoids double-compensating
-    # what Atlas already did internally).
+    # "pointonenav" (URDF xyz=1.898, 0.027, 0.450). Per the FusionEngine
+    # Message Spec v0.21 3.4.1, IMUOutput (11000) is bias/scale-corrected and
+    # ROTATED into vehicle body axes, but is NOT lever-arm-projected to the
+    # antenna -- the accelerometer specific force stays at the device
+    # location. (Only the INS pose/position output is referenced to the
+    # antenna, via the firmware Output Lever Arm config.) So /gps_p1/imu
+    # carries body-axis-rotated accel/gyro measured at "pointonenav",
+    # ~0.63 m from the antenna link "gps_antenna_top" (xyz=1.27135,0.0,0.91994).
+    #
+    # We nonetheless set imu_frame == base_frame == gps_antenna_top, which
+    # zeroes callbackImu's base<-imu translation t, so the centripetal
+    # lever-arm term (localization.cc: lin_accel -= w x (w x t)) is skipped.
+    # This is an intentional APPROXIMATION, not a claim that firmware pre-
+    # projected the IMU: at mapping speeds the dropped term is small
+    # (~0.2 m/s^2 at 0.5 rad/s), the gyro is unaffected (rigid body), and it
+    # is absorbed by the accel-bias estimator + scan matching. To model it
+    # exactly, set imu_frame: "pointonenav" (and re-verify GLIM
+    # sensors/T_lidar_imu targets the same physical IMU point); callbackImu
+    # then resolves a nonzero t and applies the compensation.
     #
     # gt_odom is /gps_p1/filtered_odom (Atlas FusionEngine INS solution)
     # which publishes nav_msgs/Odometry with header.frame_id="map" and
@@ -245,9 +254,10 @@
     localization/imu/require_topic_allowlist: true
     localization/imu/topic_allowlist: ["/gps_p1/imu"]
     # Reject IMU samples whose message frame_id does not match imu_frame.
-    # Re-enabled now that imu_frame=gps_antenna_top matches the upstream
-    # pointonenav_interface output (Atlas projects IMU to antenna phase
-    # centre internally).
+    # Re-enabled now that imu_frame=gps_antenna_top matches the frame_id the
+    # upstream pointonenav_interface / adapter stamps on /gps_p1/imu. This is
+    # a label match only; the IMU is physically device-located (see the IMU
+    # frame note above), so it confirms the tag, not a lever-arm projection.
     localization/imu/require_frame_match: true
     dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable). With Atlas imu_calibrated input the residual bias is already near-zero, so this estimate captures only mount-level tilt; shortening below ~0.1s is safe.
 

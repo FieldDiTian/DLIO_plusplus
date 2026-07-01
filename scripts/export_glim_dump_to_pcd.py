@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
@@ -133,21 +134,38 @@ def main() -> int:
     if not dirs:
         raise SystemExit(f"no GLIM submap dirs found under {args.dump_dir}")
 
-    chunks = []
-    total = 0
-    for chunk in transformed_chunks(dirs, args.voxel_size, args.stride):
-        chunks.append(chunk)
-        total += len(chunk)
-    if total == 0:
-        raise SystemExit("export produced zero points")
-
     args.output_pcd.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output_pcd.with_suffix(args.output_pcd.suffix + ".tmp")
-    with tmp.open("wb") as handle:
-        write_header(handle, total)
-        for chunk in chunks:
-            chunk.tofile(handle)
-    tmp.replace(args.output_pcd)
+    data_tmp = args.output_pcd.with_suffix(args.output_pcd.suffix + ".data.tmp")
+
+    # The PCD binary header must carry the final POINTS count, which is only
+    # known after the whole dump is processed (voxel dedup / stride change it).
+    # Rather than buffer every transformed chunk in RAM, stream each chunk to a
+    # temp binary file as it is produced (one submap chunk resident at a time,
+    # plus the voxel-dedup set when --voxel-size > 0), then prepend the header
+    # and copy the data back out. Byte-identical output, bounded peak memory.
+    total = 0
+    success = False
+    try:
+        with data_tmp.open("wb") as data_handle:
+            for chunk in transformed_chunks(dirs, args.voxel_size, args.stride):
+                chunk.tofile(data_handle)
+                total += len(chunk)
+
+        if total == 0:
+            raise SystemExit("export produced zero points")
+
+        with tmp.open("wb") as handle:
+            write_header(handle, total)
+            with data_tmp.open("rb") as data_handle:
+                shutil.copyfileobj(data_handle, handle, length=8 * 1024 * 1024)
+        tmp.replace(args.output_pcd)
+        success = True
+    finally:
+        data_tmp.unlink(missing_ok=True)
+        if not success:
+            tmp.unlink(missing_ok=True)
+
     print(f"[export_glim_dump_to_pcd] wrote {total} points to {args.output_pcd}")
     return 0
 

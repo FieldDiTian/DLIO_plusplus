@@ -30,11 +30,14 @@ def generate_launch_description():
     #   gt_odom_topic = /gps_p1/filtered_odom    (Atlas FusionEngine INS)
     #   imu_frame / base_frame = "gps_antenna_top"
     #
-    # Atlas projects its IMU output AND its INS pose solution to the primary
-    # GNSS antenna phase centre via firmware lever-arm, so every comparison
-    # the node performs lives at the same body reference -- no TF lever-arm
-    # correction needed anywhere, no second GNSS vendor, no novatel_oem7_msgs
-    # dependency. The RTK quality gate inspects msg->pose.covariance on the
+    # Atlas outputs its INS pose/position at the primary GNSS antenna phase
+    # centre; its IMU stream is body-axis-rotated but device-located (NOT
+    # antenna-projected -- FusionEngine Spec 3.4.1). We run base_frame and
+    # imu_frame both at gps_antenna_top, so pose comparisons are exact and the
+    # IMU's small device->antenna accel lever arm is deliberately dropped --
+    # no TF lever-arm correction anywhere, no second GNSS vendor, no
+    # novatel_oem7_msgs dependency. The RTK quality gate inspects
+    # msg->pose.covariance on the
     # gt_odom message itself, so there is no separate /bestgnsspos
     # subscription -- the gate is self-contained in callbackGtOdom.
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_p1/imu')
@@ -55,10 +58,10 @@ def generate_launch_description():
         'imu_topic', default_value=imu_topic,
         description='IMU topic name. Default /gps_p1/imu (Point One Atlas '
                     'imu_calibrated: sensor-calibrated, gravity present, '
-                    '99 Hz, lever-arm-projected by Atlas firmware to the '
-                    'primary antenna phase centre gps_antenna_top). Stays '
-                    'in sync with base_frame=gps_antenna_top in '
-                    'localization.yaml.')
+                    '99 Hz, body-axis-rotated but device-located -- NOT '
+                    'antenna-projected). Tagged gps_antenna_top to stay in '
+                    'sync with base_frame in localization.yaml; the small '
+                    'device->antenna accel lever arm is dropped.')
     declare_odom_topic_arg = DeclareLaunchArgument(
         'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(

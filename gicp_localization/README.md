@@ -90,7 +90,7 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 Every comparison the node performs lives at the Atlas antenna phase centre (URDF link `gps_antenna_top`):
 
 - `localization/base_frame: gps_antenna_top` — GICP's state is reported at this frame.
-- `localization/imu_frame: gps_antenna_top` — IMU subscription from `/gps_p1/imu` is at this frame (Atlas firmware projects the chassis-mounted IMU to the antenna point internally via lever-arm).
+- `localization/imu_frame: gps_antenna_top` — the `/gps_p1/imu` stream is tagged with this frame. Physically the IMU (`IMUOutput`, FusionEngine Spec §3.4.1) is body-axis-rotated but **device-located** (`pointonenav`), not antenna-projected; setting `imu_frame = base_frame` treats it as co-located with the antenna — a deliberate approximation that drops the small device→antenna accel lever arm (see [`localization.yaml`](cfg/localization.yaml)).
 - `gt_odom_topic` → `/gps_p1/filtered_odom` — Atlas INS pose, `child_frame_id="gps_antenna_top"`.
 
 Because base_frame, imu_frame, and the gt_odom source all align, the in-code TF lookups in `callbackImu` (`baselink2imu_T`) and `callbackGtOdom` (`T_base_gtbody_`) degenerate to identity. No lever-arm work happens anywhere; the cross-check `gt_pos_err_m` is exact (no constant baseline bias); `applyInitialPose` correctly seeds the state; the snap helper composes a no-op identity TF.
