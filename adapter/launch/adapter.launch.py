@@ -20,6 +20,7 @@ def _launch_nodes(context, *args, **kwargs):
     pcap_path = _text(context, "p1_imu_pcap_path")
     pcap_output_topic = _text(context, "p1_imu_pcap_output_topic")
     imu_input_topic = _text(context, "imu_input_topic")
+    imu_stamp_mode = _text(context, "imu_stamp_mode")
     if use_pcap and not pcap_path:
         raise RuntimeError(
             "Point One IMU PCAP replay is enabled by default. "
@@ -28,6 +29,9 @@ def _launch_nodes(context, *args, **kwargs):
         )
     if use_pcap:
         imu_input_topic = pcap_output_topic
+        if imu_stamp_mode == "auto":
+            # The PCAP replay node decodes IMU_OUTPUT.p1_time into header.stamp.
+            imu_stamp_mode = "p1"
     elif not imu_input_topic:
         imu_input_topic = "/atlas/imu_calibrated"
 
@@ -37,7 +41,7 @@ def _launch_nodes(context, *args, **kwargs):
         "imu_input_topic": imu_input_topic,
         "publish_gnss_pose": _bool_text(_text(context, "publish_gnss_pose")),
         "summary_output_path": _text(context, "summary_output_path"),
-        "imu_stamp_mode": _text(context, "imu_stamp_mode"),
+        "imu_stamp_mode": imu_stamp_mode,
         "imu_p1_sidecar_path": _text(context, "imu_p1_sidecar_path"),
         "imu_p1_sidecar_match_tolerance_sec": float(
             _text(context, "imu_p1_sidecar_match_tolerance_sec")
