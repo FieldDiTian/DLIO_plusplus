@@ -174,7 +174,9 @@
     localization/lidar_concat/enabled: true
     localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
-    localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans further than this from primary are dropped
+    localization/lidar_concat/time_threshold: 0.1   # seconds; aux scans further than this from primary are dropped
+                                                    # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
+                                                    #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
     localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
 
     # Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
