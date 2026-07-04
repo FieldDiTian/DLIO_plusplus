@@ -6,7 +6,19 @@
     "config_logging": "config_logging.json",
     "config_viewer": "config_viewer.json",
     "config_sensors": "config_sensors.json",
-    "config_preprocess": "config_preprocess.json",
+    // P4#2 — DENSE LOCALIZATION-MAP profile is the ACTIVE DEFAULT (upgraded
+    // from opt-in after review): every map this pipeline builds is consumed
+    // by gicp_localization, so the dense variants (preprocess 0.4 m / 80k,
+    // submap voxel 0.25 m / 150k) are the production choice. The run-12/13
+    // cross-run GICP fitness floor (~0.27) is dominated by map sparsity from
+    // the old 1.0 m preprocess downsample. Fall back to the legacy sparse
+    // configs (commented) only for odometry-only smoke runs or if mapping
+    // CPU/memory becomes a problem. After the first dense-map rebuild,
+    // re-baseline the GICP fitness floor with
+    // gicp_localization/scripts/analyze_scan_debug_log.py — the P1 ratio
+    // thresholds depend on it.
+    "config_preprocess": "config_preprocess_dense_map.json",
+    // "config_preprocess": "config_preprocess.json",  // legacy sparse (odometry-only runs)
     // RTK-tolerant mapping design:
     //   * Primary odometry = LiDAR + IMU fused (gpu/cpu/ct estimator). Runs
     //     continuously, no external pose required, no holes during RTK loss.
@@ -24,7 +36,8 @@
     "config_odometry": "config_odometry_gpu.json",
     // "config_odometry": "config_odometry_ins.json",
     // "config_odometry": "config_odometry_cpu.json",
-    "config_sub_mapping": "config_sub_mapping_passthrough.json",
+    "config_sub_mapping": "config_sub_mapping_dense_map.json",
+    // "config_sub_mapping": "config_sub_mapping_passthrough.json",  // legacy sparse (odometry-only runs)
     "config_global_mapping": "config_global_mapping_gpu.json",
     "config_gnss": "config_gnss_global.json",
     "config_pcap": "config_pcap.json"

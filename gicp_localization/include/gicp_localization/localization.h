@@ -91,6 +91,12 @@ private:
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
   // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
   bool getGtPoseAt(double stamp, GtSample& out);
+  // P2#2: world-frame (map) velocity of the gt_body origin by central finite
+  // difference of the GT poses bracketing `stamp`. Used by the snap helper
+  // when the GT odom's linear twist is unpopulated; returns ~0 at standstill,
+  // so it covers both the missing-twist and truly-stationary cases. False when
+  // fewer than 2 samples bracket the stamp within gt_odom_max_dt_.
+  bool getGtFiniteDiffVelWorld(double stamp, Eigen::Vector3f& v_world_out);
   // Compose T_map_base = T_map_gtbody * inv(T_base_gtbody) using the cached
   // gt_body -> base extrinsic, bringing the GT sample's pose from
   // msg.child_frame_id into base_frame coordinates.  The snap helper, the
@@ -207,6 +213,14 @@ private:
     std::string extrinsic_source = "tf";        // "urdf" | "static" | "tf" (for logging)
     std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
     std::mutex mtx;
+    // P4#3: signed header-time offset stats vs the primary (aux - primary),
+    // accumulated over MERGED scans only (scan-callback thread). A stable
+    // nonzero mean is the signature of a constant per-aux clock offset vs the
+    // P1 timebase — actionable via a per-aux time-offset correction upstream.
+    double dt_sum = 0.0;
+    double dt_min = std::numeric_limits<double>::infinity();
+    double dt_max = -std::numeric_limits<double>::infinity();
+    uint64_t dt_count = 0;
   };
   std::vector<std::unique_ptr<AuxLidar>> aux_lidars_;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_subs_;
@@ -224,6 +238,19 @@ private:
   bool concat_abort_on_merge_failure_ = true;   // true = abort node past budget; false = keep skipping non-fatally
   int concat_max_consec_fail_ = 10;             // tolerated consecutive incomplete merges (0 = immediate)
   int concat_consec_fail_ = 0;                  // running counter of consecutive incomplete merges
+
+  // P4#3: per-frame lidar_concat diagnostics (scan-callback thread only).
+  // Refreshed by mergeAuxClouds(), published one-sample-per-frame from
+  // performLocalization() so the run-report audit gets a per-frame source-set
+  // record (the run-12 audit explicitly could not reconstruct this).
+  int concat_last_merged_aux_ = -1;             // -1 = concat disabled / not run this frame
+  std::vector<double> concat_last_aux_dt_;      // s, aux header - primary header; NaN = not merged
+  std::vector<int> concat_last_aux_points_;     // appended points; 0 = not merged
+  double last_scan_time_span_s_ = -1.0;         // merged-scan per-point time span (deskew path)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_merged_aux_count_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_time_span_pub;
+  std::vector<rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr> dbg_aux_dt_pubs_;
+  std::vector<rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr> dbg_aux_points_pubs_;
   // Resolve every aux's T_primary_aux without live TF; returns the count resolved.
   void resolveAuxExtrinsicsOffline(const std::vector<std::vector<double>>& static_transforms);
 
@@ -272,6 +299,12 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_hessian_condition_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_trans_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_rot_deg_pub;
+  // P1 gating rework diagnostics (one sample per processed frame, like the rest
+  // of the debug/* family, so bag audits keep a single denominator).
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_fitness_ratio_pub;      // fitness / rolling-median baseline (-1 while warming up)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_degen_rot_axes_pub;     // # rotation eigen-axes zeroed by partial update (0-3)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_degen_trans_axes_pub;   // # translation eigen-axes zeroed (0-3)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_veto_pub;           // 1.0 when the yaw-consistency veto zeroed the yaw correction
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
@@ -305,6 +338,16 @@ private:
   Eigen::Matrix4f T_prior;  // IMU-based prior transformation
   std::atomic<bool> initialized;
   std::mutex pose_mutex;
+
+  // P3: scan-time IMU prior paired with the basePose measurement, captured on
+  // scan acceptance. updateState() uses it to form the time-free world-frame
+  // delta T_corr = T_meas * inv(T_prior) and applies THAT to the current
+  // state, instead of dragging the (already-advanced) state back toward the
+  // 0.1-0.3 s-old measurement pose — the source of the yaw-rate-proportional
+  // turn error (accepted-frame gt_err doubled from 1.0 m at <2 deg/s to
+  // 2.1 m at >25 deg/s on run 12).
+  Eigen::Matrix4f observer_prior_pose_;
+  bool geo_delta_correction_;
 
   // Debug tracking
   Eigen::Matrix4f last_gicp_pose_;
@@ -460,6 +503,25 @@ private:
   double gicp_hessian_fitness_warn_;
   double gicp_hessian_trans_warn_m_;
   double gicp_hessian_rot_warn_deg_;
+
+  // P1 gating rework: per-map-normalized fitness gates + degeneracy-aware
+  // partial updates (solution remapping) + turn-aware yaw-consistency veto.
+  // Rationale/thresholds: docs/action_plan_turn_error_20260704.md.
+  bool   fitness_baseline_enable_;       // maintain rolling-median fitness baseline
+  int    fitness_baseline_window_;       // ring size (accepted-frame fitness samples)
+  int    fitness_baseline_min_samples_;  // gates stay absolute-only until this many samples
+  double fitness_baseline_seed_;         // expected per-map floor used during warm-up (0 = off)
+  double fitness_ratio_reject_;          // reject scan when fitness/baseline exceeds this (<=0 off)
+  bool   degen_partial_update_enable_;   // project delta instead of binary hessian reject
+  bool   degen_full6d_;                  // full coupled 6x6 remapping (true) vs 3x3 blockwise (false)
+  double degen_coupling_length_m_;       // characteristic lever arm making rad and m commensurable (full6d)
+  double degen_rel_floor_6d_;            // full6d: eigen-axis degenerate if lambda < floor*lambda_max
+  double degen_rel_floor_rot_;           // blockwise: rot eigen-axis degenerate if lambda < floor*lambda_max(block)
+  double degen_rel_floor_trans_;         // blockwise: trans eigen-axis degenerate likewise
+  bool   yaw_gate_enable_;               // turn-aware GICP-vs-IMU yaw consistency veto
+  double yaw_gate_max_corr_deg_;         // veto yaw when |yaw corr vs IMU prior| exceeds this...
+  double yaw_gate_fitness_ratio_;        // ...AND fitness ratio exceeds this (low-confidence match)
+  std::deque<double> fitness_history_;   // accepted-frame fitness ring (scan thread only)
 
   // Preprocessing parameters
   double crop_size_;

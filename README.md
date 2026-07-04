@@ -55,6 +55,8 @@ This **replaces the earlier UTM contract**. GLIM's `gnss_global` still aligns th
 
 The operational default (`require_all_aux=false`) localizes on available LiDARs; strict mode (`require_all_aux=true`) is for a sync-validation pass. Merged-sweep deskew timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum. Config lives in `gicp_localization/cfg/localization.yaml` and `GLIM/glim/config/config_sensors.json`.
 
+Both stacks now record **per-frame merge evidence** (P4): GICP publishes `merged_aux_count`, per-aux signed `aux<i>_merge_dt_s`, `aux<i>_points`, and `scan_time_span_s` debug topics (plus the same fields in its `SCAN DEBUG` log line); GLIM's offline mapping tools emit one parseable `CONCAT DEBUG | ...` INFO line per primary scan (`lidar_concat.frame_diag_log`, default on). Both accumulate per-aux signed header-offset stats and warn when the mean exceeds 20 ms — the constant-clock-offset signature. The GICP concat ring buffer is 200 (GLIM parity; 20 was only ~2 s of aux history and silently degraded frames to fewer LiDARs).
+
 Current localization scope is intentionally single-source Point One Atlas. Earlier
 project notes mention NovAtel and VectorNav GNSS integration, but
 `gicp_localization` no longer subscribes to either; adding them back is future
@@ -63,11 +65,12 @@ topic remap.
 
 ### GNSS lever-arm policy
 
-The Atlas INS **pose/position** solution is already output at the antenna phase centre (`gps_antenna_top`), and the mapping graph body frame is that same point, so the software GNSS **position** lever-arm stays **off** to avoid double-compensation. (This is a pose-frame argument, independent of the IMU stream — which is device-located, per the Sensor/Vehicle Target note above.) The disable is explicit in three independent places — any one is sufficient:
+The Atlas INS **pose/position** solution is already output at the antenna phase centre (`gps_antenna_top`), and the mapping graph body frame is that same point, so the software GNSS **position** lever-arm stays **off** to avoid double-compensation. (This is a pose-frame argument, independent of the IMU stream — which is device-located, per the Sensor/Vehicle Target note above.) The disable is explicit in two independent places — either one is sufficient:
 
 1. **Config flag** — `GLIM/glim_ext/config/config_gnss_global.json` sets `"enable_lever_arm": false`. This is the grep-able single source of truth.
 2. **Empty antenna frame** — same file sets `"urdf_gnss_frame": ""`. With this empty, the URDF lookup is skipped and `t_imu_gnss` stays zero even if the flag check were bypassed.
-3. **Module not loaded** — `GLIM/glim/config/config_ros.json` keeps `libgnss_global.so` commented out of `extension_modules`, so the code path does not execute in the current INS-based mapping pipeline.
+
+Note the module itself **is loaded** (`libgnss_global.so` is in `config_ros.json`'s `extension_modules`) — it provides the RTK position anchoring and the dual-antenna heading priors for mapping; only its software lever-arm is disabled.
 
 To verify the disable in one command:
 
@@ -88,7 +91,7 @@ In low-feature stretches the localizer first falls back to IMU dead-reckoning. I
 - **GT divergence cross-check** (`gt_pos_err` diagnostic) → **requires RTK-FIXED**.
 - **Snap recovery** (`maybeSnapPoseToGT`) → **accepts any-quality Atlas sample**.
 
-The rationale is that Atlas FusionEngine already runs a coupled GNSS+IMU INS with calibrated sensors, so during RTK loss its degraded pose is still the better truth source than the node's own software IMU dead-reckoning. This means recovery can snap toward an RTK-float/GPS-only fix when GICP has failed — a deliberate trade. It is enabled by default (`gt_recovery/enable: true`, `min_consecutive_failures: 1`); raise `min_consecutive_failures`, or disable `gt_recovery` if you require the snap to be strictly RTK-gated. (`AGENTS.md` documents the joint GICP-fail + RTK-degraded watch condition.)
+The rationale is that Atlas FusionEngine already runs a coupled GNSS+IMU INS with calibrated sensors, so during RTK loss its degraded pose is still the better truth source than the node's own software IMU dead-reckoning. This means recovery can snap toward an RTK-float/GPS-only fix when GICP has failed — a deliberate trade. It is enabled by default (`gt_recovery/enable: true`, `min_consecutive_failures: 5` — raised from 1 in the P2 turn-error fixes: per-frame snapping masked dead-reckoning quality in replay metrics); raise `min_consecutive_failures` further, or disable `gt_recovery` if you require the snap to be strictly RTK-gated. (`AGENTS.md` documents the joint GICP-fail + RTK-degraded watch condition.)
 
 ### Initialization: RTK-driven IMU calibration
 
@@ -130,9 +133,20 @@ Steps 3–5 happen concurrently inside the parked 30 s – 2 min RTK acquisition
 
 Neither phase applies to `gicp_localization` — that pipeline does RTK-driven IMU calibration while the vehicle is moving and **seeds** from a single RTK-FIXED GT sample (the initial seed and calibration are FIXED-gated; the failure-recovery snap is not — see [Recovery during GICP failures](#recovery-during-gicp-failures)). Only GLIM mapping needs the two-phase sequenced startup.
 
+### 2026-07 turn-error campaign (P1–P5)
+
+The cross-run replay campaign (run 3 ↔ run 5, July 2026) diagnosed and fixed a family of turn-localization errors. Full analysis, evidence, and per-fix status live in [`gicp_localization/docs/action_plan_turn_error_20260704.md`](gicp_localization/docs/action_plan_turn_error_20260704.md); the locked pre-fix baseline is `docs/scorecard_baseline_run12_preP1-P4.md`, and `gicp_localization/scripts/analyze_scan_debug_log.py` scores any replay log against it. Headlines:
+
+- **P1** — GICP binary accept/reject gates replaced with confidence-weighted gating: per-map rolling-median fitness ratios, full-6D degeneracy partial updates (solution remapping on the vehicle-re-centered hessian), and a turn-aware yaw-consistency veto.
+- **P2** — state-continuity fixes on the rejected-scan path (stale-velocity bug), GT-snap twist continuity (adapter now populates `twist.angular` from the Atlas gyro), recovery threshold 1 → 5.
+- **P3** — delta-form observer correction (removes the 0.1–0.3 s stale-measurement yaw lag in turns) and a unified IMU bias path (bias applied once, at buffering).
+- **P4** — geometry densification: scan voxel 0.5 → 0.3 m, dense GLIM map profile (**active default**, see below), per-frame merge diagnostics in both stacks, concat buffer parity (200).
+- **P5** — dual-antenna heading priors in GLIM mapping hardened with a per-sample yaw-quality gate.
+
 ### Remaining tuning work
 
-- **LiDAR-specific hyperparameter tuning.** Motion-model tuning is in place for race-car dynamics, but the lidar density/range parameters (preprocessing downsample target, voxel-resolution fade horizons) are still close to GLIM's defaults, which were chosen for a lower-density rotary lidar at indoor-to-short-outdoor ranges. Retuning these for Luminar is on the TODO list; current values are workable but not optimal.
+- **Dense-map rebuild + threshold re-baseline.** The dense GLIM localization-map profile (`config_preprocess_dense_map.json` / `config_sub_mapping_dense_map.json`) is now the active default; the run3/run5 maps must be rebuilt with it, after which the GICP fitness floor and the P1 ratio thresholds (`fitnessBaseline/seedBaseline`, `yawGate/fitnessRatio`, `fitnessRatioRejectThreshold`) should be re-measured from the scorecard script's suggestions.
+- **Validation replays.** The P1–P5 changes are code/config-complete but the cross-pair replays (including one pass with `gt_recovery/enable=false`) still need to be run; plan gates are documented in the action plan.
 
 ### Diagnostic: silent IMU subscription failures
 
@@ -296,7 +310,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 - **GNSS-to-map SE(3) export** (`T_world_utm.txt`) once GNSS alignment initializes, recovered by a 2D Umeyama fit of the submap trajectory to the GNSS input frame. With the adapter feeding **local ENU**, that transform is effectively world↔ENU (the filename/variable keep the historical `utm` name). Downstream `gicp_localization` can optionally consume it for a legacy `utm`-frame mirror, but the operational contract is local ENU — see [Coordinate frames](#coordinate-frames--local-enu).
 - **URDF lever-arm support** (commit `50ae6ae`/`50ae...50a...50aa50a` — see `git log`): the IMU→GNSS lever-arm is taken from the URDF rather than from a manual offset in the config.
-- **Orientation prior** mode: optionally constrain map yaw directly from GNSS heading.
+- **Dual-antenna heading priors (default ON).** `enable_orientation_prior: true` with yaw-only precisions (`[1e-6, 1e-6, 1e2]` ≈ 5.7° sigma) adds a `PoseRotationPrior` per submap from the Atlas heading, pinning map yaw where the position prior can't. Hardened (P5) with a **per-sample yaw-quality gate** (`orientation_prior_max_yaw_sigma_deg: 3.0`): a position-FIXED sample whose reported heading sigma is degraded skips the heading prior (position prior still applied) — the upstream RTK filter qualifies position quality only.
 - **Strip stale GNSS rotation priors on graph reload** (commit `6a50632`) so a re-opened graph doesn't double-apply an orientation constraint that no longer matches the live frame.
 - **Warn when URDF IMU↔GNSS rotation breaks the lever-arm assumption** (commit `622271f`). The lever-arm math assumes IMU and GNSS share orientation; if the URDF says otherwise the user is told instead of silently getting biased corrections.
 - Switched the noise model expression from `Isotropic::Information(diagonal)` (which silently dispatched to `Gaussian::Information(Matrix)` through inheritance) to `Diagonal::Precisions(vector)` (commit `d8b2809`). Same numerical result, more honest signature — see `AGENTS.md §1` for the reasoning trail.
@@ -314,19 +328,23 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 - **Single pre-built PCD map.** No submap stitching at runtime — the map is loaded once and never grows. Trades adaptability for a small, predictable working set.
 - **Multi-LiDAR concatenation** (mirrors the GLIM-side feature, same strict-guard flags and defaults). Subscribes to N aux LiDARs, resolves extrinsics offline (URDF → static matrix → live TF), and concatenates onto the primary cloud's clock. The target map is voxel-downsampled at load (`localization/map_voxel_size: 0.3`) to bound the kd-tree memory, and the crop box runs in **sensor frame before deskew**.
 
-**Robustness against degenerate geometry**
+**Robustness against degenerate geometry** (reworked in P1, 2026-07)
 
-- **Layered rejection gates** on every GICP solve:
-  1. Hard fitness reject (`gicp/fitnessRejectThreshold`).
-  2. **Combined hessian-degeneracy gate.** Fires only when the hessian condition number is high *and* one of `fitness`/`trans`/`rot` warn floors is crossed — high hessian alone is fine if GICP barely moved, but high hessian combined with a large correction is the slide-along-unconstrained-axis signature (commit `4a594a9`).
-  3. Large-jump reject vs. the IMU-predicted prior.
-- **IMU dead-reckoning fallback.** Rejected scans propagate from the IMU-integrated prior, not by freezing at the last accepted pose — transient corner failures don't cascade into a stuck pose.
-- **GT-driven pose recovery** (optional, off by default). When GICP rejects N scans in a row, optionally snap pose + velocity to a time-matched GT odom sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state (commit `83b48a4`).
+- **Confidence-weighted gating** on every GICP solve (replaces the old binary gates, which simultaneously mass-rejected fine corner scans into 25 s dead-reckoning streaks *and* accepted wrong-basin matches):
+  1. Hard fitness reject (`gicp/fitnessRejectThreshold`) — unchanged catastrophic backstop.
+  2. **Per-map fitness-ratio gates.** A rolling median of accepted-frame fitness normalizes the map's own floor (absolute thresholds go stale on cross-run maps); `fitnessRatioRejectThreshold` catches wrong-basin matches, with `seedBaseline` keeping the gates live during warm-up.
+  3. **Degeneracy partial updates** (solution remapping): when the hessian condition proxy trips, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (coupled rot/trans null directions included; `degeneracy/full6d`), and the IMU prior is kept along degenerate axes — status `ok_partial` instead of a rejected scan.
+  4. **Turn-aware yaw-consistency veto** (`yawGate/*`): a large GICP yaw correction vs. the IMU-integrated prior on a low-confidence match keeps the IMU yaw.
+  5. Large-jump reject vs. the IMU-predicted prior (speed/scan-dt-aware thresholds).
+- **IMU dead-reckoning fallback.** Rejected scans propagate from the IMU-integrated prior — seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made dead-reckoned priors cut corners).
+- **GT-driven pose recovery** (enabled by default, `min_consecutive_failures: 5`). When GICP rejects N scans in a row, snap pose + twist to a time-matched GT odom sample; angular rate backfills from the live gyro and linear velocity from GT finite-differencing when the odom twist is unpopulated (P2).
 - **`getFitnessScore` correctness fixes.** Cleared `sq_distances_` per align so stale distances couldn't leak into the score (commit `d949e64`); cached `sq_distances_` reused inside `NanoGICP::getFitnessScore` to avoid recomputing nearest neighbors (commit `1e27b84`).
 
 **Geometric observer**
 
 - **Observer + IMU pipeline aligned to upstream DLIO design** (commit `db5cda8`). The original lift-and-shift had subtle differences in how the geometric observer was driven; this commit brings the data path back in line with DLIO's reference implementation so IMU dead-reckoning is mathematically consistent with scan corrections.
+- **Delta-form correction target** (P3, `odom/geo/delta_correction: true`). The GICP measurement is 0.1–0.3 s stale by the time the observer applies it; the legacy absolute target dragged the state backwards proportionally to yaw rate (the "turn error"). The observer now applies the time-free correction `T_meas · T_prior⁻¹` to the *current* state — zero correction at any latency when IMU and GICP agree. Gains unchanged.
+- **Single bias-application point** (P3). IMU biases are subtracted once, at buffering, so `propagateState`, the scan prior, and per-point deskew all integrate the same corrected signal (previously the prior/deskew path ran on raw gyro).
 
 **Initialization**
 
@@ -342,7 +360,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **Operational defaults**
 
-- Verbose logging, debug topic publication, per-scan jump/scan logs, and outgoing point-cloud topics are all **off by default** (commits `d492a69`, `b5116d3`, `100011c`). The pipeline is quiet and lean unless you explicitly enable diagnostics.
+- **Evidence-first defaults** (changed in the P1–P4 review): `localization/debug/enable_pub` and `verbose_scan_log` are **on** by default so every replay produces the per-frame debug topics and `SCAN DEBUG` lines the validation scorecard (`scripts/analyze_scan_debug_log.py`) consumes — measured cost is trivial (14 MB debug bag over a 36 min replay). General INFO verbosity, jump logs, and outgoing point-cloud topics remain off; disable the debug flags only for resource-constrained live deployment.
 
 ---
 

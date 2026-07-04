@@ -4,6 +4,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -30,6 +31,13 @@ struct AuxLidarSensor {
   Eigen::Isometry3d T_primary_sensor;
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> buffer;
   size_t buffer_size;
+  // P4#3 (GLIM parity with gicp_localization): signed header-time offset stats
+  // vs the primary (aux - primary), over MERGED scans only. A stable nonzero
+  // mean is the constant-per-aux-clock-offset signature vs the P1 timebase.
+  double dt_sum = 0.0;
+  double dt_min = std::numeric_limits<double>::infinity();
+  double dt_max = -std::numeric_limits<double>::infinity();
+  uint64_t dt_count = 0;
 };
 
 inline double stamp_to_sec(const builtin_interfaces::msg::Time& stamp) {
@@ -249,10 +257,30 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   bool require_all_aux = false,
   int max_consec_fail = 0,
   int* consec_fail = nullptr,
-  bool abort_on_merge_failure = true) {
+  bool abort_on_merge_failure = true,
+  bool frame_diag_log = false) {
   const double t_primary = stamp_to_sec(primary->header.stamp);
   const uint32_t point_step = primary->point_step;
   size_t merged_aux_count = 0;
+
+  // P4#3 (GLIM parity): per-frame merge record. GLIM's offline mapping tools
+  // have no ROS node to publish debug topics from, so the structured evidence
+  // channel is one parseable INFO line per frame ("CONCAT DEBUG | ...") in the
+  // mapping log, mirroring gicp_localization's per-frame debug topics.
+  std::vector<double> diag_aux_dt(aux_sensors.size(), std::numeric_limits<double>::quiet_NaN());
+  std::vector<size_t> diag_aux_pts(aux_sensors.size(), 0);
+  const auto emit_frame_diag = [&](size_t total_pts) {
+    if (!frame_diag_log) return;
+    std::ostringstream oss;
+    oss << "CONCAT DEBUG | stamp=" << std::fixed << std::setprecision(3) << t_primary
+        << " merged=" << merged_aux_count << "/" << aux_sensors.size();
+    oss << std::setprecision(4);
+    for (size_t i = 0; i < aux_sensors.size(); ++i) {
+      oss << " dt" << i << "=" << diag_aux_dt[i] << "s pts" << i << "=" << diag_aux_pts[i];
+    }
+    oss << " total_pts=" << total_pts;
+    spdlog::info(oss.str());
+  };
 
   // Strict-merge failure handler. Single routing point for every "required merge
   // can't complete" path (incomplete aux merge AND primary-precondition failures).
@@ -284,6 +312,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   int x_off, y_off, z_off;
   if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
     spdlog::warn("lidar_concat: cannot find xyz fields in primary cloud");
+    emit_frame_diag(primary->width * primary->height);
     if (on_required_failure(0, "primary cloud missing xyz fields")) return nullptr;
     return primary;
   }
@@ -297,6 +326,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
     spdlog::warn("lidar_concat: primary cloud is organized/padded (data={}, width={}, height={}, step={}); skipping concat",
                  primary->data.size(), primary->width, primary->height, point_step);
+    emit_frame_diag(primary->width * primary->height);
     if (on_required_failure(0, "primary cloud organized/padded (non-tight)")) return nullptr;
     return primary;
   }
@@ -306,7 +336,8 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   // validated above) so merged width/row_step always match the appended bytes.
   size_t total_points = primary->data.size() / point_step;
 
-  for (auto& aux : aux_sensors) {
+  for (size_t aux_i = 0; aux_i < aux_sensors.size(); ++aux_i) {
+    auto& aux = aux_sensors[aux_i];
     auto match = find_nearest(aux.buffer, t_primary, time_threshold);
     if (!match) {
       spdlog::debug("lidar_concat: no match for {} (t={:.3f})", aux.topic, t_primary);
@@ -358,7 +389,27 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     ++merged_aux_count;
 
     spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, std::abs(dt), aux_pts);
+
+    // P4#3: per-frame + running merge-timing diagnostics (parity with
+    // gicp_localization). dt here is SIGNED (aux header - primary header): a
+    // stable nonzero mean across the run is the constant per-aux clock-offset
+    // signature vs the P1 timebase, and it distorts the map's deskew at high
+    // yaw rates exactly like it does localization's.
+    diag_aux_dt[aux_i] = dt;
+    diag_aux_pts[aux_i] = aux_pts;
+    aux.dt_sum += dt;
+    aux.dt_min = std::min(aux.dt_min, dt);
+    aux.dt_max = std::max(aux.dt_max, dt);
+    if (++aux.dt_count % 512 == 0) {  // ~every 50 s at 10 Hz
+      const double mean = aux.dt_sum / static_cast<double>(aux.dt_count);
+      spdlog::info(
+        "lidar_concat: '{}' header offset vs primary over {} merges: mean={:+.1f} ms, min={:+.1f} ms, max={:+.1f} ms{}",
+        aux.topic, aux.dt_count, 1e3 * mean, 1e3 * aux.dt_min, 1e3 * aux.dt_max,
+        std::abs(mean) > 0.02 ? " — mean >20 ms: likely constant clock offset, consider a per-aux time correction" : "");
+    }
   }
+
+  emit_frame_diag(total_points);
 
   merged->width = total_points;
   merged->height = 1;
@@ -389,6 +440,11 @@ struct AuxConcatConfig {
   bool abort_on_merge_failure = true;         // true = stop past budget; false = keep skipping non-fatally
   int max_consecutive_aux_merge_failures = 10;
   int consecutive_merge_failures = 0;
+  // P4#3: one parseable "CONCAT DEBUG | ..." INFO line per primary scan
+  // (merged count, per-aux signed dt + points, total points). Default ON for
+  // the offline mapping tools — this is the map-side merge evidence the run
+  // reports need; ~1 line / 100 ms costs a few MB per mapping run.
+  bool frame_diag_log = true;
 };
 
 // Resolve a (possibly relative) urdf_path CWD-independently. parse_urdf_transforms
@@ -423,6 +479,7 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   out.require_all_aux = config_sensors.param<bool>("lidar_concat", "require_all_aux", false);
   out.abort_on_merge_failure = config_sensors.param<bool>("lidar_concat", "abort_on_merge_failure", true);
   out.max_consecutive_aux_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_aux_merge_failures", 10);
+  out.frame_diag_log = config_sensors.param<bool>("lidar_concat", "frame_diag_log", true);
 
   if (!out.enabled) {
     return out;

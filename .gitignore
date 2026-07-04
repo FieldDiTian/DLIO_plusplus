@@ -2,6 +2,7 @@ build/
 install/
 log/
 tmp/
+/runs/
 .DS_Store
 CLAUDE.md
 .codex

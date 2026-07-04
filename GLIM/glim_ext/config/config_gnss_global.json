@@ -60,6 +60,18 @@
       1e-6,
       1e2
     ],
+    // P5#1 yaw-quality gate. The RTK filter feeding gnss_topic qualifies
+    // POSITION quality only; the dual-antenna HEADING can be degraded or
+    // unsolved while position stays RTK-FIXED (secondary-antenna outage,
+    // baseline multipath). Skip the heading prior when the message's reported
+    // yaw sigma (sqrt of pose.covariance[35], populated by the adapter from
+    // Atlas rpy_covariance in deg^2 -> rad^2) exceeds this threshold; the
+    // position prior is still applied. Atlas dual-antenna heading is
+    // ~0.1-0.3 deg sigma when healthy, >1 deg degraded — 3.0 sits well clear
+    // of healthy while rejecting garbage that a 5.7-deg-sigma prior would
+    // otherwise ingest. <= 0 disables the gate; samples without populated
+    // yaw covariance pass (covariance-less publishers keep old behavior).
+    "orientation_prior_max_yaw_sigma_deg": 3.0,
     // Software antenna -> IMU lever-arm compensation.
     //
     // Set to FALSE for tightly-coupled INS receivers (Point One Atlas,

@@ -1,9 +1,11 @@
 #include <deque>
+#include <cmath>
 #include <atomic>
 #include <thread>
 #include <numeric>
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -61,6 +63,10 @@ public:
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
   bool has_orientation = false;
+  // P5#1: reported yaw variance (rad^2) from pose.covariance[35].
+  // < 0 means "not populated by the publisher" (passes the yaw-quality gate
+  // for backwards compatibility with covariance-less GNSS sources).
+  double yaw_var = -1.0;
 };
 
 /**
@@ -83,6 +89,16 @@ public:
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
     enable_orientation_prior = config.param<bool>("gnss", "enable_orientation_prior", false);
     orientation_prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "orientation_prior_inf_scale", Eigen::Vector3d(1e2, 1e2, 1e2));
+    // P5#1: yaw-quality gate for the orientation prior. The RTK gate upstream
+    // (adapter/rtk_fixed filter) qualifies POSITION quality only; a
+    // position-FIXED sample can still carry a degraded/unsolved dual-antenna
+    // heading (secondary-antenna outage, short baseline multipath). Feeding
+    // that heading as a stiff PoseRotationPrior would twist the map exactly
+    // where we are trying to pin it. Skip the orientation prior when the
+    // publisher's reported yaw sigma (sqrt of pose.covariance[35]) exceeds
+    // this threshold. <= 0 disables the gate; samples WITHOUT a populated
+    // yaw covariance pass (backwards compatible with covariance-less sources).
+    orientation_prior_max_yaw_sigma_deg = config.param<double>("gnss", "orientation_prior_max_yaw_sigma_deg", 3.0);
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
 
     if (enable_orientation_prior && orientation_prior_inf_scale.minCoeff() < 0.0) {
@@ -198,13 +214,15 @@ public:
   void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w);
+    const double yaw_var = gnss_msg->pose.covariance[35] > 0.0 ? gnss_msg->pose.covariance[35] : -1.0;
+    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
   }
 
   void gnss_callback(const OdometryConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w);
+    const double yaw_var = gnss_msg->pose.covariance[35] > 0.0 ? gnss_msg->pose.covariance[35] : -1.0;
+    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
   }
 
   void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
@@ -340,11 +358,29 @@ public:
           output_factors.push_back(
             gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model)));
 
-          if (enable_orientation_prior && gnss.has_orientation) {
+          // P5#1 yaw-quality gate: skip the heading prior when the publisher
+          // reports a degraded yaw solution (dual-antenna heading can be bad
+          // while position is RTK-FIXED — the upstream RTK filter qualifies
+          // position only). Unpopulated covariance (yaw_var < 0) passes.
+          const double max_yaw_sigma_rad = orientation_prior_max_yaw_sigma_deg * M_PI / 180.0;
+          const bool yaw_quality_ok =
+            orientation_prior_max_yaw_sigma_deg <= 0.0 || gnss.yaw_var < 0.0 ||
+            gnss.yaw_var <= max_yaw_sigma_rad * max_yaw_sigma_rad;
+
+          if (enable_orientation_prior && gnss.has_orientation && yaw_quality_ok) {
             const Eigen::Matrix3d R_world_gnss = T_world_utm.linear() * gnss.orientation.toRotationMatrix();
             const auto rotation_model = gtsam::noiseModel::Diagonal::Precisions(orientation_prior_inf_scale);
             output_factors.push_back(
               gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseRotationPrior<gtsam::Pose3>(X(submap->id), gtsam::Rot3(R_world_gnss), rotation_model)));
+          } else if (enable_orientation_prior && gnss.has_orientation && !yaw_quality_ok) {
+            ++yaw_gate_skip_count;
+            if (yaw_gate_skip_count == 1 || yaw_gate_skip_count % 50 == 0) {
+              logger->warn(
+                "orientation prior skipped for submap {}: reported yaw sigma {:.2f} deg > max {:.2f} deg "
+                "({} skipped so far) — position prior still applied",
+                submap->id, std::sqrt(gnss.yaw_var) * 180.0 / M_PI,
+                orientation_prior_max_yaw_sigma_deg, yaw_gate_skip_count);
+            }
           } else if (enable_orientation_prior && !warned_missing_orientation) {
             logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
             warned_missing_orientation = true;
@@ -394,10 +430,11 @@ private:
     logger->info("saved T_world_utm (4x4 SE(3)) to: {}", filename);
   }
 
-  void push_gnss_data(double stamp, double x, double y, double z, double qx, double qy, double qz, double qw) {
+  void push_gnss_data(double stamp, double x, double y, double z, double qx, double qy, double qz, double qw, double yaw_var = -1.0) {
     GNSSData gnss_data;
     gnss_data.stamp = stamp;
     gnss_data.position << x, y, z;
+    gnss_data.yaw_var = yaw_var;
 
     Eigen::Quaterniond orientation(qw, qx, qy, qz);
     if (orientation.coeffs().allFinite() && orientation.norm() > 1e-6) {
@@ -436,6 +473,11 @@ private:
     if (interpolated.has_orientation) {
       interpolated.orientation = left.orientation.slerp(p, right.orientation).normalized();
     }
+    // Yaw variance: conservative max of the bracketing samples. If EITHER is
+    // unpopulated (<0), the interpolated variance is unknown too — the gate
+    // then passes it (unknown != known-bad), matching the per-sample contract.
+    interpolated.yaw_var = (left.yaw_var > 0.0 && right.yaw_var > 0.0)
+        ? std::max(left.yaw_var, right.yaw_var) : -1.0;
 
     return interpolated;
   }
@@ -467,6 +509,8 @@ private:
   Eigen::Vector3d prior_inf_scale;
   bool enable_orientation_prior;
   Eigen::Vector3d orientation_prior_inf_scale;
+  double orientation_prior_max_yaw_sigma_deg;  // P5#1 yaw-quality gate (<=0 disables)
+  size_t yaw_gate_skip_count = 0;              // heading priors skipped by the gate
   double min_baseline;
 
   Eigen::Vector3d t_imu_gnss;

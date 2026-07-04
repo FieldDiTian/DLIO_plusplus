@@ -28,7 +28,13 @@
     //   false = keep skipping incomplete scans non-fatally (robust long replays)
     // Ignored when require_all_aux=false. Parity with GICP abort_on_merge_failure.
     "abort_on_merge_failure": true,
-    "max_consecutive_aux_merge_failures": 10
+    "max_consecutive_aux_merge_failures": 10,
+    // P4#3: one parseable "CONCAT DEBUG | ..." INFO line per primary scan
+    // (merged n/N, per-aux signed dt + point counts, total points) — the
+    // map-side merge evidence, mirroring gicp_localization's per-frame debug
+    // topics. Per-aux mean/min/max header offset is also summarized every 512
+    // merges, warning when |mean| > 20 ms (constant clock-offset signature).
+    "frame_diag_log": true
   },
   "sensors": {
     "T_lidar_camera": [

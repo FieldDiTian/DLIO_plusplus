@@ -133,6 +133,191 @@ double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
   return max_eigenvalue / min_nonzero_eigenvalue;
 }
 
+// ---------------------------------------------------------------------------
+// P1 gating rework: degeneracy-aware partial update ("solution remapping",
+// Zhang & Singh ICRA'16). Instead of binary-rejecting a scan whose hessian is
+// ill-conditioned, project the GICP correction onto the well-constrained
+// eigen-subspace and keep the IMU prior along the degenerate directions.
+//
+// Frame handling: nano_gicp's final hessian is parameterized as [omega; t]
+// with the rotation taken about the WORLD ORIGIN (jacobian block is
+// skew(transformed_point)). With the vehicle ~hundreds of metres from the map
+// origin, a yaw about the origin is numerically indistinguishable from a
+// translation, so the raw rotation block mostly measures lever-arm effects.
+// We therefore re-center the hessian about the vehicle position c first:
+// with new variables [omega; t_hat], t_hat = t + omega x c, the substitution
+// x = A x_hat, A = [[I,0],[skew(c),I]] gives H_c = A^T H A whose rotation
+// block measures rotations ABOUT THE VEHICLE. Conveniently t_hat is, to first
+// order, exactly candidate_p - prior_p, so the projected translation applies
+// directly to the pose difference.
+// ---------------------------------------------------------------------------
+struct DegeneracyProjection {
+  bool valid{false};          // analysis ran (hessian finite, eigensolver ok)
+  bool modified{false};       // projected pose differs from raw candidate
+  bool fully_degenerate{false};  // all 6 axes degenerate -> caller should reject
+  bool yaw_vetoed{false};     // yaw-consistency veto zeroed the yaw correction
+  int degen_rot_axes{0};
+  int degen_trans_axes{0};
+  Eigen::Matrix4f projected_pose = Eigen::Matrix4f::Identity();
+};
+
+DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& hessian,
+                                            const Eigen::Matrix4f& T_prior,
+                                            const Eigen::Matrix4f& candidate,
+                                            bool apply_eigen_projection,
+                                            bool full6d,
+                                            double coupling_length_m,
+                                            double rel_floor_6d,
+                                            double rel_floor_rot,
+                                            double rel_floor_trans,
+                                            double veto_yaw_above_deg /* <=0 disables */) {
+  DegeneracyProjection out;
+  out.projected_pose = candidate;
+  if (!hessian.allFinite()) return out;
+
+  const Eigen::Matrix4d prior = T_prior.cast<double>();
+  const Eigen::Matrix4d cand = candidate.cast<double>();
+  const Eigen::Matrix3d R_prior = prior.block<3, 3>(0, 0);
+  const Eigen::Matrix3d R_cand = cand.block<3, 3>(0, 0);
+  const Eigen::Vector3d p_prior = prior.block<3, 1>(0, 3);
+  const Eigen::Vector3d p_cand = cand.block<3, 1>(0, 3);
+
+  // World-frame delta: candidate = T_delta * prior.
+  const Eigen::Matrix3d R_delta = R_cand * R_prior.transpose();
+  Eigen::AngleAxisd aa(R_delta);
+  Eigen::Vector3d omega = aa.angle() * aa.axis();   // rotation correction (world axes, about vehicle)
+  Eigen::Vector3d t_hat = p_cand - p_prior;         // translation correction of the vehicle
+
+  Eigen::Vector3d omega_p = omega;
+  Eigen::Vector3d t_hat_p = t_hat;
+
+  if (apply_eigen_projection) {
+    // Re-center the hessian about the vehicle position.
+    const Eigen::Matrix<double, 6, 6> H_sym = 0.5 * (hessian + hessian.transpose());
+    Eigen::Matrix3d skew_c;
+    skew_c << 0.0, -p_prior.z(), p_prior.y(),
+              p_prior.z(), 0.0, -p_prior.x(),
+             -p_prior.y(), p_prior.x(), 0.0;
+    Eigen::Matrix<double, 6, 6> A = Eigen::Matrix<double, 6, 6>::Identity();
+    A.block<3, 3>(3, 0) = skew_c;
+    const Eigen::Matrix<double, 6, 6> H_c = A.transpose() * H_sym * A;
+
+    if (full6d) {
+      // Full 6D solution remapping (Zhang & Singh). Rotation (rad) and
+      // translation (m) are incommensurable, so scale rotation coordinates by
+      // a characteristic coupling length L first: x_s = [L*omega; t_hat],
+      // x = D x_s with D = diag(I/L, I), H_s = D H_c D. L should be the
+      // typical constraint lever arm (~point-cloud radius after the 80 m
+      // crop); with it, one unit of any scaled coordinate moves constraint
+      // points by comparable metres, making the joint spectrum meaningful and
+      // COUPLED rot/trans null directions (e.g. slide-along-a-wall = yaw +
+      // lateral mix) visible — a blockwise analysis structurally cannot see
+      // those.
+      const double L = std::max(coupling_length_m, 1e-3);
+      Eigen::Matrix<double, 6, 6> D = Eigen::Matrix<double, 6, 6>::Identity();
+      D.block<3, 3>(0, 0) /= L;
+      const Eigen::Matrix<double, 6, 6> H_s = D * H_c * D;
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(H_s);
+      if (es.info() != Eigen::Success) {
+        return out;  // eigensolver failure: leave candidate untouched, valid=false
+      }
+      const Eigen::Matrix<double, 6, 1> evals = es.eigenvalues().cwiseAbs();
+      const double lambda_max = evals.maxCoeff();
+      Eigen::Matrix<double, 6, 6> P6 = Eigen::Matrix<double, 6, 6>::Zero();
+      int n_degen = 0;
+      for (int i = 0; i < 6; ++i) {
+        const Eigen::Matrix<double, 6, 1> v = es.eigenvectors().col(i);
+        if (lambda_max <= 0.0 || evals[i] < rel_floor_6d * lambda_max) {
+          ++n_degen;
+          // Report which sub-block the degenerate direction mostly lives in
+          // (diagnostic only; the projector itself is fully coupled).
+          if (v.head<3>().norm() >= v.tail<3>().norm()) {
+            ++out.degen_rot_axes;
+          } else {
+            ++out.degen_trans_axes;
+          }
+        } else {
+          P6 += v * v.transpose();
+        }
+      }
+      if (n_degen == 6) {
+        out.valid = true;
+        out.fully_degenerate = true;
+        return out;
+      }
+      Eigen::Matrix<double, 6, 1> dx_s;
+      dx_s.head<3>() = L * omega;
+      dx_s.tail<3>() = t_hat;
+      const Eigen::Matrix<double, 6, 1> dx_s_p = P6 * dx_s;
+      omega_p = dx_s_p.head<3>() / L;
+      t_hat_p = dx_s_p.tail<3>();
+    } else {
+      // Blockwise fallback (degeneracy/full6d: false): independent 3x3
+      // eigen-analyses of the rot/trans blocks. Unit-mixing-free but blind to
+      // coupled rot/trans degeneracy; kept for A/B comparison.
+      Eigen::Matrix3d P_rot = Eigen::Matrix3d::Identity();
+      Eigen::Matrix3d P_trans = Eigen::Matrix3d::Identity();
+      auto blockProjector = [](const Eigen::Matrix3d& block, double rel_floor,
+                               Eigen::Matrix3d& projector, int& n_degen) -> bool {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(block);
+        if (es.info() != Eigen::Success) return false;
+        const Eigen::Vector3d evals = es.eigenvalues().cwiseAbs();
+        const double lambda_max = evals.maxCoeff();
+        projector.setZero();
+        n_degen = 0;
+        for (int i = 0; i < 3; ++i) {
+          if (lambda_max <= 0.0 || evals[i] < rel_floor * lambda_max) {
+            ++n_degen;
+          } else {
+            const Eigen::Vector3d v = es.eigenvectors().col(i);
+            projector += v * v.transpose();
+          }
+        }
+        return true;
+      };
+
+      if (!blockProjector(H_c.block<3, 3>(0, 0), rel_floor_rot, P_rot, out.degen_rot_axes) ||
+          !blockProjector(H_c.block<3, 3>(3, 3), rel_floor_trans, P_trans, out.degen_trans_axes)) {
+        return out;  // eigensolver failure: leave candidate untouched, valid=false
+      }
+      if (out.degen_rot_axes == 3 && out.degen_trans_axes == 3) {
+        out.valid = true;
+        out.fully_degenerate = true;
+        return out;
+      }
+      omega_p = P_rot * omega;
+      t_hat_p = P_trans * t_hat;
+    }
+  }
+
+  // Turn-aware yaw-consistency veto: T_prior already contains the
+  // IMU-integrated yaw across the scan gap, so omega.z() IS the GICP-vs-IMU
+  // yaw disagreement. A large disagreement on a low-confidence match is the
+  // wrong-basin entry signature; keep the IMU yaw instead.
+  constexpr double kRad2Deg = 180.0 / M_PI;
+  if (veto_yaw_above_deg > 0.0 && std::abs(omega_p.z()) * kRad2Deg > veto_yaw_above_deg) {
+    omega_p.z() = 0.0;
+    out.yaw_vetoed = true;
+  }
+
+  const double kEps = 1e-12;
+  const bool changed = ((omega_p - omega).norm() > kEps) || ((t_hat_p - t_hat).norm() > kEps);
+  out.valid = true;
+  if (changed) {
+    Eigen::Matrix3d R_delta_p = Eigen::Matrix3d::Identity();
+    const double angle = omega_p.norm();
+    if (angle > kEps) {
+      R_delta_p = Eigen::AngleAxisd(angle, omega_p / angle).toRotationMatrix();
+    }
+    Eigen::Matrix4d projected = Eigen::Matrix4d::Identity();
+    projected.block<3, 3>(0, 0) = R_delta_p * R_prior;
+    projected.block<3, 1>(0, 3) = p_prior + t_hat_p;
+    out.projected_pose = projected.cast<float>();
+    out.modified = true;
+  }
+  return out;
+}
+
 // Find x/y/z field offsets in a PointCloud2 message. Returns false if any are missing.
 bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
   x_off = y_off = z_off = -1;
@@ -712,6 +897,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   // Initialize pose
   this->current_pose = Eigen::Matrix4f::Identity();
   this->T_prior = Eigen::Matrix4f::Identity();
+  this->observer_prior_pose_ = Eigen::Matrix4f::Identity();
   this->last_gicp_pose_ = Eigen::Matrix4f::Identity();
   this->last_gicp_stamp_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
   this->last_gicp_valid_ = false;
@@ -1030,6 +1216,26 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
     this->dbg_gt_rot_deg_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
+    // P1 gating rework diagnostics
+    this->dbg_fitness_ratio_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness_ratio", 10);
+    this->dbg_degen_rot_axes_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/degen_rot_axes", 10);
+    this->dbg_degen_trans_axes_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/degen_trans_axes", 10);
+    this->dbg_yaw_veto_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_veto", 10);
+    // P4#3: per-frame lidar_concat diagnostics (one sample per processed frame).
+    this->dbg_merged_aux_count_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
+    this->dbg_scan_time_span_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_time_span_s", 10);
+    for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+      this->dbg_aux_dt_pubs_.push_back(this->create_publisher<std_msgs::msg::Float64>(
+          "gicp/localization/debug/aux" + std::to_string(i) + "_merge_dt_s", 10));
+      this->dbg_aux_points_pubs_.push_back(this->create_publisher<std_msgs::msg::Float64>(
+          "gicp/localization/debug/aux" + std::to_string(i) + "_points", 10));
+    }
   }
 
   if (this->visualize_map_) {
@@ -1177,7 +1383,9 @@ void gicp_localization::LocalizationNode::getParams() {
   // GT-driven pose recovery (optional). Independent of gt_odom/enable; recovery
   // requires the same subscriber to be active, so it implies gt_odom/enable.
   this->declare_parameter<bool>("localization/gt_recovery/enable", false);
-  this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 3);
+  // Default matches cfg/localization.yaml (P2#3: raised from 1; per-frame
+  // snapping masked dead-reckoning quality). Keep the two in sync.
+  this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 5);
   this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
   this->get_parameter("localization/gt_recovery/min_consecutive_failures",
                       this->gt_recovery_min_consecutive_failures_);
@@ -1227,6 +1435,39 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("gicp/hessianTransWarnM", 1.0);
   this->declare_parameter<double>("gicp/hessianRotWarnDeg", 1.5);
 
+  // P1 gating rework (docs/action_plan_turn_error_20260704.md).
+  // Rolling-median fitness baseline: absolute fitness thresholds calibrated on
+  // a same-run map (floor 0.03-0.06) are meaningless on cross-run maps (floor
+  // ~0.27), so gates operate on fitness / rolling-median instead.
+  this->declare_parameter<bool>("gicp/fitnessBaseline/enable", true);
+  this->declare_parameter<int>("gicp/fitnessBaseline/window", 201);
+  this->declare_parameter<int>("gicp/fitnessBaseline/minSamples", 50);
+  // Warm-up seed: expected per-map fitness floor used as the baseline until
+  // minSamples accepted frames exist, so ratio gates / yaw veto are live from
+  // frame 1 (0 = off; gates absolute-only during warm-up, pre-review behavior).
+  this->declare_parameter<double>("gicp/fitnessBaseline/seedBaseline", 0.0);
+  // Wrong-basin (bad-accept) gate: run-12 data shows good accepts at ratio
+  // median 1.00 / p99 1.92, bad accepts (gt_err>20m) at median 1.34 / p90 2.55.
+  this->declare_parameter<double>("gicp/fitnessRatioRejectThreshold", 2.0);
+  // Degeneracy partial update: when the condition proxy crosses hessianCondMax,
+  // project the correction instead of rejecting the whole scan (the old binary
+  // reject produced 253-frame dead-reckoning streaks on run 12).
+  this->declare_parameter<bool>("gicp/degeneracy/partialUpdate", true);
+  // Full 6D coupled remapping (default) vs independent 3x3 rot/trans blocks.
+  // full6d sees COUPLED rot/trans null directions (slide-along-a-wall = yaw +
+  // lateral mix) that a blockwise analysis structurally cannot; rotation
+  // coordinates are made commensurable with translation via couplingLengthM
+  // (the typical constraint lever arm, ~point-cloud radius after cropping).
+  this->declare_parameter<bool>("gicp/degeneracy/full6d", true);
+  this->declare_parameter<double>("gicp/degeneracy/couplingLengthM", 20.0);
+  this->declare_parameter<double>("gicp/degeneracy/relFloor6d", 0.02);
+  this->declare_parameter<double>("gicp/degeneracy/relFloorRot", 0.02);
+  this->declare_parameter<double>("gicp/degeneracy/relFloorTrans", 0.02);
+  // Turn-aware yaw-consistency veto (Codex finding 1).
+  this->declare_parameter<bool>("gicp/yawGate/enable", true);
+  this->declare_parameter<double>("gicp/yawGate/maxCorrDeg", 1.5);
+  this->declare_parameter<double>("gicp/yawGate/fitnessRatio", 1.2);
+
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
   this->get_parameter("gicp/maxCorrespondenceDistance", this->gicp_max_corr_dist_);
@@ -1238,6 +1479,35 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/hessianFitnessWarnThreshold", this->gicp_hessian_fitness_warn_);
   this->get_parameter("gicp/hessianTransWarnM", this->gicp_hessian_trans_warn_m_);
   this->get_parameter("gicp/hessianRotWarnDeg", this->gicp_hessian_rot_warn_deg_);
+  this->get_parameter("gicp/fitnessBaseline/enable", this->fitness_baseline_enable_);
+  this->get_parameter("gicp/fitnessBaseline/window", this->fitness_baseline_window_);
+  this->get_parameter("gicp/fitnessBaseline/minSamples", this->fitness_baseline_min_samples_);
+  this->get_parameter("gicp/fitnessBaseline/seedBaseline", this->fitness_baseline_seed_);
+  this->get_parameter("gicp/fitnessRatioRejectThreshold", this->fitness_ratio_reject_);
+  this->get_parameter("gicp/degeneracy/partialUpdate", this->degen_partial_update_enable_);
+  this->get_parameter("gicp/degeneracy/full6d", this->degen_full6d_);
+  this->get_parameter("gicp/degeneracy/couplingLengthM", this->degen_coupling_length_m_);
+  this->get_parameter("gicp/degeneracy/relFloor6d", this->degen_rel_floor_6d_);
+  this->get_parameter("gicp/degeneracy/relFloorRot", this->degen_rel_floor_rot_);
+  this->get_parameter("gicp/degeneracy/relFloorTrans", this->degen_rel_floor_trans_);
+  this->get_parameter("gicp/yawGate/enable", this->yaw_gate_enable_);
+  this->get_parameter("gicp/yawGate/maxCorrDeg", this->yaw_gate_max_corr_deg_);
+  this->get_parameter("gicp/yawGate/fitnessRatio", this->yaw_gate_fitness_ratio_);
+  if (this->fitness_baseline_window_ < 3) this->fitness_baseline_window_ = 3;
+  if (this->fitness_baseline_min_samples_ < 3) this->fitness_baseline_min_samples_ = 3;
+  RCLCPP_INFO(this->get_logger(),
+              "P1 gating: fitness baseline %s (window=%d, min=%d), ratio_reject=%.2f, "
+              "partial_update=%s (%s, L=%.1fm, floor6d=%.3f, block floors rot=%.3f trans=%.3f), "
+              "yaw_gate=%s (max=%.2fdeg, ratio>%.2f)",
+              this->fitness_baseline_enable_ ? "ON" : "OFF",
+              this->fitness_baseline_window_, this->fitness_baseline_min_samples_,
+              this->fitness_ratio_reject_,
+              this->degen_partial_update_enable_ ? "ON" : "OFF",
+              this->degen_full6d_ ? "full6d" : "blockwise",
+              this->degen_coupling_length_m_, this->degen_rel_floor_6d_,
+              this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
+              this->yaw_gate_enable_ ? "ON" : "OFF",
+              this->yaw_gate_max_corr_deg_, this->yaw_gate_fitness_ratio_);
 
   // Preprocessing parameters
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
@@ -1268,7 +1538,11 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
   this->declare_parameter<double>("localization/lidar_concat/time_threshold", 0.05);
-  this->declare_parameter<int>("localization/lidar_concat/buffer_size", 20);
+  // P4#3: 200 for parity with GLIM's lidar_concat. At 10 Hz a depth of 20 is
+  // only 2 s of aux history — a brief aux-stream stall or replay burst drops
+  // the matching scan and the frame silently degrades to fewer LiDARs (run-12
+  // throttled logs: only ~35% of sampled scans merged 2/2). 200 = ~20 s.
+  this->declare_parameter<int>("localization/lidar_concat/buffer_size", 200);
   // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
   this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
   this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
@@ -1444,6 +1718,18 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("odom/geo/Kz_damping", this->geo_Kz_damping_);
   this->get_parameter("odom/geo/abias_max", this->geo_abias_max_);
   this->get_parameter("odom/geo/gbias_max", this->geo_gbias_max_);
+
+  // P3: delta-form observer correction. The GICP measurement and its IMU
+  // prior are both stamped at the scan's median point time, 0.1-0.3 s before
+  // the correction is applied (half sweep + queueing + GICP solve). Legacy
+  // behavior pulls the CURRENT state toward that stale absolute pose, which
+  // is a systematic backward/yaw-lag drag during turns (accepted-frame gt_err
+  // scaled with yaw rate on run 12). Delta form instead applies
+  // T_corr = T_meas * inv(T_prior) — the time-free IMU-drift correction — to
+  // the current state, so a perfect IMU/GICP agreement produces a ZERO
+  // correction regardless of latency. false = legacy absolute-target observer.
+  this->declare_parameter<bool>("odom/geo/delta_correction", true);
+  this->get_parameter("odom/geo/delta_correction", this->geo_delta_correction_);
 
   // Observer-correction stability bounds (P2#1).
   this->declare_parameter<double>("odom/geo/observer_dt_max", 0.15);
@@ -2218,6 +2504,14 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
 
   this->luminar_primary_min_ts_valid_ = false;
+
+  // P4#3: reset the per-frame concat diagnostics. Any early return below
+  // leaves them at "nothing merged", which is exactly what happened.
+  this->concat_last_merged_aux_ = 0;
+  this->concat_last_aux_dt_.assign(this->aux_lidars_.size(),
+                                   std::numeric_limits<double>::quiet_NaN());
+  this->concat_last_aux_points_.assign(this->aux_lidars_.size(), 0);
+
   if (this->aux_lidars_.empty()) return primary;
 
   // Strict-merge failure handler. Single routing point for every "required merge
@@ -2330,8 +2624,8 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   // Avoids per-aux reallocations as we grow merged->data.
   merged->data.reserve(primary->data.size() * (1 + this->aux_lidars_.size()));
 
-  for (auto& aux_ptr : this->aux_lidars_) {
-    auto& aux = *aux_ptr;
+  for (size_t aux_i = 0; aux_i < this->aux_lidars_.size(); ++aux_i) {
+    auto& aux = *this->aux_lidars_[aux_i];
 
     // Cache T_primary_aux from TF on first use. Skip this aux until TF is available.
     if (!aux.extrinsic_cached) {
@@ -2448,7 +2742,33 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     // not width*height, so merged->width/row_step stay consistent with data.
     total_points += aux_pts;
     ++merged_aux_count;
+
+    // P4#3: per-frame + running merge-timing diagnostics. signed_dt is the
+    // aux-vs-primary HEADER offset (not the |dt| used for matching): a stable
+    // nonzero mean across the run is the signature of a constant per-aux
+    // clock offset against the P1 timebase, which a per-aux time-offset
+    // correction upstream could absorb (and which inflates deskew error at
+    // high yaw rates).
+    const double signed_dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
+    this->concat_last_aux_dt_[aux_i] = signed_dt;
+    this->concat_last_aux_points_[aux_i] = static_cast<int>(aux_pts);
+    aux.dt_sum += signed_dt;
+    aux.dt_min = std::min(aux.dt_min, signed_dt);
+    aux.dt_max = std::max(aux.dt_max, signed_dt);
+    if (++aux.dt_count % 512 == 0) {  // ~every 50 s at 10 Hz
+      RCLCPP_INFO(this->get_logger(),
+                  "lidar_concat: '%s' header offset vs primary over %lu merges: "
+                  "mean=%+.1f ms, min=%+.1f ms, max=%+.1f ms%s",
+                  aux.topic.c_str(), static_cast<unsigned long>(aux.dt_count),
+                  1e3 * aux.dt_sum / static_cast<double>(aux.dt_count),
+                  1e3 * aux.dt_min, 1e3 * aux.dt_max,
+                  std::abs(aux.dt_sum / static_cast<double>(aux.dt_count)) > 0.02
+                      ? " — mean >20 ms: likely constant clock offset, consider a per-aux time correction"
+                      : "");
+    }
   }
+
+  this->concat_last_merged_aux_ = static_cast<int>(merged_aux_count);
 
   // The merged cloud is unorganized (height=1); width = total appended points.
   // Compute row_step in size_t so the point_step*total_points multiply cannot
@@ -2619,9 +2939,15 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
 
   if (timestamps.empty()) {
     RCLCPP_WARN(this->get_logger(), "No timestamps extracted from point cloud, skipping deskewing");
+    this->last_scan_time_span_s_ = -1.0;
     this->current_scan = this->original_scan;
     return;
   }
+
+  // P4#3: per-frame sweep time span of the (merged) cloud. A healthy 3-LiDAR
+  // merge spans ~1 sweep period; a much larger span means a badly-offset aux
+  // got rebased far from the primary and is being deskewed across a long arc.
+  this->last_scan_time_span_s_ = timestamps.back() - timestamps.front();
 
   // A Luminar sweep that collapses to a single unique timestamp means every point
   // shares one time, so deskew degenerates to a rigid transform (no motion
@@ -2858,6 +3184,62 @@ void gicp_localization::LocalizationNode::performLocalization() {
       : (optimizer_solution * T_lidar_base);
   const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
+  // --- P1: per-map fitness baseline (rolling median of accepted-frame fitness).
+  // Absolute fitness thresholds calibrated on a same-run map (floor 0.03-0.06)
+  // are meaningless on a cross-run map (floor ~0.27); gates below operate on
+  // fitness_ratio = fitness / baseline. ratio stays -1 (gates inert) until
+  // minSamples accepted frames have been observed.
+  double fitness_baseline = -1.0;
+  double fitness_ratio = -1.0;
+  if (this->fitness_baseline_enable_ &&
+      static_cast<int>(this->fitness_history_.size()) >= this->fitness_baseline_min_samples_) {
+    std::vector<double> tmp(this->fitness_history_.begin(), this->fitness_history_.end());
+    const size_t mid = tmp.size() / 2;
+    std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+    fitness_baseline = tmp[mid];
+  } else if (this->fitness_baseline_enable_ && this->fitness_baseline_seed_ > 0.0) {
+    // Warm-up seed (review fix): without it the ratio gates and yaw veto are
+    // inert for the first minSamples accepted frames — a replay that starts
+    // mid-turn is unprotected exactly when it is most fragile. Seed with the
+    // expected per-map floor (read it off the previous run's scorecard,
+    // scripts/analyze_scan_debug_log.py); the rolling median takes over once
+    // warmed up.
+    fitness_baseline = this->fitness_baseline_seed_;
+  }
+  if (fitness_baseline > 1e-9 && std::isfinite(fitness_score)) {
+    fitness_ratio = fitness_score / fitness_baseline;
+  }
+
+  // --- P1: degeneracy-aware partial update + yaw-consistency veto.
+  // Eigen-projection engages when the (calibrated) condition proxy crosses
+  // hessianCondMax; the yaw veto engages independently on low-confidence
+  // matches (fitness_ratio above yawGate/fitnessRatio). Either way the scan is
+  // not binary-rejected: the correction is projected and the IMU prior kept
+  // along untrusted directions.
+  const bool eigen_projection_wanted =
+      this->degen_partial_update_enable_ && candidate_pose_valid &&
+      this->gicp_hessian_cond_max_ > 0.0 && std::isfinite(hessian_condition) &&
+      hessian_condition > this->gicp_hessian_cond_max_;
+  // NOTE: yawGate is deliberately INDEPENDENT of degeneracy/partialUpdate —
+  // disabling partial updates (legacy binary hessian gate) must not silently
+  // disable the yaw-consistency veto.
+  const bool yaw_veto_wanted =
+      candidate_pose_valid &&
+      this->yaw_gate_enable_ && fitness_ratio > 0.0 &&
+      fitness_ratio > this->yaw_gate_fitness_ratio_;
+  DegeneracyProjection degen;
+  degen.projected_pose = candidate_pose;
+  if (eigen_projection_wanted || yaw_veto_wanted) {
+    degen = projectDegenerateDelta(final_hessian, this->T_prior, candidate_pose,
+                                   eigen_projection_wanted,
+                                   this->degen_full6d_, this->degen_coupling_length_m_,
+                                   this->degen_rel_floor_6d_,
+                                   this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
+                                   yaw_veto_wanted ? this->yaw_gate_max_corr_deg_ : 0.0);
+  }
+  const Eigen::Matrix4f final_candidate =
+      (degen.valid && degen.modified) ? degen.projected_pose : candidate_pose;
+
   double guess_to_solution_trans = -1.0;
   double guess_to_solution_rot_deg = -1.0;
   if (candidate_pose_valid) {
@@ -2910,6 +3292,18 @@ void gicp_localization::LocalizationNode::performLocalization() {
       this->jump_rot_dt_scale_deg_ * scan_dt_clamped;
   const bool large_jump = candidate_pose_valid &&
                           (jump_trans > eff_jump_trans_m || jump_rot_deg > eff_jump_rot_deg);
+  // The jump GATE evaluates the pose that would actually be applied. A partial
+  // update can only shrink the GICP-vs-prior delta, so this is never looser
+  // than the raw-candidate check; raw jump_trans/jump_rot_deg stay in the
+  // debug topics/log as the unprojected disagreement signal.
+  double final_jump_trans = jump_trans;
+  double final_jump_rot_deg = jump_rot_deg;
+  if (candidate_pose_valid && degen.valid && degen.modified) {
+    final_jump_trans = deltaTranslationNorm(this->T_prior, final_candidate);
+    final_jump_rot_deg = rotationDistanceDeg(this->T_prior, final_candidate);
+  }
+  const bool large_jump_final = candidate_pose_valid &&
+      (final_jump_trans > eff_jump_trans_m || final_jump_rot_deg > eff_jump_rot_deg);
 
   // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
   // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
@@ -2924,8 +3318,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // do NOT participate in this gate; they accept Atlas dead-reckoning
     // quality as the next-best truth.
     if (this->getGtPoseAt(this->scan_stamp.seconds(), gt) && this->gtSampleIsRtkFixed(gt)) {
-      const Eigen::Vector3f cand_p = candidate_pose.block<3, 1>(0, 3);
-      const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
+      // Evaluate the pose that would actually be APPLIED (post degeneracy
+      // projection), so run-report gt_err statistics describe the output.
+      const Eigen::Vector3f cand_p = final_candidate.block<3, 1>(0, 3);
+      const Eigen::Quaternionf cand_q(Eigen::Matrix3f(final_candidate.block<3, 3>(0, 0)));
       // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
       // using the same TF composition the snap helper uses. For the AV-24
       // single-source P1 config this is a no-op (identity TF, gt_body ==
@@ -2977,6 +3373,23 @@ void gicp_localization::LocalizationNode::performLocalization() {
     publish_float(this->dbg_hessian_condition_pub, hessian_condition);
     publish_float(this->dbg_jump_trans_pub, jump_trans);
     publish_float(this->dbg_jump_rot_deg_pub, jump_rot_deg);
+    publish_float(this->dbg_fitness_ratio_pub, fitness_ratio);
+    publish_float(this->dbg_degen_rot_axes_pub, static_cast<double>(degen.degen_rot_axes));
+    publish_float(this->dbg_degen_trans_axes_pub, static_cast<double>(degen.degen_trans_axes));
+    publish_float(this->dbg_yaw_veto_pub, degen.yaw_vetoed ? 1.0 : 0.0);
+    // P4#3: per-frame concat/source-set record (merged_aux_count = -1 when
+    // concat disabled; aux dt = NaN when that aux did not merge this frame).
+    publish_float(this->dbg_merged_aux_count_pub,
+                  static_cast<double>(this->concat_last_merged_aux_));
+    publish_float(this->dbg_scan_time_span_pub, this->last_scan_time_span_s_);
+    for (size_t i = 0; i < this->dbg_aux_dt_pubs_.size(); ++i) {
+      const double dt_i = (i < this->concat_last_aux_dt_.size())
+          ? this->concat_last_aux_dt_[i] : std::numeric_limits<double>::quiet_NaN();
+      const double pts_i = (i < this->concat_last_aux_points_.size())
+          ? static_cast<double>(this->concat_last_aux_points_[i]) : 0.0;
+      publish_float(this->dbg_aux_dt_pubs_[i], dt_i);
+      publish_float(this->dbg_aux_points_pubs_[i], pts_i);
+    }
 
     std_msgs::msg::Bool converged_msg;
     converged_msg.data = (converged || (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_)) && candidate_pose_valid;
@@ -2990,8 +3403,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
     this->dbg_initial_guess_pose_pub->publish(
         poseStampedFromMatrix(guess_pose_map, this->scan_stamp, this->map_frame));
     if (candidate_pose_valid) {
+      // Post-projection pose (what would be applied); raw disagreement is
+      // still visible via jump_trans/jump_rot_deg topics.
       this->dbg_final_pose_pub->publish(
-          poseStampedFromMatrix(candidate_pose, this->scan_stamp, this->map_frame));
+          poseStampedFromMatrix(final_candidate, this->scan_stamp, this->map_frame));
     }
 
     if (this->dbg_pose_markers_pub->get_subscription_count() > 0) {
@@ -3053,6 +3468,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
         << " gicp_ms=" << scalarSummary(elapsed_ms, 2)
         << " converged=" << (converged ? "true" : "false")
         << " fitness=" << scalarSummary(fitness_score, 6)
+        << " fit_ratio=" << scalarSummary(fitness_ratio, 3)
+        << " degen=[r" << degen.degen_rot_axes << ",t" << degen.degen_trans_axes
+        << ",yaw_veto=" << (degen.yaw_vetoed ? 1 : 0)
+        << ",partial=" << ((degen.valid && degen.modified) ? 1 : 0) << "]"
         << " final_error=" << scalarSummary(final_error, 6)
         << " correspondences=" << num_correspondences << "/" << this->current_scan->points.size()
         << " ratio=" << scalarSummary(correspondence_ratio, 3)
@@ -3061,6 +3480,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
         << " jump=[" << scalarSummary(jump_trans) << "m," << scalarSummary(jump_rot_deg) << "deg]"
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
+        << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
+    for (size_t i = 0; i < this->concat_last_aux_dt_.size(); ++i) {
+      oss << ",dt" << i << "=" << scalarSummary(this->concat_last_aux_dt_[i], 3)
+          << "s,pts" << i << "=" << this->concat_last_aux_points_[i];
+    }
+    oss << ",span=" << scalarSummary(this->last_scan_time_span_s_, 3) << "s]"
         << " hessian_cond=" << scalarSummary(hessian_condition, 3)
         << " candidate={" << poseSummary(candidate_pose) << "}";
 
@@ -3087,11 +3512,32 @@ void gicp_localization::LocalizationNode::performLocalization() {
       (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_);
 
   bool gicp_rejected_fitness = false;
+  bool gicp_rejected_fitness_ratio = false;
   bool gicp_rejected_jump = false;
   bool gicp_rejected_hessian = false;
   if (effectively_converged && candidate_pose_valid) {
     if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
+    } else if (this->fitness_ratio_reject_ > 0.0 && fitness_ratio > 0.0 &&
+               fitness_ratio > this->fitness_ratio_reject_) {
+      // Wrong-basin gate (P1): fitness far above the map's own rolling-median
+      // baseline is the bad-accept signature (run-12: bad accepts at gt_err>20m
+      // had ratio median 1.34 / p90 2.55 while good accepts sat at 1.00). A
+      // wrong-basin solution must not be partially applied either — fall back
+      // to the IMU prior entirely.
+      gicp_rejected_fitness_ratio = true;
+    } else if (this->degen_partial_update_enable_) {
+      // P1 partial-update path: degenerate geometry no longer rejects the scan
+      // (the old binary gate produced 253-frame dead-reckoning streaks when the
+      // absolute fitness warn threshold went stale on a cross-run map). The
+      // correction has already been projected onto the well-constrained
+      // eigen-subspace above; reject only when the analysis says NOTHING is
+      // trustworthy (all axes degenerate / hessian not analyzable).
+      if (eigen_projection_wanted && (!degen.valid || degen.fully_degenerate)) {
+        gicp_rejected_hessian = true;
+      } else if (this->gicp_reject_large_jumps_ && large_jump_final) {
+        gicp_rejected_jump = true;
+      }
     } else if (this->gicp_hessian_cond_max_ > 0.0 &&
                std::isfinite(hessian_condition) &&
                hessian_condition > this->gicp_hessian_cond_max_ &&
@@ -3104,21 +3550,24 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 (this->gicp_hessian_fitness_warn_ <= 0.0 &&
                  this->gicp_hessian_trans_warn_m_ <= 0.0 &&
                  this->gicp_hessian_rot_warn_deg_ <= 0.0))) {
-      // Combined geometric degeneracy gate. High hessian condition alone is
-      // harmless when the IMU prior was already good and GICP barely moved.
-      // Reject only when geometry is degenerate AND any of these slide signals
-      // fire: elevated fitness (wrong basin), large translation correction,
-      // or large rotation correction. In degenerate geometry the optimizer can
-      // slide along the unconstrained axis; the magnitude of that slide is
-      // exactly the discrepancy between IMU prior and GICP candidate.
-      // (All warns disabled = legacy "hessian alone" behavior.)
+      // LEGACY combined geometric degeneracy gate (degeneracy/partialUpdate:
+      // false). High hessian condition alone is harmless when the IMU prior
+      // was already good and GICP barely moved; reject only when degenerate
+      // AND a slide signal fires. NOTE: the fitness/trans/rot warn thresholds
+      // here are ABSOLUTE and calibrated per-map — on cross-run maps they go
+      // stale (see docs/action_plan_turn_error_20260704.md), which is why the
+      // partial-update path above is the default.
       gicp_rejected_hessian = true;
-    } else if (this->gicp_reject_large_jumps_ && large_jump) {
+    } else if (this->gicp_reject_large_jumps_ && large_jump_final) {
+      // large_jump_final == large_jump unless the (independent) yaw veto
+      // modified the candidate; gate the pose that would actually be applied.
       gicp_rejected_jump = true;
     }
   }
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
-                             !gicp_rejected_fitness && !gicp_rejected_hessian && !gicp_rejected_jump;
+                             !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
+                             !gicp_rejected_hessian && !gicp_rejected_jump;
+  const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
@@ -3129,6 +3578,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
                 fitness_score, this->gicp_fitness_reject_threshold_,
                 build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_fitness_ratio) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",
+                fitness_ratio, this->fitness_ratio_reject_, fitness_baseline,
+                build_scan_debug_log("rejected_fitness_ratio").c_str());
   } else if (gicp_rejected_hessian) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (hessian_cond=%.3e > %.3e AND [fitness=%.4f|trans=%.3fm|rot=%.3fdeg] crossed [%.4f|%.3fm|%.3fdeg] — degenerate slide): %s",
@@ -3141,17 +3595,30 @@ void gicp_localization::LocalizationNode::performLocalization() {
   } else if (gicp_rejected_jump) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg > eff thresholds [%.2fm, %.2fdeg] @ speed=%.1fm/s scan_dt=%.3fs): %s",
-                jump_trans, jump_rot_deg, eff_jump_trans_m, eff_jump_rot_deg,
+                final_jump_trans, final_jump_rot_deg, eff_jump_trans_m, eff_jump_rot_deg,
                 static_cast<double>(speed_est), scan_dt_clamped,
                 build_scan_debug_log("rejected_jump").c_str());
-  } else if (large_jump) {
+  } else if (large_jump && !gicp_partial) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("large_jump").c_str());
   } else if (this->debug_verbose_scan_log_) {
-    RCLCPP_INFO(this->get_logger(), "%s", build_scan_debug_log("ok").c_str());
+    // "ok_partial" = accepted after degeneracy projection / yaw veto shrank
+    // the correction; grep-compatible with "status=ok" prefix matching is NOT
+    // preserved on purpose so audits can split the two populations.
+    RCLCPP_INFO(this->get_logger(), "%s",
+                build_scan_debug_log(gicp_partial ? "ok_partial" : "ok").c_str());
   }
 
   if (gicp_accepted) {
-    this->current_pose = candidate_pose;
+    // P1: apply the (possibly degeneracy-projected) candidate, and feed the
+    // per-map fitness baseline from accepted frames only, so wrong-basin /
+    // rejected fitness never inflates the baseline the gates divide by.
+    this->current_pose = final_candidate;
+    if (this->fitness_baseline_enable_ && std::isfinite(fitness_score) && fitness_score >= 0.0) {
+      this->fitness_history_.push_back(fitness_score);
+      while (static_cast<int>(this->fitness_history_.size()) > this->fitness_baseline_window_) {
+        this->fitness_history_.pop_front();
+      }
+    }
 
     // Update lidar pose for next iteration
     Eigen::Vector3f new_p = this->current_pose.block<3, 1>(0, 3);
@@ -3161,6 +3628,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
     this->basePose.p = new_p;
     this->basePose.q = q;
+    // P3: pair the measurement with the IMU prior it was registered against
+    // (both at median scan time) so updateState can form the time-free delta.
+    this->observer_prior_pose_ = this->T_prior;
 
     // Validate GICP result before using it
     bool gicp_valid = std::isfinite(new_p.x()) && std::isfinite(new_p.y()) && std::isfinite(new_p.z()) &&
@@ -3232,9 +3702,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // Log pose and correction
     Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
     RCLCPP_INFO(this->get_logger(),
-                "Localization: ✓ %s | fitness=%.6f | time=%.2fms | "
+                "Localization: ✓ %s%s | fitness=%.6f | time=%.2fms | "
                 "correction=[%.3f, %.3f, %.3f] | pose=[%.2f, %.2f, %.2f]",
                 converged ? "CONVERGED" : "ACCEPTED(fitness-ok)",
+                gicp_partial ? " [PARTIAL: degenerate axes kept on IMU prior]" : "",
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
                 this->basePose.p.x(), this->basePose.p.y(), this->basePose.p.z());
@@ -3247,6 +3718,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
+                       : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
                        : gicp_rejected_hessian ? "degenerate geometry"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
@@ -3257,8 +3729,16 @@ void gicp_localization::LocalizationNode::performLocalization() {
       this->basePose.p = new_p;
       this->basePose.q = q;
       {
+        // P2#1 (stale-velocity bug): seed the next scan's IMU integration from
+        // the CURRENT IMU-propagated velocity, not geo.prev_vel. geo.prev_vel
+        // is only refreshed by updateState() (accepted scans) or a GT snap, so
+        // during an N-frame rejection streak it stayed frozen at the last
+        // accepted scan's velocity while the vehicle's velocity vector rotated
+        // through the turn — every per-scan prior then extrapolated straight
+        // ("corner cutting", run-12 webm). state.v.lin.w is maintained at IMU
+        // rate by propagateState() and is the correct dead-reckoning velocity.
         std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
-        this->prev_vel = this->geo.prev_vel;
+        this->prev_vel = this->state.v.lin.w;
       }
       RCLCPP_WARN(this->get_logger(),
                   "Localization: ⚠ GICP %s — holding IMU dead-reckoning pose [%.2f, %.2f, %.2f] | fitness=%.4f time=%.2fms",
@@ -3541,6 +4021,30 @@ bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& ou
   return true;
 }
 
+bool gicp_localization::LocalizationNode::getGtFiniteDiffVelWorld(
+    double stamp, Eigen::Vector3f& v_world_out) {
+  std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+  if (this->gt_odom_buffer_.size() < 2) return false;
+  // Buffer is monotone non-decreasing (out-of-order samples dropped at insert).
+  auto it = std::lower_bound(
+      this->gt_odom_buffer_.begin(), this->gt_odom_buffer_.end(), stamp,
+      [](const GtSample& s, double t) { return s.stamp < t; });
+  // Choose a bracketing (or nearest adjacent) pair around the query stamp.
+  auto b = (it == this->gt_odom_buffer_.end()) ? std::prev(it) : it;
+  auto a = (b == this->gt_odom_buffer_.begin()) ? b : std::prev(b);
+  if (a == b) b = std::next(b);  // query before first sample: use first pair
+  const double dt = b->stamp - a->stamp;
+  if (dt <= 1e-6) return false;
+  // Both endpoints must be reasonably close to the query, mirroring
+  // getGtPoseAt's staleness contract.
+  if (std::min(std::abs(stamp - a->stamp), std::abs(b->stamp - stamp)) >
+      this->gt_odom_max_dt_) {
+    return false;
+  }
+  v_world_out = (b->p - a->p) / static_cast<float>(dt);
+  return v_world_out.allFinite();
+}
+
 bool gicp_localization::LocalizationNode::composeGtPoseInBase(
     const GtSample& gt, Eigen::Vector3f& p_out,
     Eigen::Quaternionf& q_out) const {
@@ -3787,33 +4291,68 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     return false;
   }
 
-  // Twist composition: GT twist is at gt_body. Move it to base via the lever-arm
-  // correction (mirrors callbackImu's centripetal-acceleration term).
-  // r_gtbody_to_base in gt_body frame:
+  // Twist composition (P2#2): resolve the linear and angular sources
+  // INDEPENDENTLY. Run 12/13 Atlas odom carried a valid linear twist but ZERO
+  // angular twist (the adapter didn't populate twist.angular from the gyro),
+  // and the old all-or-nothing "twist_is_zero" check passed the zeros through
+  // — every one of the 1,860 snaps reset the angular-rate state to zero
+  // mid-turn. Sources by priority:
+  //   angular: GT twist -> live IMU gyro (bias-corrected under geo.mtx below;
+  //            angular rate is rigid-body-invariant and the Atlas gyro IS the
+  //            measured body rate in these axes) -> zero.
+  //   linear:  GT twist -> finite difference of the bracketing GT poses
+  //            (handles both an unpopulated twist and a true standstill
+  //            uniformly) -> keep the current state velocity (never zero a
+  //            moving vehicle's velocity: with the old behavior the next
+  //            IMU prior integrates from v=0 and immediately re-fails).
   const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
   const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
   const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
   const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
-  Eigen::Vector3f v_base_body;
-  Eigen::Vector3f omega_base_body;
-  const bool twist_is_zero = gt.v_lin_body.norm() < 0.05f && gt.v_ang_body.norm() < 0.01f;
-  if (twist_is_zero) {
-    static bool warned_zero_twist = false;
-    if (!warned_zero_twist) {
-      warned_zero_twist = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "GT recovery: incoming GT twist appears empty (lin=%.3f, ang=%.3f rad/s); "
-                  "snapping with zero velocity",
-                  gt.v_lin_body.norm(), gt.v_ang_body.norm());
-    }
-    v_base_body = Eigen::Vector3f::Zero();
-    omega_base_body = Eigen::Vector3f::Zero();
-  } else {
+
+  const bool gt_ang_valid = gt.v_ang_body.norm() >= 0.01f;
+  const bool gt_lin_valid = gt.v_lin_body.norm() >= 0.05f;
+
+  Eigen::Vector3f omega_base_body = Eigen::Vector3f::Zero();
+  bool omega_from_imu = false;
+  if (gt_ang_valid) {
     omega_base_body = R_gtbody_base * gt.v_ang_body;
-    v_base_body = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+  } else {
+    std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
+    if (this->first_imu_received &&
+        std::abs(this->imu_meas.stamp - this->scan_stamp.seconds()) < 0.2) {
+      // P3: imu_meas is bias-corrected at buffering time — use as-is.
+      omega_base_body = this->imu_meas.ang_vel;
+      omega_from_imu = true;
+    }
   }
-  const Eigen::Vector3f v_base_world = q_new * v_base_body;
-  const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
+
+  Eigen::Vector3f v_base_body = Eigen::Vector3f::Zero();
+  bool lin_resolved = false;
+  bool lin_from_fd = false;
+  if (gt_lin_valid) {
+    v_base_body = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+    lin_resolved = true;
+  } else {
+    Eigen::Vector3f v_fd_world;
+    if (this->getGtFiniteDiffVelWorld(this->scan_stamp.seconds(), v_fd_world)) {
+      v_base_body = q_new.conjugate() * v_fd_world;
+      lin_resolved = true;
+      lin_from_fd = true;
+    }
+  }
+
+  static bool warned_twist_sources = false;
+  if (!warned_twist_sources && (!gt_ang_valid || !gt_lin_valid)) {
+    warned_twist_sources = true;
+    RCLCPP_INFO(this->get_logger(),
+                "GT recovery: GT twist partially unpopulated (lin=%.3f m/s%s, ang=%.3f rad/s%s); "
+                "backfilling angular from %s and linear from %s",
+                gt.v_lin_body.norm(), gt_lin_valid ? "" : " INVALID",
+                gt.v_ang_body.norm(), gt_ang_valid ? "" : " INVALID",
+                gt_ang_valid ? "GT" : (omega_from_imu ? "IMU gyro" : "zero"),
+                gt_lin_valid ? "GT" : (lin_from_fd ? "GT pose finite-difference" : "current state"));
+  }
 
   // Apply state. Caller (performLocalization) already holds pose_mutex (line 1768),
   // so we MUST NOT re-acquire it here — std::mutex is non-recursive and that would
@@ -3823,8 +4362,18 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
   this->current_pose.setIdentity();
   this->current_pose.block<3, 3>(0, 0) = q_new.toRotationMatrix();
   this->current_pose.block<3, 1>(0, 3) = p_new;
+  Eigen::Vector3f v_base_world;
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
+    // (P3: no bias subtraction here — imu_meas is bias-corrected at buffering;
+    // omega_from_imu is noted only for the source log above.)
+    (void)omega_from_imu;
+    if (!lin_resolved) {
+      // Last resort: preserve the IMU-propagated velocity through the snap.
+      v_base_body = this->state.q.conjugate() * this->state.v.lin.w;
+    }
+    v_base_world = q_new * v_base_body;
+    const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
     this->state.p = p_new;
     this->state.q = q_new;
     this->state.v.lin.b = v_base_body;
@@ -3963,8 +4512,23 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
 
   ImuMeas imu_meas_temp;
   imu_meas_temp.stamp = stamp;
-  imu_meas_temp.ang_vel = ang_vel;
-  imu_meas_temp.lin_accel = lin_accel;
+  // P3 (bonus): buffer BIAS-CORRECTED IMU so every consumer — propagateState,
+  // integrateImu (T_prior) and the per-point deskew frames — integrates the
+  // same corrected signal. Previously only propagateState subtracted state.b;
+  // the prior/deskew path integrated the raw gyro/accel, so once RTK
+  // calibration set a nonzero bias the two integration paths permanently
+  // disagreed (worst during high-yaw-rate sweeps, where deskew rotation error
+  // scales directly with the gyro bias). Mirrors upstream DLIO, which applies
+  // the bias in the IMU callback before buffering.
+  // NOTE: the calibration paths below intentionally keep consuming the RAW
+  // ang_vel/lin_accel locals — bias estimation must see the uncorrected
+  // signal. state.b is zero until calibration completes, so pre-calibration
+  // buffered samples are unaffected.
+  {
+    std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+    imu_meas_temp.ang_vel = ang_vel - this->state.b.gyro;
+    imu_meas_temp.lin_accel = lin_accel - this->state.b.accel;
+  }
 
   // Calculate dt
   {
@@ -4457,11 +5021,11 @@ void gicp_localization::LocalizationNode::propagateState() {
   Eigen::Quaternionf omega;
   Eigen::Vector3f world_accel;
 
-  // Apply gyro bias correction
-  Eigen::Vector3f ang_vel_corrected = imu_local.ang_vel - bias_gyro;
-
-  // Apply accel bias correction
-  Eigen::Vector3f lin_accel_corrected = imu_local.lin_accel - bias_accel;
+  // P3: biases are now subtracted ONCE, at buffering time in callbackImu, so
+  // the buffered measurement is already corrected — do NOT subtract again here
+  // (bias_gyro/bias_accel are still read above for the periodic status log).
+  Eigen::Vector3f ang_vel_corrected = imu_local.ang_vel;
+  Eigen::Vector3f lin_accel_corrected = imu_local.lin_accel;
 
   // Transform accel from body to world frame and subtract gravity
   world_accel = qhat._transformVector(lin_accel_corrected);
@@ -4763,6 +5327,39 @@ void gicp_localization::LocalizationNode::updateState() {
     RCLCPP_WARN(this->get_logger(), "Invalid inputs in updateState - pin=[%.3f,%.3f,%.3f] state.p=[%.3f,%.3f,%.3f]",
                 pin.x(), pin.y(), pin.z(), this->state.p.x(), this->state.p.y(), this->state.p.z());
     return;
+  }
+
+  // P3: delta-form correction target. basePose (pin/qin) is the GICP result
+  // at the scan's MEDIAN POINT TIME; by now the state has been IMU-propagated
+  // 0.1-0.3 s past it (half sweep + queueing + solve). Pulling the current
+  // state toward the stale absolute pose drags it backwards along the
+  // trajectory — zero-mean on straights, a systematic yaw/position lag in
+  // turns. Instead, form the time-free world-frame correction
+  //   T_corr = T_meas * inv(T_prior)   (both at median scan time)
+  // and target T_corr (x) current_state: if IMU and GICP agree, T_corr = I and
+  // the correction vanishes regardless of latency. Gains/structure unchanged.
+  if (this->geo_delta_correction_ && matrixFinite(this->observer_prior_pose_)) {
+    Eigen::Quaternionf q_prior(this->observer_prior_pose_.block<3, 3>(0, 0));
+    q_prior.normalize();
+    const Eigen::Vector3f p_prior = this->observer_prior_pose_.block<3, 1>(0, 3);
+    const Eigen::Quaternionf q_corr = (qin * q_prior.conjugate()).normalized();
+    const Eigen::Vector3f t_corr = pin - q_corr._transformVector(p_prior);
+    // Sanity: the prior/measurement delta is bounded by the jump gate on
+    // accepted scans; a huge delta here means observer_prior_pose_ is stale
+    // or corrupted — fall back to the legacy absolute target for this update.
+    const double corr_angle_deg =
+        2.0 * std::acos(std::clamp(static_cast<double>(std::abs(q_corr.w())), 0.0, 1.0)) * 180.0 / M_PI;
+    const float corr_trans =
+        (q_corr._transformVector(this->state.p) + t_corr - this->state.p).norm();
+    if (corr_angle_deg < 45.0 && std::isfinite(corr_trans) && corr_trans < 100.0f) {
+      pin = q_corr._transformVector(this->state.p) + t_corr;
+      qin = (q_corr * this->state.q).normalized();
+    } else {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "updateState: delta correction implausible (rot=%.1fdeg trans=%.2fm); "
+                           "using legacy absolute target this update",
+                           corr_angle_deg, static_cast<double>(corr_trans));
+    }
   }
 
   Eigen::Quaternionf qe, qhat, qcorr;

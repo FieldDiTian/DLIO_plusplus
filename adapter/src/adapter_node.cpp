@@ -317,6 +317,22 @@ private:
     odom.twist.covariance[0] = static_cast<double>(vc[0]);
     odom.twist.covariance[7] = static_cast<double>(vc[4]);
     odom.twist.covariance[14] = static_cast<double>(vc[8]);
+    // P2#2: angular twist from the latest Atlas gyro (see publishImu note).
+    // Only when reasonably fresh; a stale gyro (IMU stream stalled) is worse
+    // than the documented "no angular twist" default of zero, which consumers
+    // (gicp_localization snap) now detect and back-fill from their own IMU.
+    // Both stamps are in the ROS-mapped time domain (odom.header.stamp was set
+    // via clock_mapper_.toRos above; latest_gyro_stamp_ is publishImu's mapped
+    // stamp), so the age comparison is domain-consistent.
+    const double gyro_age = stampToSec(odom.header.stamp) - latest_gyro_stamp_;
+    if (latest_gyro_stamp_ > 0.0 && std::abs(gyro_age) < kMaxGyroAgeSec) {
+      odom.twist.twist.angular = latest_gyro_;
+      // Conservative fixed rate variance (Atlas imu_calibrated gyro noise is
+      // ~1e-2 rad/s class at 100 Hz bandwidth).
+      odom.twist.covariance[21] = 1.0e-4;
+      odom.twist.covariance[28] = 1.0e-4;
+      odom.twist.covariance[35] = 1.0e-4;
+    }
 
     if (publish_gnss_pose_) {
       auto gnss = makeGnssMsg(odom, "/gnss");
@@ -477,6 +493,15 @@ private:
   {
     msg.header.stamp = monotonicStamp("/gps_p1/imu", stamp);
     msg.header.frame_id = imu_frame_id_;
+    // Cache the latest gyro so poseCallback can populate the odometry's
+    // angular twist (P2#2: FusionEngine Pose carries no body rates, and a
+    // zero twist.angular made every GT snap in gicp_localization reset the
+    // published angular velocity to zero mid-turn). Angular rate is
+    // location-independent on a rigid body, and IMUOutput is already rotated
+    // into vehicle body axes == odom child_frame axes, so the gyro is exactly
+    // the odometry twist.angular. Guarded by core_mutex_ (all callers hold it).
+    latest_gyro_ = msg.angular_velocity;
+    latest_gyro_stamp_ = stamp;
     imu_pub_->publish(msg);
     ++imu_out_count_;
   }
@@ -553,6 +578,12 @@ private:
   uint64_t imu_p1_sidecar_match_count_ = 0;
   uint64_t imu_p1_sidecar_miss_count_ = 0;
   uint64_t imu_p1_sidecar_skip_count_ = 0;
+
+  // P2#2: latest Atlas gyro (vehicle body axes), used to populate
+  // /gps_p1/filtered_odom twist.angular. Guarded by core_mutex_.
+  static constexpr double kMaxGyroAgeSec = 0.5;
+  geometry_msgs::msg::Vector3 latest_gyro_;
+  double latest_gyro_stamp_ = 0.0;
 
   mutable std::mutex core_mutex_;
 };

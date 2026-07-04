@@ -27,13 +27,15 @@ how the map inputs and the seed are produced.
 - **GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
 - **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); time-aligns aux LiDARs to the primary, transforms them via offline-resolved extrinsics, and concatenates per-point timestamps onto the primary clock. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
-- **Layered rejection gates**:
-  - Hard fitness reject (`gicp/fitnessRejectThreshold`)
-  - Combined geometric-degeneracy gate (`hessianCondMax` AND any of `fitness`/`trans`/`rot` warn floors) — catches optimizer slides on feature-poor corners
-  - Large-jump reject (compares GICP candidate to IMU-predicted prior)
-- **IMU dead-reckoning fallback**: any non-accepted scan falls back to the IMU-integrated prior instead of freezing at the last accepted pose, so transient corner failures don't cascade.
-- **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]`, publishes deltas. Diagnostic only — never feeds back into accept/reject.
-- **GT-driven pose recovery** (optional): when GICP fails for N consecutive scans, snap pose+velocity to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Disabled by default; falls back to dead-reckoning when GT is unavailable.
+- **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates; see `docs/action_plan_turn_error_20260704.md` for the evidence):
+  - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
+  - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
+  - **Degeneracy partial update** (`gicp/degeneracy/*`): when the hessian condition proxy trips `hessianCondMax`, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (full-6D by default — coupled rot/trans null directions included) and the IMU prior is kept along degenerate axes. Accepted-with-projection logs `status=ok_partial`; wholesale `rejected_hessian` remains only for the all-axes-degenerate case. Legacy binary gate available via `degeneracy/partialUpdate: false`.
+  - **Yaw-consistency veto** (`gicp/yawGate/*`, independent of partialUpdate): a GICP yaw correction > `maxCorrDeg` vs. the IMU-integrated prior on a low-confidence match (ratio > `fitnessRatio`) keeps the IMU yaw — the wrong-basin *entry* signature the jump gate can't see.
+  - Large-jump reject (compares the applied candidate to the IMU-predicted prior; speed/scan-dt-aware thresholds).
+- **IMU dead-reckoning fallback**: any non-accepted scan falls back to the IMU-integrated prior instead of freezing at the last accepted pose, seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made multi-scan rejection streaks cut corners).
+- **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]` against the pose actually applied (post-projection), publishes deltas. Diagnostic only — never feeds back into accept/reject.
+- **GT-driven pose recovery**: when GICP fails for N consecutive scans (default 5), snap pose+twist to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Twist sources resolve independently (P2): angular rate backfills from the live bias-corrected gyro and linear velocity from GT pose finite-differencing when the odom twist is unpopulated — never zeroing a moving vehicle. Falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
 - **Local-ENU output** (operational contract): the primary `map_frame` pose / odom / path are already in the map's frame, which — with the adapter — is a fixed local-ENU datum (Putnam origin from the `race_metadata` TTL). GICP itself is frame-agnostic and simply reports the pose in the map's frame.
 - **UTM-frame output** (optional legacy layer): only active if `localization/utm_transform_path` is set; when provided, publish pose / odom / path in `utm` frame alongside `map`. Not the default.
@@ -179,18 +181,52 @@ ENU frame. The `map`, the seed, and GICP must all share the one datum the adapte
 defines — a single-datum consistency requirement. UTM publishing is an optional
 legacy layer (see below), not the operational contract.
 
-### GICP rejection gates
+### GICP gating (P1 confidence-weighted rework)
 
 ```yaml
-gicp/fitnessRejectThreshold: 1.0          # hard reject: fitness > threshold
-gicp/rejectLargeJumps: true               # reject if pose jumps > debug_jump_*
-gicp/hessianCondMax: 5.0e9                # condition-number floor for combined gate
-gicp/hessianFitnessWarnThreshold: 0.15    # OR trigger: fitness elevated
-gicp/hessianTransWarnM: 1.0               # OR trigger: GICP correction > X m
-gicp/hessianRotWarnDeg: 1.5               # OR trigger: GICP correction > X deg
+gicp/fitnessRejectThreshold: 1.0          # hard reject: fitness > threshold (catastrophic backstop)
+
+# Per-map fitness normalization — gates operate on fitness / rolling-median
+# of ACCEPTED-frame fitness, so they survive cross-run maps whose absolute
+# floor differs 5-10x from the calibration map:
+gicp/fitnessBaseline/enable: true
+gicp/fitnessBaseline/window: 201          # rolling-median window (~20 s @ 10 Hz)
+gicp/fitnessBaseline/minSamples: 50       # rolling median takes over after this
+gicp/fitnessBaseline/seedBaseline: 0.28   # warm-up baseline so gates are live from frame 1 (re-measure per map!)
+gicp/fitnessRatioRejectThreshold: 2.0     # wrong-basin gate: reject when ratio exceeds this
+
+# Degeneracy partial update (replaces the old binary hessian reject):
+gicp/hessianCondMax: 5.0e9                # TRIGGER: when tripped, project instead of reject
+gicp/degeneracy/partialUpdate: true       # false = legacy binary combined gate below
+gicp/degeneracy/full6d: true              # coupled 6x6 remapping (vs blockwise 3x3 A/B)
+gicp/degeneracy/couplingLengthM: 20.0     # lever arm making rad/m commensurable
+gicp/degeneracy/relFloor6d: 0.02          # eigen-axis degenerate if lambda < floor*lambda_max
+
+# Turn-aware yaw-consistency veto (independent of partialUpdate):
+gicp/yawGate/enable: true
+gicp/yawGate/maxCorrDeg: 1.5              # veto yaw corr above this vs IMU prior...
+gicp/yawGate/fitnessRatio: 1.2            # ...on low-confidence matches
+
+gicp/rejectLargeJumps: true               # reject if applied pose jumps > thresholds (speed/dt-aware)
+
+# LEGACY combined-gate warn floors — consulted only when partialUpdate=false.
+# ABSOLUTE values calibrated on a same-run map; they go stale on cross-run maps.
+gicp/hessianFitnessWarnThreshold: 0.15
+gicp/hessianTransWarnM: 1.0
+gicp/hessianRotWarnDeg: 1.5
 ```
 
-The combined hessian gate fires when condition number is high AND any of the three warn floors is crossed. High hessian alone is harmless when GICP barely moved (good IMU prior, degenerate but well-anchored geometry); large corrections in degenerate geometry are the slide signature. Set any threshold ≤ 0 to disable that OR branch.
+When `hessianCondMax` trips, the GICP correction is eigendecomposed on the
+vehicle-re-centered, unit-scaled 6×6 hessian and applied only along
+well-constrained directions (the IMU prior holds the degenerate ones) —
+`status=ok_partial`. The old behavior (reject the whole scan) produced
+253-frame dead-reckoning streaks on cross-run replays; wholesale
+`rejected_hessian` now fires only when all six axes are degenerate. The
+fitness-ratio gate catches the opposite failure (wrong-basin matches accepted
+with good-looking fitness). Rationale, measurements, and thresholds:
+`docs/action_plan_turn_error_20260704.md`; score any replay with
+`scripts/analyze_scan_debug_log.py` (it also suggests re-baselined ratio
+thresholds per map).
 
 ### Multi-LiDAR concatenation
 
@@ -201,6 +237,7 @@ localization/lidar_concat/enabled:        true
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
 localization/lidar_concat/time_threshold: 0.1     # drop aux scans further than this from primary
+localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
 
 # Strict merge guard — IDENTICAL semantics + defaults to GLIM:
 localization/lidar_concat/require_all_aux:                    false  # false = localize on whatever LiDARs merged; true = incomplete merge SKIPS the scan (degraded cloud never registered; IMU propagation continues)
@@ -219,7 +256,18 @@ localization needs no `/tf_static`.
 
 **Map voxel downsample + crop box.** The GICP target map is voxel-downsampled at
 load (`localization/map_voxel_size: 0.3`) before building the kd-tree, to bound
-memory. The crop box runs in the **sensor frame** before deskew.
+memory. The crop box runs in the **sensor frame** before deskew. Live scans are
+voxel-filtered at `dlio/preprocessing/voxelFilter/res: 0.3` (P4: lowered from
+0.5 — the sparser scans starved GICP of yaw-constraining geometry at corners;
+watch `gicp_ms` p99 against the 100 ms scan period if you densify further).
+
+**Merge diagnostics (P4).** Every processed frame records its LiDAR source set:
+debug topics `merged_aux_count`, `aux<i>_merge_dt_s` (signed, NaN = not
+merged), `aux<i>_points`, `scan_time_span_s`, plus the same fields in the
+`SCAN DEBUG` line (`concat=[n/2,dt0=…,pts0=…,…,span=…]`). Per-aux signed
+header-offset stats are summarized every 512 merges with a warning when the
+mean exceeds 20 ms — the constant-clock-offset signature worth absorbing
+upstream.
 
 ### Ground-truth diagnostics + recovery
 
@@ -229,7 +277,7 @@ localization/gt_odom/buffer_size:   200      # ~2 s of history at 100 Hz
 localization/gt_odom/max_dt:        0.1      # max scan-to-GT lookup gap
 
 localization/gt_recovery/enable:                   true    # snap to GT after sustained GICP failure
-localization/gt_recovery/min_consecutive_failures: 1       # snap after N consecutive non-accepts
+localization/gt_recovery/min_consecutive_failures: 5       # snap after N consecutive non-accepts (P2: raised from 1 — per-frame snapping masked dead-reckoning quality)
 ```
 
 When `gt_recovery/enable=true`, the node caches the `base_frame ← child_frame_id` TF on the first GT message and uses it to compose snap poses into `base_frame` (so the snap lands at the same reference point GICP normally tracks).
@@ -246,11 +294,28 @@ odom/geo/Kv: 11.25                 # Velocity
 odom/geo/Kq: 4.0                   # Orientation
 odom/geo/Kab: 0.0                  # Online accel-bias adaptation disabled
 odom/geo/Kgb: 0.0                  # Online gyro-bias adaptation disabled
+odom/geo/delta_correction: true    # P3: apply GICP as a time-free delta (see below)
 ```
 
 `Kab`/`Kgb` are intentionally zero for the fused Point One (Atlas) INS path. Initial
 RTK/stationary calibration may still seed `state.b`, but GICP residuals do not
 continue rewriting IMU bias online unless these gains are explicitly raised.
+
+**Delta-form correction (P3).** The GICP measurement is stamped at the scan's
+median point time — 0.1–0.3 s before the observer applies it. The legacy
+absolute target dragged the current state backwards toward that stale pose,
+which is zero-mean on straights but a systematic yaw/position lag in turns
+(accepted-frame gt_err doubled from 1.0 m at <2°/s to 2.1 m at >25°/s on the
+run-12 baseline). With `delta_correction: true` the observer instead applies
+the time-free correction `T_meas · T_prior⁻¹` to the current state: perfect
+IMU/GICP agreement produces zero correction at any latency. Gains unchanged.
+
+**Bias path (P3).** IMU biases are subtracted **once, at buffering** in
+`callbackImu`, so `propagateState`, the scan prior (`integrateImu`), and
+per-point deskew all integrate the same corrected signal. (Previously only
+`propagateState` subtracted; the prior/deskew path integrated raw gyro and
+diverged once RTK calibration set a nonzero bias.) Calibration still consumes
+the raw values.
 
 **Per-point timestamps and deskew.** Luminar per-point timestamps are `UINT8[8]`
 = a `uint64` PTP epoch in nanoseconds (per the *Luminar Iris Data Output
@@ -294,12 +359,20 @@ Per-scan scalar metrics on `gicp/localization/debug/*`:
 - `num_correspondences`, `correspondence_ratio`
 - `guess_to_solution_m`, `guess_to_solution_deg`
 - `guess_from_last_m`, `guess_from_last_deg`
-- `jump_trans`, `jump_rot_deg`
+- `jump_trans`, `jump_rot_deg` (raw GICP-vs-prior disagreement, pre-projection)
 - `hessian_condition_proxy`
-- `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled)
+- **P1 gating**: `fitness_ratio` (−1 during warm-up without seed), `degen_rot_axes`, `degen_trans_axes`, `yaw_veto`
+- **P4 concat**: `merged_aux_count` (−1 = concat disabled), `aux<i>_merge_dt_s` (signed; NaN = not merged), `aux<i>_points`, `scan_time_span_s`
+- `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled; measured against the pose actually applied)
 - `converged` (Bool)
 
-Plus pose / cloud topics: `initial_guess_pose`, `final_pose`, `input_cloud_base`, `initial_guess_cloud`, `pose_markers`.
+Plus pose / cloud topics: `initial_guess_pose`, `final_pose` (post-projection), `input_cloud_base`, `initial_guess_cloud`, `pose_markers`.
+
+`enable_pub` and `verbose_scan_log` are **on by default** so every replay
+produces this evidence; score a run's `localization.log` with
+`scripts/analyze_scan_debug_log.py` (status/streaks, gicp_ms percentiles,
+fitness floor + suggested ratio thresholds, gt_err yaw-rate buckets, concat
+coverage).
 
 ## Algorithm
 
@@ -310,23 +383,32 @@ Plus pose / cloud topics: `initial_guess_pose`, `final_pose`, `input_cloud_base`
                                                 ↓
                                               GICP align (initial guess = T_prior)
                                                 ↓
-                                              gate: fitness / hessian-combined / jump
-                                ┌─── accepted ─┴── rejected ──┐
-                                ↓                              ↓
-                          updateState (geo observer)     dead-reckon: lidarPose ← T_prior
-                                ↓                              ↓
-                          state ← merge(GICP, IMU)        consecutive_failures++
-                                ↓                              ↓
+                            gate: fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump
+                                ┌─── accepted (ok | ok_partial) ─┴── rejected ──┐
+                                ↓                                                ↓
+                          updateState (geo observer,                dead-reckon: lidarPose ← T_prior,
+                          delta-form target)                        prev_vel ← state.v (current)
+                                ↓                                                ↓
+                          state ← merge(GICP, IMU)                  consecutive_failures++
+                                ↓                                                ↓
                                                        ≥ N consecutive AND gt_recovery on?
-                                                              ↓
+                                                                     ↓
                                                        maybeSnapPoseToGT(reason)
 
                           propagateState (every IMU sample) → publish odom/TF at ~100 Hz
 ```
 
-### Rejection branches
+### Status taxonomy
 
-- `failed_to_converge`, `rejected_fitness`, `rejected_hessian`, `rejected_jump`, `invalid_solution` — all fall through to the dead-reckoning branch (set `current_pose ← T_prior`, increment streak counter, optionally trigger snap).
+- **Accepted**: `ok` (full GICP correction) and `ok_partial` (P1: degeneracy
+  projection and/or yaw veto shrank the correction; the projected pose is what
+  gets applied, published, and GT-scored).
+- **Rejected**: `failed_to_converge`, `rejected_fitness` (absolute),
+  `rejected_fitness_ratio` (P1 wrong-basin gate), `rejected_hessian` (now only
+  the all-axes-degenerate case), `rejected_jump`, `invalid_solution` — all fall
+  through to the dead-reckoning branch (set `current_pose ← T_prior`, seed
+  `prev_vel` from the current IMU-propagated velocity, increment streak
+  counter, optionally trigger snap).
 - `last_gicp_pose_` is **not** updated on rejection, so the IMU prior on the next scan is still anchored to the last successfully-matched GICP pose.
 
 ## Map preparation
@@ -373,11 +455,18 @@ If you see SCAN DEBUG gaps > 200 ms during turns, `lidar_concat/time_threshold` 
 
 ### GICP slides at corners
 
-Watch for `GICP REJECTED (... — degenerate slide)` warns. Tunable knobs (in order of impact):
+With the P1 partial-update gating, degenerate corners no longer binary-reject —
+watch `degen_rot_axes`/`degen_trans_axes` and `yaw_veto` in the debug topics
+(or `degen=[…]` in SCAN DEBUG) to see the projection engaging. Tunable knobs
+(in order of impact):
 
-1. Lower `gicp/hessianTransWarnM` / `hessianRotWarnDeg` to catch slides earlier (default 1.0 m / 1.5°).
-2. Lower `gicp/hessianCondMax` to be stricter about what counts as "degenerate" (default 5e9).
-3. If the rejection cascades, enable `gt_recovery` to recover at corners.
+1. Lower `gicp/hessianCondMax` to engage the eigen-projection earlier (default 5e9), or raise `gicp/degeneracy/relFloor6d` to zero out weaker axes more aggressively (default 0.02).
+2. Lower `gicp/yawGate/maxCorrDeg` / `yawGate/fitnessRatio` to veto suspicious yaw corrections earlier (defaults 1.5° / 1.2).
+3. Lower `gicp/fitnessRatioRejectThreshold` to reject wrong-basin matches earlier (default 2.0) — at the cost of more dead-reckoned frames; check the streak histogram in the scorecard after changing it.
+4. If rejection still cascades, `gt_recovery` (on by default, N=5) recovers at corners.
+
+(Legacy knobs `hessianTransWarnM`/`hessianRotWarnDeg`/`hessianFitnessWarnThreshold`
+only apply with `degeneracy/partialUpdate: false`.)
 
 ### Frame check
 

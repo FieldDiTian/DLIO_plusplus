@@ -44,13 +44,14 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
   - Startup guards also gate on `require_all_aux && abort_on_merge_failure`.
 - **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
 - **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
+- **Per-frame merge diagnostics** (P4, 2026-07; `lidar_concat.frame_diag_log`, default **true**): one parseable `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… total_pts=…` INFO line per primary scan — the map-side merge evidence, mirroring GICP's per-frame debug topics (GLIM's offline tools have no node to publish from). Per-aux **signed header-offset stats** (mean/min/max vs primary) are summarized every 512 merges, warning when |mean| > 20 ms — the constant-clock-offset signature worth absorbing upstream.
 - Live wiring: the live node subscribes to the aux topics, buffers them, and merges on primary-cloud arrival (`points_callback_live`), matching the offline `glim_rosbag` / `glim_pcap_rosbag` merge path.
 
 **GNSS / RTK global anchoring** — `glim_ext/modules/mapping/gnss_global`, `config_gnss_global.json`, `config.json`
 
 - INS-tolerant design: LiDAR+IMU (`libodometry_estimation_gpu.so`) is the *primary* trajectory; `libgnss_global.so` adds RTK-FIXED **position-prior** factors to the iSAM2 graph. The INS-driven `config_odometry_ins.json` path (which pauses on RTK loss) is left in tree but not selected.
 - RTK-FIXED-only gating via the `gicp_localization/scripts/rtk_fixed_odom_filter.py` pre-filter; factors go silent during dropouts and re-anchor on reacquisition (iSAM2 retroactively smooths the gap).
-- **Atlas dual-antenna heading prior**: `enable_orientation_prior=true`, `orientation_prior_inf_scale=[1e-6,1e-6,1e2]` → a **yaw-only** `PoseRotationPrior` per submap (roll/pitch left free), pinning heading the position prior can't. Lever-arm compensation disabled (the Atlas INS pose is already at the antenna phase centre and the graph body runs there too). *Validate the yaw convention before tightening.*
+- **Atlas dual-antenna heading prior**: `enable_orientation_prior=true`, `orientation_prior_inf_scale=[1e-6,1e-6,1e2]` → a **yaw-only** `PoseRotationPrior` per submap (roll/pitch left free), pinning heading the position prior can't. Hardened (P5, 2026-07) with a **per-sample yaw-quality gate** (`orientation_prior_max_yaw_sigma_deg: 3.0`): the upstream RTK filter qualifies *position* quality only, and the dual-antenna heading can be degraded while position stays FIXED (secondary-antenna outage, baseline multipath) — such samples now skip the heading prior (position prior still applied; skips logged with a running count). Unpopulated yaw covariance passes, so covariance-less publishers keep the old behavior. Lever-arm compensation disabled (the Atlas INS pose is already at the antenna phase centre and the graph body runs there too). *Validate the yaw convention before tightening.*
 - `T_world_utm.txt` export of the odom→GNSS-input-frame SE(3) transform for downstream GICP localization / post-processing. `gnss_global` still aligns the map to the GNSS input frame via a 2D Umeyama fit and exports that SE(3) (the code still names the variable `T_world_utm` internally). The operational **contract is now local ENU** supplied by the adapter — since the adapter feeds `/gps_p1/*` already in ENU, the exported transform is effectively world↔ENU. UTM is not used.
 
 **Mapping / optimization — offline whole-track refinement** — `config_global_mapping_gpu.json`
@@ -74,7 +75,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 ### Key Features
 
 - **LiDAR+IMU tight fusion as primary odometry** — runs every scan via VGICP + GTSAM `CombinedImuFactor` preintegration. No external pose required; mapping cannot stall on GNSS loss.
-- **RTK-FIXED-only GNSS anchoring** — a small ROS2 pre-filter (`gicp_localization/scripts/rtk_fixed_odom_filter.py`) admits only Atlas samples whose pose covariance indicates a FIXED-integer solution. `libgnss_global.so` then turns each forwarded message into a position-prior factor on the iSAM2 graph.
+- **RTK-FIXED-only GNSS anchoring** — a small ROS2 pre-filter (`gicp_localization/scripts/rtk_fixed_odom_filter.py`) admits only Atlas samples whose pose covariance indicates a FIXED-integer solution. `libgnss_global.so` then turns each forwarded message into a position-prior factor on the iSAM2 graph, plus a yaw-only heading prior when the sample's reported heading quality passes the yaw gate (see the GNSS anchoring section above).
 - **Seamless GNSS-denied continuity** — when RTK quality degrades, the filter stops forwarding and the GNSS factor stream goes silent. LiDAR+IMU odometry continues to extend the map perimeter; on RTK reacquisition the next factor anchors the post-dropout trajectory back to the global frame and iSAM2 retroactively smooths the dropout.
 - **Geo-referenced output** — `T_world_utm.txt` saves the SE(3) transform from the local odom frame to the GNSS input frame for downstream use (GICP localization, post-processing, etc.). Because the adapter feeds `/gps_p1/*` already in **local ENU**, that input frame *is* ENU and the exported transform is effectively world↔ENU. The variable keeps its historical `T_world_utm` name in code, but no UTM projection is performed.
 
@@ -365,7 +366,8 @@ Each directory contains:
 - `config_odometry_gpu.json` — **Currently selected** odometry estimator (VGICP + IMU)
 - `config_odometry_ins.json` — Alternative INS-driven estimator (NOT selected; pauses on RTK loss)
 - `config_odometry_{cpu,ct}.json` — Other alternatives (CPU-only VGICP, continuous-time)
-- `config_preprocess.json` — Point cloud preprocessing
+- `config_preprocess.json` — Point cloud preprocessing (legacy sparse; see dense profile below)
+- `config_preprocess_dense_map.json` / `config_sub_mapping_dense_map.json` — **Dense localization-map profile, the ACTIVE DEFAULT in `config.json`** (P4, 2026-07): preprocess random-grid 1.0 → 0.4 m / target 30k → 80k, submap voxel 0.5 → 0.25 m / 50k → 150k points. Every map this pipeline builds is consumed by `gicp_localization`, and the cross-run GICP fitness floor (~0.27) was dominated by map sparsity from the old 1.0 m downsample. Swap back to the legacy sparse configs (commented in `config.json`) only for odometry-only smoke runs. After the first dense rebuild, **re-baseline the GICP fitness floor** with `gicp_localization/scripts/analyze_scan_debug_log.py` — the GICP P1 ratio thresholds depend on it.
 - `config_global_mapping_gpu.json` — Loop closure and global optimization (iSAM2 backend)
 
 **GNSS Extension (`glim_ext/config/`):**
@@ -403,6 +405,7 @@ Loosen these to admit RTK-FLOAT if your sky view is poor; tighten to reject Atla
     "min_baseline": 5.0,
     "enable_orientation_prior": true,
     "orientation_prior_inf_scale": [1e-6, 1e-6, 1e2],
+    "orientation_prior_max_yaw_sigma_deg": 3.0,
     "prior_inf_scale": [1e4, 1e4, 1e3],
     "enable_lever_arm": false
   }
@@ -410,6 +413,7 @@ Loosen these to admit RTK-FLOAT if your sky view is poor; tighten to reject Atla
 ```
 - `prior_inf_scale` is **precision** (1/variance), not sigma. Equivalent sigmas: σ_x = σ_y ≈ 1 cm, σ_z ≈ 3 cm — about 2× looser than Atlas's reported precision.
 - `enable_orientation_prior: true` adds a **yaw-only** heading prior per submap from the Atlas dual-antenna heading carried in the GNSS `Odometry.pose.orientation` (this is the INS pose orientation, *not* the `sensor_msgs/Imu.orientation` field, which Atlas leaves unpopulated). `orientation_prior_inf_scale: [1e-6, 1e-6, 1e2]` constrains only yaw (σ ≈ 5.7°) and leaves roll/pitch to gravity/LiDAR. It pins heading against the slow LiDAR-IMU yaw drift that the position prior alone cannot fix. Fires only on RTK-FIXED samples; validate the yaw convention on a bag before tightening the yaw precision.
+- `orientation_prior_max_yaw_sigma_deg: 3.0` (P5 yaw-quality gate) — skip the heading prior when the message's reported yaw sigma (√`pose.covariance[35]`, populated by the adapter from Atlas `rpy_covariance`) exceeds this. The RTK filter above qualifies *position* quality only; dual-antenna heading can be degraded while position is FIXED, and a garbage heading at 5.7° precision would twist the map. Healthy Atlas heading is 0.1–0.3° sigma. Position priors are unaffected; skips are logged with a running count; `<= 0` disables; unpopulated covariance passes.
 - `enable_lever_arm: false` because the Atlas INS **pose/position** is already output at `gps_antenna_top` and the graph body runs there too, so a software **position** lever-arm would double-compensate. (The IMU stream is body-axis-rotated but device-located per FusionEngine Spec §3.4.1 — a separate, small accel lever-arm, deliberately not modelled.)
 
 **IMU noise** (`config_sensors.json`, tuned for Atlas `imu_calibrated`):
