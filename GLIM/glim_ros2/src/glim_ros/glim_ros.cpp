@@ -382,9 +382,13 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
     sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
     {
       std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+      // frame_diag_log wired through (review fix): without it the live node
+      // silently used the default `false` even when config_sensors.json
+      // enabled the per-frame CONCAT DEBUG evidence.
       merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold,
                                       aux_concat.require_all_aux, aux_concat.max_consecutive_aux_merge_failures,
-                                      &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure);
+                                      &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure,
+                                      aux_concat.frame_diag_log);
     }
     // nullptr = strict merge skipped this scan (require_all_aux); drop it.
     if (!merged) {

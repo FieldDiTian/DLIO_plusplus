@@ -241,6 +241,74 @@ inline void shift_cloud_timestamps(
 
 // `primary` is taken as a ConstSharedPtr so both the offline tools (which hold
 // a mutable SharedPtr) and the live GlimROS points_callback (which receives a
+// P4 review follow-up: per-point time span (seconds) of a cloud, for the
+// CONCAT DEBUG evidence line (parity with GICP's scan_time_span_s debug
+// topic). A healthy 3-LiDAR merge spans ~1 sweep period; a much larger span
+// means a badly-offset aux was rebased far from the primary and will be
+// deskewed across a long arc. Returns NaN when no usable time field exists.
+// Units by encoding: UINT8[8] = uint64 epoch ns; UINT32 = ns;
+// FLOAT32/FLOAT64 = seconds (absolute or scan-relative — the SPAN is
+// epoch-invariant either way). One O(N) pass; only run when diag is enabled.
+inline double cloud_time_span_seconds(const sensor_msgs::msg::PointCloud2& cloud) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  int off = -1;
+  uint8_t datatype = 0;
+  int count = 0;
+  if (!find_time_field(cloud, off, datatype, count)) return nan;
+  const uint32_t step = cloud.point_step;
+  if (step == 0 || off < 0 || static_cast<uint32_t>(off) >= step) return nan;
+  const size_t n = cloud.data.size() / step;
+  if (n == 0) return nan;
+  const size_t avail = step - static_cast<uint32_t>(off);
+
+  switch (datatype) {
+    case sensor_msgs::msg::PointField::UINT8: {  // Luminar uint64 epoch ns
+      if (count != 8 || avail < 8) return nan;
+      uint64_t mn = std::numeric_limits<uint64_t>::max(), mx = 0;
+      for (size_t i = 0; i < n; i++) {
+        uint64_t v;
+        std::memcpy(&v, &cloud.data[i * step + off], sizeof(v));
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+      }
+      return (mx >= mn) ? (mx - mn) * 1e-9 : nan;
+    }
+    case sensor_msgs::msg::PointField::UINT32: {  // scan-relative ns
+      if (avail < 4) return nan;
+      uint32_t mn = std::numeric_limits<uint32_t>::max(), mx = 0;
+      for (size_t i = 0; i < n; i++) {
+        uint32_t v;
+        std::memcpy(&v, &cloud.data[i * step + off], sizeof(v));
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+      }
+      return (mx >= mn) ? (mx - mn) * 1e-9 : nan;
+    }
+    case sensor_msgs::msg::PointField::FLOAT32: {
+      if (avail < 4) return nan;
+      float mn = std::numeric_limits<float>::infinity(), mx = -mn;
+      for (size_t i = 0; i < n; i++) {
+        float v;
+        std::memcpy(&v, &cloud.data[i * step + off], sizeof(v));
+        if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
+      }
+      return (mx >= mn) ? static_cast<double>(mx - mn) : nan;
+    }
+    case sensor_msgs::msg::PointField::FLOAT64: {
+      if (avail < 8) return nan;
+      double mn = std::numeric_limits<double>::infinity(), mx = -mn;
+      for (size_t i = 0; i < n; i++) {
+        double v;
+        std::memcpy(&v, &cloud.data[i * step + off], sizeof(v));
+        if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
+      }
+      return (mx >= mn) ? (mx - mn) : nan;
+    }
+    default:
+      return nan;
+  }
+}
+
 // ConstSharedPtr) can call this directly. The primary cloud is only read here;
 // the merged output is a fresh copy.
 // Strict merge guard (optional): when require_all_aux is set, a scan that fails to
@@ -269,7 +337,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   // mapping log, mirroring gicp_localization's per-frame debug topics.
   std::vector<double> diag_aux_dt(aux_sensors.size(), std::numeric_limits<double>::quiet_NaN());
   std::vector<size_t> diag_aux_pts(aux_sensors.size(), 0);
-  const auto emit_frame_diag = [&](size_t total_pts) {
+  const auto emit_frame_diag = [&](size_t total_pts, const sensor_msgs::msg::PointCloud2& cloud) {
     if (!frame_diag_log) return;
     std::ostringstream oss;
     oss << "CONCAT DEBUG | stamp=" << std::fixed << std::setprecision(3) << t_primary
@@ -278,8 +346,12 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     for (size_t i = 0; i < aux_sensors.size(); ++i) {
       oss << " dt" << i << "=" << diag_aux_dt[i] << "s pts" << i << "=" << diag_aux_pts[i];
     }
-    oss << " total_pts=" << total_pts;
-    spdlog::info(oss.str());
+    // Merged-sweep per-point time span (GICP scan_time_span_s parity); NaN =
+    // no usable time field. Computed only when the diag line is enabled.
+    oss << " span=" << cloud_time_span_seconds(cloud) << "s total_pts=" << total_pts;
+    // "{}" wrapper: never pass a runtime string as the fmt format string
+    // (stray braces would throw fmt::format_error mid-mapping).
+    spdlog::info("{}", oss.str());
   };
 
   // Strict-merge failure handler. Single routing point for every "required merge
@@ -312,7 +384,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   int x_off, y_off, z_off;
   if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
     spdlog::warn("lidar_concat: cannot find xyz fields in primary cloud");
-    emit_frame_diag(primary->width * primary->height);
+    emit_frame_diag(primary->width * primary->height, *primary);
     if (on_required_failure(0, "primary cloud missing xyz fields")) return nullptr;
     return primary;
   }
@@ -326,7 +398,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   if (point_step == 0 || primary->data.size() != static_cast<size_t>(primary->width) * primary->height * point_step) {
     spdlog::warn("lidar_concat: primary cloud is organized/padded (data={}, width={}, height={}, step={}); skipping concat",
                  primary->data.size(), primary->width, primary->height, point_step);
-    emit_frame_diag(primary->width * primary->height);
+    emit_frame_diag(primary->width * primary->height, *primary);
     if (on_required_failure(0, "primary cloud organized/padded (non-tight)")) return nullptr;
     return primary;
   }
@@ -409,7 +481,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     }
   }
 
-  emit_frame_diag(total_points);
+  emit_frame_diag(total_points, *merged);
 
   merged->width = total_points;
   merged->height = 1;

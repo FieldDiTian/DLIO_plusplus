@@ -193,8 +193,9 @@ def main():
         for i in range(total_aux):
             dts = []
             for r in cc:
-                m = re.search(rf"dt{i}=(-?[\d.]+|nan)s", r["cdetail"])
-                if m and m.group(1) != "nan":
+                # tolerate platform NaN spellings: nan, -nan, -nan(ind)
+                m = re.search(rf"dt{i}=(-?(?:[\d.]+|nan(?:\(ind\))?))s", r["cdetail"])
+                if m and "nan" not in m.group(1):
                     dts.append(float(m.group(1)))
             if dts:
                 dts.sort()

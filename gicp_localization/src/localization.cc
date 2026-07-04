@@ -173,7 +173,11 @@ DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& h
                                             double veto_yaw_above_deg /* <=0 disables */) {
   DegeneracyProjection out;
   out.projected_pose = candidate;
-  if (!hessian.allFinite()) return out;
+  // A non-finite hessian only invalidates the EIGEN projection — the yaw veto
+  // works on the pose delta alone and must not be silently disabled by it
+  // (review fix). Callers treat valid=false as "reject when eigen projection
+  // was required", which is still the right contract below.
+  if (apply_eigen_projection && !hessian.allFinite()) return out;
 
   const Eigen::Matrix4d prior = T_prior.cast<double>();
   const Eigen::Matrix4d cand = candidate.cast<double>();
@@ -1773,9 +1777,20 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/verbose", this->verbose_);
 
   // Suppress INFO/DEBUG logs when verbose is off; WARN/ERROR still pass through.
-  if (!this->verbose_) {
+  // REVIEW FIX (commit 0e4916c follow-up): the WARN clamp also silenced the
+  // INFO-level "SCAN DEBUG | status=ok/ok_partial" lines even when
+  // debug/verbose_scan_log=true — the replay scorecard
+  // (scripts/analyze_scan_debug_log.py) would then see only rejected frames
+  // and report nonsense acceptance/streak/bucket stats. Keep INFO alive when
+  // the per-scan evidence log is requested; verbose_ still gates the raw
+  // stderr debug prints independently.
+  if (!this->verbose_ && !this->debug_verbose_scan_log_) {
     rcutils_logging_set_logger_level(this->get_logger().get_name(),
                                      RCUTILS_LOG_SEVERITY_WARN);
+  } else if (!this->verbose_) {
+    RCLCPP_INFO(this->get_logger(),
+                "localization/verbose=false but debug/verbose_scan_log=true: keeping INFO "
+                "log level so per-scan SCAN DEBUG evidence reaches the log");
   }
 
   RCLCPP_INFO(this->get_logger(), "Preprocessing config: crop_size=%.2f, voxel_filter=%s, voxel_res=%.2f",
@@ -2799,6 +2814,11 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
 
 void gicp_localization::LocalizationNode::deskewPointcloud() {
 
+  // REVIEW FIX: reset the per-frame sweep-span diagnostic up front so early
+  // returns (deskew off, unsupported sensor, empty IMU buffer, ...) publish
+  // -1 instead of the previous frame's stale span.
+  this->last_scan_time_span_s_ = -1.0;
+
   if (!this->deskew_ || !this->first_imu_received) {
     this->current_scan = this->original_scan;
 
@@ -3237,8 +3257,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
                                    this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
                                    yaw_veto_wanted ? this->yaw_gate_max_corr_deg_ : 0.0);
   }
+  // REVIEW FIX: require the projected pose to be finite before adopting it —
+  // final_candidate reaches basePose/current_pose ahead of the downstream
+  // gicp_valid finiteness guard, so a (pathological) NaN from the projection
+  // would otherwise poison the next scan's prior.
   const Eigen::Matrix4f final_candidate =
-      (degen.valid && degen.modified) ? degen.projected_pose : candidate_pose;
+      (degen.valid && degen.modified && matrixFinite(degen.projected_pose))
+          ? degen.projected_pose : candidate_pose;
 
   double guess_to_solution_trans = -1.0;
   double guess_to_solution_rot_deg = -1.0;
