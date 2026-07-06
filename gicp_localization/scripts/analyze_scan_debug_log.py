@@ -44,6 +44,8 @@ ROW = re.compile(
     r".*?fitness=(?P<fit>[-\d.eE+]+|n/a)"
     r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a))?"
     r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d),partial=(?P<pu>\d)\])?"
+    r"(?:.*?yaw_innov=\[(?P<yi>-?[\d.]+|nan)deg,fin=(?P<yif>-?[\d.]+|nan)deg\])?"
+    r"(?:.*?yaw_stiff=(?P<ys>-?[\d.]+|n/a))?"
     r"(?:.*?concat=\[(?P<cn>-?\d+)/(?P<ct>\d+)(?P<cdetail>[^\]]*)\])?"
     r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|inf)"
     r"(?:.*?gt_err=\[(?P<gtp>[\d.]+)m,(?P<gtr>[\d.]+)deg)?"
@@ -55,6 +57,7 @@ def main():
     ap.add_argument("log")
     ap.add_argument("--period", type=float, default=0.1, help="scan period s (watchpoint)")
     ap.add_argument("--gt-bad", type=float, default=20.0, help="bad-accept gt_err threshold m")
+    ap.add_argument("--gt-bad-rot", type=float, default=10.0, help="bad-accept gt_rot threshold deg")
     args = ap.parse_args()
 
     rows = []
@@ -76,6 +79,9 @@ def main():
                 fit=float(d["fit"]) if d["fit"] not in (None, "n/a") else float("nan"),
                 ratio=float(d["ratio"]) if d["ratio"] not in (None, "n/a") else float("nan"),
                 yv=int(d["yv"]) if d["yv"] else 0,
+                yi=float(d["yi"]) if d["yi"] not in (None, "nan") else float("nan"),
+                yif=float(d["yif"]) if d["yif"] not in (None, "nan") else float("nan"),
+                ys=float(d["ys"]) if d["ys"] not in (None, "n/a") else float("nan"),
                 pu=int(d["pu"]) if d["pu"] else 0,
                 dr=int(d["dr"]) if d["dr"] else 0,
                 dtx=int(d["dt"]) if d["dt"] else 0,
@@ -174,6 +180,37 @@ def main():
         print(f"    {b[0]:>2}-{b[1]:<2} deg/s: n={len(vals):5d}  gt_pos median={fmt(pct(gp,50),2)} "
               f"p90={fmt(pct(gp,90),2)} | gt_rot median={fmt(pct(gr,50),2)} p90={fmt(pct(gr,90),2)}")
     print("    [plan gate: turning p90 within 1.5x of straight p90]")
+
+    # --- Yaw safety (yaw-failure-first reporting; P1 yaw bug runs 19/20) ---
+    print("\n## Yaw safety")
+    for name, grp in (("ok", [r for r in rows if r["st"] == "ok"]),
+                      ("ok_partial", [r for r in rows if r["st"] == "ok_partial"]),
+                      ("all accepted", [r for r in rows if r["st"] in ok_like])):
+        rg = sorted(r["gtr"] for r in grp if not math.isnan(r["gtr"]))
+        if rg:
+            print(f"  gt_rot [{name:12s}]: median={fmt(pct(rg,50),2)} p95={fmt(pct(rg,95),2)} "
+                  f"p99={fmt(pct(rg,99),2)} max={fmt(rg[-1],1)} deg  (n={len(rg)})")
+    bad_yaw = [r for r in rows if r["st"] in ok_like and not math.isnan(r["gtr"])
+               and r["gtr"] > args.gt_bad_rot]
+    print(f"  bad-yaw accepts (gt_rot>{args.gt_bad_rot:.0f} deg): {len(bad_yaw)}   [plan gate: ~0]")
+    yi_acc = sorted(r["yi"] for r in rows if r["st"] in ok_like and not math.isnan(r["yi"]))
+    yif_acc = sorted(r["yif"] for r in rows if r["st"] in ok_like and not math.isnan(r["yif"]))
+    if yi_acc:
+        print(f"  accepted yaw innovation RAW  : median={fmt(pct(yi_acc,50),2)} p99={fmt(pct(yi_acc,99),2)} "
+              f"max={fmt(yi_acc[-1],1)} deg")
+        print(f"  accepted yaw innovation FINAL: median={fmt(pct(yif_acc,50),2)} p99={fmt(pct(yif_acc,99),2)} "
+              f"max={fmt(yif_acc[-1],1)} deg   [applied pose; large RAW->small FINAL = veto working]")
+    vet = [r for r in rows if r["yv"]]
+    if vet:
+        vg = sorted(r["gtr"] for r in vet if not math.isnan(r["gtr"]))
+        print(f"  yaw vetoes: {len(vet)}; vetoed-frame gt_rot median={fmt(pct(vg,50),2)} "
+              f"p95={fmt(pct(vg,95),2)} deg  (low = veto correctly kept IMU yaw)")
+    stiff = sorted(r["ys"] for r in rows if not math.isnan(r["ys"]) and r["ys"] >= 0)
+    if stiff:
+        print(f"  yaw marginal stiffness: p10={fmt(pct(stiff,10),1)} median={fmt(pct(stiff,50),1)} "
+              f"p90={fmt(pct(stiff,90),1)}  -> suggested gicp/prior/yawInfo ~ {fmt(0.2*pct(stiff,50),1)} (0.2x median)")
+    ry = counts.get("rejected_yaw", 0)
+    print(f"  rejected_yaw frames: {ry}  (hard innovation gate; nonzero means the veto tier was bypassed)")
 
     # --- P1 engagement ---
     if any(r["pu"] or r["yv"] for r in rows):

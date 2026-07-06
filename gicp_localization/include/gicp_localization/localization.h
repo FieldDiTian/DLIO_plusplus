@@ -246,6 +246,7 @@ private:
   int concat_last_merged_aux_ = -1;             // -1 = concat disabled / not run this frame
   std::vector<double> concat_last_aux_dt_;      // s, aux header - primary header; NaN = not merged
   std::vector<int> concat_last_aux_points_;     // appended points; 0 = not merged
+  std::vector<double> concat_aux_time_offsets_; // P3 fix: constant per-aux clock offset (s), order = aux_topics
   double last_scan_time_span_s_ = -1.0;         // merged-scan per-point time span (deskew path)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_merged_aux_count_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_time_span_pub;
@@ -305,6 +306,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_degen_rot_axes_pub;     // # rotation eigen-axes zeroed by partial update (0-3)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_degen_trans_axes_pub;   // # translation eigen-axes zeroed (0-3)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_veto_pub;           // 1.0 when the yaw-consistency veto zeroed the yaw correction
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_innovation_pub;      // raw GICP-vs-IMU yaw disagreement (deg, pre-veto)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_stiffness_pub;        // marginal yaw information of the scan (Schur, re-centered)
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
@@ -519,8 +522,17 @@ private:
   double degen_rel_floor_rot_;           // blockwise: rot eigen-axis degenerate if lambda < floor*lambda_max(block)
   double degen_rel_floor_trans_;         // blockwise: trans eigen-axis degenerate likewise
   bool   yaw_gate_enable_;               // turn-aware GICP-vs-IMU yaw consistency veto
-  double yaw_gate_max_corr_deg_;         // veto yaw when |yaw corr vs IMU prior| exceeds this...
-  double yaw_gate_fitness_ratio_;        // ...AND fitness ratio exceeds this (low-confidence match)
+  double yaw_gate_max_corr_deg_;         // SOFT veto: yaw corr above this AND ratio above fitnessRatio
+  double yaw_gate_fitness_ratio_;        // soft-tier arming ratio (low-confidence match)
+  double yaw_gate_hard_max_corr_deg_;    // HARD veto: unconditional yaw-corr bound (<=0 off) — P1 yaw-safety
+  double gicp_nonconv_ok_max_trans_m_;   // PR#6: max correction for the non-converged fitness fallback (<=0 off)
+  double gicp_nonconv_ok_max_rot_deg_;   // PR#6: max rotation for the non-converged fitness fallback (<=0 off)
+  // Algorithmic yaw-defect fixes (optimizer-level, 2026-07-05):
+  std::string gicp_dof_mode_;            // "6dof" | "4dof" (fix roll/pitch, default) | "3dof" (fix attitude)
+  int gicp_full6dof_every_n_;            // periodic unconstrained scan to re-anchor roll/pitch (0 = never)
+  int dof_scan_counter_ = 0;             // scan counter for the periodic 6dof refresh
+  double gicp_prior_yaw_info_;           // soft in-optimizer yaw prior info (rad^-2, 0 = off)
+  double gicp_prior_rollpitch_info_;     // soft in-optimizer roll/pitch prior info (rad^-2, 0 = off)
   std::deque<double> fitness_history_;   // accepted-frame fitness ring (scan thread only)
 
   // Preprocessing parameters
@@ -552,6 +564,8 @@ private:
   double geo_observer_dt_max_;     // s   — cap on dt used in updateState corrections
   double geo_max_pos_correction_;  // m   — clamp per-update position correction (0=off)
   double geo_max_vel_correction_;  // m/s — clamp per-update velocity correction (0=off)
+  double geo_max_yaw_correction_deg_;  // deg — clamp per-update yaw error before gain (0=off) — P1 yaw-safety
+  double geo_max_rot_correction_deg_;  // deg — clamp per-update total rotation error (0=off)
 
   // Time/speed-based dead-reckoning covariance growth (P3). During GICP loss the
   // reported position sigma grows with elapsed dead-reckon time and distance
@@ -572,6 +586,10 @@ private:
   // thresholds (debug_jump_trans_m_ / debug_jump_rot_deg_).
   double jump_trans_speed_scale_;  // extra trans threshold per (speed*scan_dt) metre
   double jump_rot_dt_scale_deg_;   // extra rot threshold (deg) per second of scan_dt
+  // P1 yaw-safety: yaw-specific innovation gate (split from total rotation).
+  double jump_yaw_max_deg_;        // base yaw budget vs IMU prior (<=0 disables)
+  double jump_yaw_dt_scale_deg_;   // extra yaw budget per second of scan_dt
+  double jump_yaw_total_max_deg_;  // absolute cap the dt scaling can never exceed
   bool verbose_;
 
   // Extrinsics

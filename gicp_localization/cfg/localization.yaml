@@ -200,6 +200,14 @@
     localization/lidar_concat/time_threshold: 0.1   # seconds; aux scans further than this from primary are dropped
                                                     # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
                                                     #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
+    # Yaw-defect fix (P3): constant per-aux clock offsets (seconds, order =
+    # aux_topics; missing = 0). ADDED to the aux header stamp for matching /
+    # rebasing AND to Luminar absolute per-point times, so a constant clock
+    # offset vs the primary/IMU no longer warps the merged scan during turns
+    # (false yaw pressure). Read the value off the per-aux offset diagnostic
+    # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
+    # runs 19/20 measured 80-90 ms offsets.
+    localization/lidar_concat/aux_time_offsets: []
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -378,6 +386,15 @@
     # an absolute ceiling on how far one scan can move the state.
     odom/geo/max_pos_correction: 0.0 # m   — clamp per-update position correction
     odom/geo/max_vel_correction: 0.0 # m/s — clamp per-update velocity correction
+    # P1 yaw-safety fix #3: ORIENTATION got the clamp position/velocity always
+    # had. The observer pulls dt_eff*Kq (~45%) of the orientation error per
+    # update; unclamped, one bad accepted scan injects tens of degrees of
+    # heading in a single update (runs 19/20). The yaw clamp bounds the error's
+    # body-z component BEFORE the gain; 5 deg still allows >20 deg/s of
+    # legitimate correction authority at 10 Hz. max_rot bounds total rotation
+    # error (roll/pitch included); 0 = off.
+    odom/geo/max_yaw_correction_deg: 5.0
+    odom/geo/max_rot_correction_deg: 0.0
 
     # Dead-reckoning covariance growth (P3). During GICP loss the reported
     # position sigma grows with elapsed dead-reckon time and distance travelled
@@ -412,6 +429,20 @@
     # restore the fixed thresholds above.
     localization/jump/trans_speed_scale: 1.5   # extra metres of threshold per (speed*scan_dt) metre
     localization/jump/rot_dt_scale_deg: 60.0   # extra degrees of threshold per second of scan_dt
+    # P1 yaw-safety: YAW is split out of the rotation jump gate. The generic
+    # 30 + 60*dt envelope (36 deg at a normal 0.1 s scan, 45 deg after a
+    # 0.25 s recovery gap) is a re-acquisition allowance for TOTAL rotation,
+    # but as a yaw budget it is physically absurd — runs 19/20 accepted
+    # 45-47 deg heading proposals through it. Yaw innovation vs the IMU prior
+    # gets its own budget with an absolute cap the dt scaling can never lift:
+    #   eff_yaw = min(yaw_max_deg + yaw_dt_scale_deg * scan_dt, yaw_total_max_deg)
+    # Evaluated on the APPLIED pose (post yaw-veto), so vetoed frames pass and
+    # keep their translation info. Set yaw_max_deg <= 0 to disable.
+    # Re-acquisition after long dead-reckoning with genuinely drifted yaw is
+    # the GT snap's job (it bypasses scan gates by design), not this gate's.
+    localization/jump/yaw_max_deg: 10.0
+    localization/jump/yaw_dt_scale_deg: 10.0
+    localization/jump/yaw_total_max_deg: 15.0
 
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)
@@ -435,6 +466,17 @@
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
     gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
+    # converged"). The fallback exists for max-iterations-at-speed scans whose
+    # correction is small; unbounded, it also admitted wrong-basin results
+    # (3.27 m/11.2 deg, 9.21 m/10.7 deg on run5-vs-run3) whose accepts reset
+    # the failure counter and locked GT recovery out. Non-converged candidates
+    # whose applied correction vs the IMU prior exceeds either bound are
+    # classified failed_to_converge instead. <=0 disables a bound.
+    # PR validation: nonconv accepts 1145->397; accepts with INS err >=50 m
+    # 99->3; p90 INS err 21.6->12.7 m.
+    gicp/nonConvergedFitnessOkMaxTransM: 3.0
+    gicp/nonConvergedFitnessOkMaxRotDeg: 5.0
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
 
     # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========
@@ -492,8 +534,42 @@
     # yawGate is INDEPENDENT of degeneracy/partialUpdate: the veto still fires
     # with the legacy binary hessian gate.
     gicp/yawGate/enable: true
-    gicp/yawGate/maxCorrDeg: 1.5           # healthy GICP yaw corrections are <0.5 deg (IMU prior is good)
-    gicp/yawGate/fitnessRatio: 1.2         # veto only on low-confidence matches
+    gicp/yawGate/maxCorrDeg: 1.5           # SOFT tier: healthy GICP yaw corrections are <0.5 deg (IMU prior is good)
+    gicp/yawGate/fitnessRatio: 1.2         # soft tier arms only on low-confidence matches (ratio above this)
+    # HARD tier (P1 yaw-safety, runs 19/20): UNCONDITIONAL — independent of
+    # fitness ratio. A wrong-basin match can carry plausible fitness and slip
+    # the soft tier; but the IMU-integrated prior yaw cannot be 8+ deg wrong
+    # over a 0.1-0.3 s scan gap on a ground vehicle, so any larger GICP yaw
+    # "correction" is dropped (IMU yaw kept, translation still gated).
+    # Runs 19/20 saw 45-47 deg proposals accepted -> 78-98 deg heading error.
+    # <= 0 disables the hard tier.
+    gicp/yawGate/hardMaxCorrDeg: 8.0
+
+    # ===== Algorithmic yaw-defect fixes (2026-07-05 deep-cause report) =====
+    # The gates above bound damage AFTER the optimizer proposes a bad pose;
+    # these remove the failure at the source.
+    #
+    # 1) Registration DoF. The upstream optimizer is unconstrained SE(3); a
+    #    ground vehicle with firmware-calibrated Atlas attitude should not let
+    #    LiDAR registration freely re-estimate roll/pitch against repeated map
+    #    structure. "4dof" (default) fixes roll+pitch to the IMU prior INSIDE
+    #    the LM solve (translation + yaw stay free); "3dof" also fixes yaw
+    #    (translation-only — maximum protection, but yaw drift then recovers
+    #    only via GT snap); "6dof" restores upstream behavior. Every
+    #    full6dofEveryN-th scan runs unconstrained so roll/pitch re-anchor to
+    #    map structure and slow gyro drift cannot accumulate in fixed axes.
+    gicp/dof/mode: "4dof"
+    gicp/dof/full6dofEveryN: 10
+    # 2) Soft attitude prior INSIDE the optimizer (the deep P1 cause: no IMU
+    #    yaw term existed, so plausible correspondences on repeated curbs /
+    #    barriers could pull yaw into a wrong basin unopposed). Info is rad^-2
+    #    on the world-tangent attitude residual vs the IMU-integrated initial
+    #    guess, and competes directly with the point terms. 0 = off (default —
+    #    calibrate first: read debug/yaw_marginal_stiffness (or yaw_stiff= in
+    #    SCAN DEBUG) from a replay and start yawInfo at ~0.2x its median; the
+    #    scorecard prints the suggestion). rollPitchInfo only matters in 6dof.
+    gicp/prior/yawInfo: 0.0
+    gicp/prior/rollPitchInfo: 0.0
 
     # Degeneracy TRIGGER (condition proxy of the raw 6x6 hessian). With
     # partialUpdate=true this no longer rejects — it decides when the

@@ -147,6 +147,54 @@ bool LsqRegistration<PointTarget, PointSource>::is_converged(const Eigen::Isomet
   return std::max(r_delta.maxCoeff(), t_delta.maxCoeff()) < 1;
 }
 
+
+template <typename PointTarget, typename PointSource>
+double LsqRegistration<PointTarget, PointSource>::prior_error(const Eigen::Isometry3d& x0) const {
+  if (!rot_prior_set_) return 0.0;
+  const Eigen::Matrix3d R_err = x0.linear() * rot_prior_target_.transpose();
+  const Eigen::AngleAxisd aa(R_err);
+  const Eigen::Vector3d e = aa.angle() * aa.axis();
+  return e.dot(rot_prior_info_.asDiagonal() * e);
+}
+
+template <typename PointTarget, typename PointSource>
+double LsqRegistration<PointTarget, PointSource>::apply_constraints(const Eigen::Isometry3d& x0,
+                                                                    Eigen::Matrix<double, 6, 6>* H,
+                                                                    Eigen::Matrix<double, 6, 1>* b) const {
+  double y_prior = 0.0;
+  // Soft attitude prior (yaw-defect fix): e = Log(R_x0 * R_target^T) lives in
+  // the same left/world tangent as d.head<3>(), so J_e ~ I for small e and the
+  // Gauss-Newton contribution is H_rot += W, b_rot += W * e. Included in the
+  // returned error so LM's rho ratio sees the same objective it solves.
+  if (rot_prior_set_) {
+    const Eigen::Matrix3d R_err = x0.linear() * rot_prior_target_.transpose();
+    const Eigen::AngleAxisd aa(R_err);
+    const Eigen::Vector3d e = aa.angle() * aa.axis();
+    const Eigen::Matrix3d W = rot_prior_info_.asDiagonal();
+    H->template block<3, 3>(0, 0) += W;
+    b->template head<3>() += W * e;
+    y_prior = e.dot(W * e);
+  }
+  // Hard DoF mask (4-DoF / 3-DoF registration): zero the masked rotation rows
+  // and columns and pin the diagonal at the unmasked scale, so the solve
+  // yields exactly d(i) = 0 — the attitude axis never moves from the initial
+  // guess. Done AFTER the prior so a masked axis is fully fixed regardless of
+  // prior settings. Diagonal pinned at max|diag| (not 1.0) so the reported
+  // final hessian's spectrum stays in range for the downstream degeneracy
+  // analysis ("externally constrained" reads as a stiff axis, not a null one).
+  if (dof_fix_[0] || dof_fix_[1] || dof_fix_[2]) {
+    const double pin = std::max(1.0, H->diagonal().array().abs().maxCoeff());
+    for (int i = 0; i < 3; ++i) {
+      if (!dof_fix_[i]) continue;
+      H->row(i).setZero();
+      H->col(i).setZero();
+      (*H)(i, i) = pin;
+      (*b)(i) = 0.0;
+    }
+  }
+  return y_prior;
+}
+
 template <typename PointTarget, typename PointSource>
 bool LsqRegistration<PointTarget, PointSource>::step_optimize(Eigen::Isometry3d& x0, Eigen::Isometry3d& delta) {
   switch (lsq_optimizer_type_) {
@@ -164,6 +212,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_gn(Eigen::Isometry3d& x0, E
   Eigen::Matrix<double, 6, 6> H;
   Eigen::Matrix<double, 6, 1> b;
   double y0 = linearize(x0, &H, &b);
+  y0 += apply_constraints(x0, &H, &b);
 
   Eigen::LDLT<Eigen::Matrix<double, 6, 6>> solver(H);
   Eigen::Matrix<double, 6, 1> d = solver.solve(-b);
@@ -184,6 +233,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
   Eigen::Matrix<double, 6, 6> H;
   Eigen::Matrix<double, 6, 1> b;
   double y0 = linearize(x0, &H, &b);
+  y0 += apply_constraints(x0, &H, &b);
 
   if (lm_lambda_ < 0.0) {
     lm_lambda_ = lm_init_lambda_factor_ * H.diagonal().array().abs().maxCoeff();
@@ -199,7 +249,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
     delta.translation() = d.tail<3>();
 
     Eigen::Isometry3d xi = delta * x0;
-    double yi = compute_error(xi);
+    double yi = compute_error(xi) + prior_error(xi);
     double rho = (y0 - yi) / (d.dot(lm_lambda_ * d - b));
 
     if (lm_debug_print_) {

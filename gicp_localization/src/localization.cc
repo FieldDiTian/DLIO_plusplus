@@ -322,6 +322,19 @@ DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& h
   return out;
 }
 
+// P1 yaw-safety: yaw component (deg, absolute) of the world-frame delta
+// between two poses — the z element of the rotation vector of
+// R_b * R_a^T. For a near-level ground vehicle this is the heading
+// disagreement; roll/pitch live in the x/y components and are gated
+// separately by the total-rotation jump threshold.
+double yawInnovationDeg(const Eigen::Matrix4f& a, const Eigen::Matrix4f& b) {
+  const Eigen::Matrix3d Ra = a.block<3, 3>(0, 0).cast<double>();
+  const Eigen::Matrix3d Rb = b.block<3, 3>(0, 0).cast<double>();
+  const Eigen::AngleAxisd aa(Rb * Ra.transpose());
+  const Eigen::Vector3d rv = aa.angle() * aa.axis();
+  return std::abs(rv.z()) * 180.0 / M_PI;
+}
+
 // Find x/y/z field offsets in a PointCloud2 message. Returns false if any are missing.
 bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
   x_off = y_off = z_off = -1;
@@ -809,7 +822,7 @@ void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType
 // arithmetic on those bits would scramble them.
 void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
-                          double dt, bool luminar_uint64) {
+                          double dt, bool luminar_uint64, double abs_clock_shift_s = 0.0) {
   if (time_off < 0) return;
 
   // Absolute-epoch path (Luminar Iris UINT8[8]): leave the per-point values
@@ -819,6 +832,24 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
   // without any rebasing here.
   if (luminar_uint64) {
     (void)dt;
+    // P3 yaw-defect fix: absolute-epoch per-point times normally pass through
+    // unshifted (each point carries its own capture time). But a CONSTANT
+    // clock offset between this aux LiDAR and the primary/IMU clock makes
+    // those absolute times land on the wrong segment of the IMU motion during
+    // deskew — warping the merged scan during turns and creating false yaw
+    // pressure. When a measured offset is configured
+    // (lidar_concat/aux_time_offsets), correct the absolute times by it.
+    if (abs_clock_shift_s != 0.0 && time_count == 8) {
+      const int64_t shift_ns = static_cast<int64_t>(abs_clock_shift_s * 1e9);
+      for (size_t i = 0; i < num_points; ++i) {
+        uint8_t* time_ptr = data + i * point_step + time_off;
+        uint64_t val;
+        std::memcpy(&val, time_ptr, sizeof(uint64_t));
+        const int64_t shifted = static_cast<int64_t>(val) + shift_ns;
+        val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
+        std::memcpy(time_ptr, &val, sizeof(uint64_t));
+      }
+    }
     return;
   }
 
@@ -1229,6 +1260,10 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/degen_trans_axes", 10);
     this->dbg_yaw_veto_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_veto", 10);
+    this->dbg_yaw_innovation_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_innovation_deg", 10);
+    this->dbg_yaw_stiffness_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_marginal_stiffness", 10);
     // P4#3: per-frame lidar_concat diagnostics (one sample per processed frame).
     this->dbg_merged_aux_count_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
@@ -1471,6 +1506,29 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("gicp/yawGate/enable", true);
   this->declare_parameter<double>("gicp/yawGate/maxCorrDeg", 1.5);
   this->declare_parameter<double>("gicp/yawGate/fitnessRatio", 1.2);
+  // P1 yaw-safety: UNCONDITIONAL veto tier — fires regardless of fitness
+  // ratio. The IMU prior's yaw cannot be this wrong over one scan gap on a
+  // ground vehicle; any larger GICP yaw "correction" is a wrong basin with
+  // plausible fitness (runs 19/20). <=0 disables the hard tier.
+  this->declare_parameter<double>("gicp/yawGate/hardMaxCorrDeg", 8.0);
+  // PR#6: bounds on the non-converged low-fitness fallback (see
+  // performLocalization). Defaults from the PR validation replay.
+  this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxTransM", 3.0);
+  this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxRotDeg", 5.0);
+  // ---- Algorithmic yaw-defect fixes (2026-07-05 deep-cause report) ----
+  // Registration DoF for a ground vehicle. "4dof" (default) fixes roll+pitch
+  // to the IMU prior inside the optimizer (translation+yaw free); "3dof"
+  // additionally fixes yaw (translation-only registration); "6dof" restores
+  // the unconstrained upstream behavior. Every full6dofEveryN-th scan runs
+  // full 6-DoF so roll/pitch stay anchored to map structure (0 = never).
+  this->declare_parameter<std::string>("gicp/dof/mode", "4dof");
+  this->declare_parameter<int>("gicp/dof/full6dofEveryN", 10);
+  // Soft attitude prior INSIDE the LM optimizer (info in rad^-2 on the
+  // world-tangent residual vs the IMU-integrated initial guess). 0 = off.
+  // Calibrate yawInfo against debug/yaw_marginal_stiffness (start at ~0.2x
+  // the published median). rollPitchInfo only matters in 6dof mode.
+  this->declare_parameter<double>("gicp/prior/yawInfo", 0.0);
+  this->declare_parameter<double>("gicp/prior/rollPitchInfo", 0.0);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
@@ -1497,6 +1555,22 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/yawGate/enable", this->yaw_gate_enable_);
   this->get_parameter("gicp/yawGate/maxCorrDeg", this->yaw_gate_max_corr_deg_);
   this->get_parameter("gicp/yawGate/fitnessRatio", this->yaw_gate_fitness_ratio_);
+  this->get_parameter("gicp/yawGate/hardMaxCorrDeg", this->yaw_gate_hard_max_corr_deg_);
+  this->get_parameter("gicp/nonConvergedFitnessOkMaxTransM", this->gicp_nonconv_ok_max_trans_m_);
+  this->get_parameter("gicp/nonConvergedFitnessOkMaxRotDeg", this->gicp_nonconv_ok_max_rot_deg_);
+  this->get_parameter("gicp/dof/mode", this->gicp_dof_mode_);
+  this->get_parameter("gicp/dof/full6dofEveryN", this->gicp_full6dof_every_n_);
+  this->get_parameter("gicp/prior/yawInfo", this->gicp_prior_yaw_info_);
+  this->get_parameter("gicp/prior/rollPitchInfo", this->gicp_prior_rollpitch_info_);
+  if (this->gicp_dof_mode_ != "6dof" && this->gicp_dof_mode_ != "4dof" && this->gicp_dof_mode_ != "3dof") {
+    RCLCPP_WARN(this->get_logger(), "gicp/dof/mode '%s' unknown; falling back to 6dof",
+                this->gicp_dof_mode_.c_str());
+    this->gicp_dof_mode_ = "6dof";
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "GICP DoF: %s (full 6dof every %d scans), rotation prior info yaw=%.1f rp=%.1f rad^-2",
+              this->gicp_dof_mode_.c_str(), this->gicp_full6dof_every_n_,
+              this->gicp_prior_yaw_info_, this->gicp_prior_rollpitch_info_);
   if (this->fitness_baseline_window_ < 3) this->fitness_baseline_window_ = 3;
   if (this->fitness_baseline_min_samples_ < 3) this->fitness_baseline_min_samples_ = 3;
   RCLCPP_INFO(this->get_logger(),
@@ -1547,6 +1621,15 @@ void gicp_localization::LocalizationNode::getParams() {
   // the matching scan and the frame silently degrades to fewer LiDARs (run-12
   // throttled logs: only ~35% of sampled scans merged 2/2). 200 = ~20 s.
   this->declare_parameter<int>("localization/lidar_concat/buffer_size", 200);
+  // Yaw-defect fix (P3): constant per-aux clock offset (seconds, ADDED to the
+  // aux header stamp AND to Luminar absolute per-point times) — absorbs a
+  // constant offset between an aux LiDAR's clock and the primary/IMU clock
+  // that would otherwise warp the merged scan during turns and create false
+  // yaw pressure. Read the value straight off the per-aux offset diagnostic
+  // ("header offset vs primary ... mean=..."); runs 19/20 showed 80-90 ms.
+  // Order matches aux_topics; missing entries = 0.
+  this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_time_offsets",
+                                               std::vector<double>{});
   // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
   this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
   this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
@@ -1568,6 +1651,7 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/lidar_concat/time_threshold", this->concat_time_threshold_);
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
+  this->get_parameter("localization/lidar_concat/aux_time_offsets", this->concat_aux_time_offsets_);
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
   this->get_parameter("localization/lidar_concat/primary_frame", this->concat_primary_frame_);
   this->get_parameter("localization/lidar_concat/urdf_path", this->concat_urdf_path_);
@@ -1739,9 +1823,17 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("odom/geo/observer_dt_max", 0.15);
   this->declare_parameter<double>("odom/geo/max_pos_correction", 0.0);
   this->declare_parameter<double>("odom/geo/max_vel_correction", 0.0);
+  // P1 yaw-safety fix #3: per-update ORIENTATION clamps (position/velocity
+  // already had them). Yaw clamp ON by default — the failure mode it bounds
+  // (one bad accepted scan yanking heading tens of degrees) is exactly the
+  // runs-19/20 signature. 0 disables.
+  this->declare_parameter<double>("odom/geo/max_yaw_correction_deg", 5.0);
+  this->declare_parameter<double>("odom/geo/max_rot_correction_deg", 0.0);
   this->get_parameter("odom/geo/observer_dt_max", this->geo_observer_dt_max_);
   this->get_parameter("odom/geo/max_pos_correction", this->geo_max_pos_correction_);
   this->get_parameter("odom/geo/max_vel_correction", this->geo_max_vel_correction_);
+  this->get_parameter("odom/geo/max_yaw_correction_deg", this->geo_max_yaw_correction_deg_);
+  this->get_parameter("odom/geo/max_rot_correction_deg", this->geo_max_rot_correction_deg_);
   if (this->geo_observer_dt_max_ <= 0.0) {
     this->geo_observer_dt_max_ = 0.15;  // guard against a non-positive cap disabling all corrections
   }
@@ -1771,8 +1863,18 @@ void gicp_localization::LocalizationNode::getParams() {
   // Speed/scan_dt-aware jump-gate scaling (P2#2). 0 reproduces the fixed thresholds.
   this->declare_parameter<double>("localization/jump/trans_speed_scale", 1.5);
   this->declare_parameter<double>("localization/jump/rot_dt_scale_deg", 60.0);
+  // P1 yaw-safety: yaw split out of the 3D rotation jump gate. The generic
+  // 30 + 60*dt envelope admits re-acquisition but is physically absurd as a
+  // YAW budget on a ground vehicle; yaw gets its own tight limit with an
+  // absolute cap scan_dt scaling can never lift into the tens of degrees.
+  this->declare_parameter<double>("localization/jump/yaw_max_deg", 10.0);
+  this->declare_parameter<double>("localization/jump/yaw_dt_scale_deg", 10.0);
+  this->declare_parameter<double>("localization/jump/yaw_total_max_deg", 15.0);
   this->get_parameter("localization/jump/trans_speed_scale", this->jump_trans_speed_scale_);
   this->get_parameter("localization/jump/rot_dt_scale_deg", this->jump_rot_dt_scale_deg_);
+  this->get_parameter("localization/jump/yaw_max_deg", this->jump_yaw_max_deg_);
+  this->get_parameter("localization/jump/yaw_dt_scale_deg", this->jump_yaw_dt_scale_deg_);
+  this->get_parameter("localization/jump/yaw_total_max_deg", this->jump_yaw_total_max_deg_);
 
   this->get_parameter("localization/verbose", this->verbose_);
 
@@ -2671,11 +2773,16 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     // Pick the aux scan whose header is closest in time to the primary header,
     // within the configured threshold.
     sensor_msgs::msg::PointCloud2::ConstSharedPtr match;
+    // P3 yaw-defect fix: correct a measured constant clock offset before any
+    // time comparison — matching, rebasing, and diagnostics all see the
+    // corrected aux timeline.
+    const double aux_clock_off = (aux_i < this->concat_aux_time_offsets_.size())
+                                     ? this->concat_aux_time_offsets_[aux_i] : 0.0;
     double best_dt = std::numeric_limits<double>::max();
     {
       std::lock_guard<std::mutex> lk(aux.mtx);
       for (const auto& msg : aux.buffer) {
-        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() - t_primary);
+        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() + aux_clock_off - t_primary);
         if (dt < best_dt) {
           best_dt = dt;
           match = msg;
@@ -2739,9 +2846,10 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     if (has_time_field) {
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
-      const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
+      const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
       const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
-      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64);
+      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64,
+                           aux_clock_off);
     } else if (this->deskew_) {
       // Without per-point timestamps the aux rays would deskew against the
       // primary scan's IMU integration with a stale (aux-header) reference,
@@ -2764,7 +2872,7 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     // clock offset against the P1 timebase, which a per-aux time-offset
     // correction upstream could absorb (and which inflates deskew error at
     // high yaw rates).
-    const double signed_dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
+    const double signed_dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
     this->concat_last_aux_dt_[aux_i] = signed_dt;
     this->concat_last_aux_points_[aux_i] = static_cast<int>(aux_pts);
     aux.dt_sum += signed_dt;
@@ -3166,9 +3274,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // in map<-lidar, then convert the optimizer output back to map<-base.
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
-  Eigen::Matrix4f initial_guess = this->deskew_
-      ? Eigen::Matrix4f::Identity()
-      : (this->T_prior * T_base_lidar);
+  // PR#6: plain if-assignment instead of a ternary mixing two different
+  // Eigen expression types (CwiseNullaryOp vs Product) — the ternary broke
+  // package builds and had to be hot-patched in every replay worktree.
+  Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+  if (!this->deskew_) {
+    initial_guess = this->T_prior * T_base_lidar;
+  }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;
@@ -3176,6 +3288,36 @@ void gicp_localization::LocalizationNode::performLocalization() {
   if (this->last_gicp_valid_) {
     guess_from_last_trans = deltaTranslationNorm(this->last_gicp_pose_, guess_pose_map);
     guess_from_last_rot_deg = rotationDistanceDeg(this->last_gicp_pose_, guess_pose_map);
+  }
+
+  // ---- Ground-vehicle registration constraints (yaw-defect fix) ----
+  // DoF mask: fix roll/pitch (4dof) or full attitude (3dof) to the initial
+  // guess INSIDE the optimizer — the IMU prior attitude cannot be tens of
+  // degrees wrong over one scan gap, so wrong-basin attitude updates are
+  // removed at the source instead of gated after the fact. Every
+  // full6dofEveryN-th scan runs unconstrained so roll/pitch re-anchor to the
+  // map (bounds slow gyro-drift accumulation in the fixed axes).
+  bool dof_full6_this_scan = (this->gicp_dof_mode_ == "6dof");
+  if (!dof_full6_this_scan && this->gicp_full6dof_every_n_ > 0 &&
+      (++this->dof_scan_counter_ % this->gicp_full6dof_every_n_) == 0) {
+    dof_full6_this_scan = true;
+  }
+  const bool fix_rp = !dof_full6_this_scan &&
+      (this->gicp_dof_mode_ == "4dof" || this->gicp_dof_mode_ == "3dof");
+  const bool fix_yaw_dof = !dof_full6_this_scan && this->gicp_dof_mode_ == "3dof";
+  this->gicp.setDoFMask(fix_rp, fix_rp, fix_yaw_dof);
+  // Soft attitude prior toward the IMU-integrated initial guess (P1 deep
+  // cause: the optimizer had NO IMU attitude term, so repeated map structure
+  // could pull yaw into a plausible wrong basin unopposed).
+  if (this->gicp_prior_yaw_info_ > 0.0 || this->gicp_prior_rollpitch_info_ > 0.0) {
+    const Eigen::Matrix3d R_target =
+        initial_guess.block<3, 3>(0, 0).cast<double>();
+    this->gicp.setRotationPrior(
+        R_target, Eigen::Vector3d(this->gicp_prior_rollpitch_info_,
+                                  this->gicp_prior_rollpitch_info_,
+                                  this->gicp_prior_yaw_info_));
+  } else {
+    this->gicp.clearRotationPrior();
   }
 
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Starting GICP alignment...");
@@ -3187,6 +3329,17 @@ void gicp_localization::LocalizationNode::performLocalization() {
   double elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
   double fitness_score = this->gicp.getFitnessScore();
+  bool converged_precheck = this->gicp.hasConverged();
+  double fitness_score_final = fitness_score;
+  if (!converged_precheck) {
+    // Yaw-defect fix (P2a): the cached score reflects the LAST LINEARIZATION
+    // pose; on non-converged scans that lags the applied pose by one LM step,
+    // and the "effectively converged" acceptance below would judge a bad
+    // final candidate by a stale, flattering number. Recompute honestly at
+    // the final pose (one kd-tree pass) and gate on the worse of the two.
+    fitness_score_final = this->gicp.getFitnessScoreAtFinal();
+    fitness_score = std::max(fitness_score, fitness_score_final);
+  }
   this->last_fitness_score_ = fitness_score;
   double final_error = this->gicp.getFinalError();
   bool converged = this->gicp.hasConverged();
@@ -3197,6 +3350,35 @@ void gicp_localization::LocalizationNode::performLocalization() {
           : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
   const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
   const double hessian_condition = hessianConditionProxy(final_hessian);
+
+  // Marginal yaw stiffness (yaw-defect diagnostic): Schur complement of the
+  // vehicle-re-centered hessian w.r.t. everything except yaw — the
+  // information THIS SCAN actually carries about vehicle heading after the
+  // other 5 DoF absorb what they can. Low values = the map geometry barely
+  // constrains yaw here (wrong-basin risk); also the calibration reference
+  // for gicp/prior/yawInfo (start at ~0.2x the run median).
+  double yaw_marginal_stiffness = -1.0;
+  if (candidate_pose_valid && final_hessian.allFinite() && matrixFinite(this->T_prior)) {
+    const Eigen::Matrix<double, 6, 6> H_sym = 0.5 * (final_hessian + final_hessian.transpose());
+    const Eigen::Vector3d c = this->T_prior.block<3, 1>(0, 3).cast<double>();
+    Eigen::Matrix3d skew_c;
+    skew_c << 0.0, -c.z(), c.y(), c.z(), 0.0, -c.x(), -c.y(), c.x(), 0.0;
+    Eigen::Matrix<double, 6, 6> A = Eigen::Matrix<double, 6, 6>::Identity();
+    A.block<3, 3>(3, 0) = skew_c;
+    const Eigen::Matrix<double, 6, 6> H_c = A.transpose() * H_sym * A;
+    const int o_idx[5] = {0, 1, 3, 4, 5};  // everything but yaw (index 2)
+    Eigen::Matrix<double, 5, 5> Hoo;
+    Eigen::Matrix<double, 5, 1> Hoy;
+    for (int r = 0; r < 5; ++r) {
+      Hoy(r) = H_c(o_idx[r], 2);
+      for (int col = 0; col < 5; ++col) Hoo(r, col) = H_c(o_idx[r], o_idx[col]);
+    }
+    const Eigen::LDLT<Eigen::Matrix<double, 5, 5>> ldlt(Hoo);
+    if (ldlt.info() == Eigen::Success) {
+      const double schur = H_c(2, 2) - Hoy.dot(ldlt.solve(Hoy));
+      if (std::isfinite(schur)) yaw_marginal_stiffness = std::max(0.0, schur);
+    }
+  }
 
   const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
   const Eigen::Matrix4f candidate_pose = this->deskew_
@@ -3243,10 +3425,34 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // NOTE: yawGate is deliberately INDEPENDENT of degeneracy/partialUpdate —
   // disabling partial updates (legacy binary hessian gate) must not silently
   // disable the yaw-consistency veto.
-  const bool yaw_veto_wanted =
+  //
+  // TWO-TIER YAW VETO (P1 yaw-safety fix, runs 19/20: raw GICP rotation
+  // proposals up to 45-47 deg were accepted with plausible fitness, producing
+  // 78-98 deg heading errors vs RTK):
+  //   * SOFT tier (yawGate/maxCorrDeg, default 1.5 deg): armed only on
+  //     low-confidence matches (fitness_ratio > yawGate/fitnessRatio) — the
+  //     original wrong-basin ENTRY veto.
+  //   * HARD tier (yawGate/hardMaxCorrDeg, default 8 deg): UNCONDITIONAL,
+  //     independent of fitness ratio. T_prior carries the IMU-integrated yaw,
+  //     whose error over one scan gap is <0.1 deg; a ground vehicle cannot
+  //     make the IMU wrong by 8+ deg in 0.1-0.3 s, so any such GICP yaw
+  //     "correction" is a wrong basin regardless of how plausible its fitness
+  //     looks. The yaw component is dropped (IMU yaw kept); translation is
+  //     still gated separately below.
+  const bool yaw_soft_armed =
       candidate_pose_valid &&
       this->yaw_gate_enable_ && fitness_ratio > 0.0 &&
       fitness_ratio > this->yaw_gate_fitness_ratio_;
+  const bool yaw_hard_armed =
+      candidate_pose_valid && this->yaw_gate_enable_ &&
+      this->yaw_gate_hard_max_corr_deg_ > 0.0;
+  double yaw_veto_threshold_deg = 0.0;  // 0 = veto disabled in the projector
+  if (yaw_soft_armed) {
+    yaw_veto_threshold_deg = this->yaw_gate_max_corr_deg_;
+  } else if (yaw_hard_armed) {
+    yaw_veto_threshold_deg = this->yaw_gate_hard_max_corr_deg_;
+  }
+  const bool yaw_veto_wanted = yaw_soft_armed || yaw_hard_armed;
   DegeneracyProjection degen;
   degen.projected_pose = candidate_pose;
   if (eigen_projection_wanted || yaw_veto_wanted) {
@@ -3255,7 +3461,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
                                    this->degen_full6d_, this->degen_coupling_length_m_,
                                    this->degen_rel_floor_6d_,
                                    this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
-                                   yaw_veto_wanted ? this->yaw_gate_max_corr_deg_ : 0.0);
+                                   yaw_veto_threshold_deg);
   }
   // REVIEW FIX: require the projected pose to be finite before adopting it —
   // final_candidate reaches basePose/current_pose ahead of the downstream
@@ -3330,6 +3536,53 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const bool large_jump_final = candidate_pose_valid &&
       (final_jump_trans > eff_jump_trans_m || final_jump_rot_deg > eff_jump_rot_deg);
 
+  // P1 yaw-safety fix #2: yaw split out of the 3D rotation jump gate. The
+  // generic gate (30 deg + 60 deg/s * scan_dt) exists to admit re-acquisition
+  // after gaps, but for YAW that envelope is physically absurd on a ground
+  // vehicle — the IMU-integrated prior cannot be tens of degrees wrong over a
+  // 0.1-0.3 s gap (runs 19/20: 45-47 deg proposals passed the ~36-45 deg
+  // effective gate and produced 78-98 deg heading errors). Yaw innovation vs
+  // T_prior gets its own tight budget with a hard absolute cap that scan_dt
+  // scaling can never raise into relocalization territory:
+  //   eff_yaw = min(yaw_max_deg + yaw_dt_scale_deg * scan_dt, yaw_total_max_deg)
+  // Evaluated on the APPLIED pose (post yaw-veto/projection), so a vetoed
+  // frame — whose yaw already equals the IMU prior — passes and keeps its
+  // translation information. Controlled relocalization stays available via
+  // GT snap recovery, which bypasses scan gates by design.
+  const double yaw_innov_raw_deg =
+      candidate_pose_valid ? yawInnovationDeg(this->T_prior, candidate_pose) : -1.0;
+  const double yaw_innov_final_deg =
+      candidate_pose_valid ? ((degen.valid && degen.modified)
+                                  ? yawInnovationDeg(this->T_prior, final_candidate)
+                                  : yaw_innov_raw_deg)
+                           : -1.0;
+  const double eff_yaw_max_deg =
+      (this->jump_yaw_max_deg_ > 0.0)
+          ? std::min(this->jump_yaw_max_deg_ + this->jump_yaw_dt_scale_deg_ * scan_dt_clamped,
+                     this->jump_yaw_total_max_deg_ > 0.0 ? this->jump_yaw_total_max_deg_
+                                                         : std::numeric_limits<double>::infinity())
+          : std::numeric_limits<double>::infinity();
+  const bool yaw_jump_final = candidate_pose_valid && std::isfinite(eff_yaw_max_deg) &&
+                              yaw_innov_final_deg > eff_yaw_max_deg;
+
+  // PR#6: BOUNDED non-converged fitness fallback. The "effectively converged"
+  // rule (non-converged but fitness under the absolute threshold) exists for
+  // the max-iterations-at-highway-speed case, where the correction is small.
+  // Run5-on-Run3 showed it also admitting wrong-basin results with corrections
+  // of 3.27 m/11.2 deg and 9.21 m/10.7 deg — and each accept reset the
+  // consecutive-failure counter, locking GT recovery out until the pose had
+  // drifted far from INS. Keep the fallback only for SMALL corrections
+  // (vs the IMU prior, on the pose actually applied); larger non-converged
+  // candidates are classified failed_to_converge. <=0 disables either bound.
+  // PR-validated: nonconv accepts 1145->397, accepts with INS err >=50 m 99->3.
+  const bool nonconv_fallback_ok =
+      candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_ &&
+      (this->gicp_nonconv_ok_max_trans_m_ <= 0.0 ||
+       final_jump_trans <= this->gicp_nonconv_ok_max_trans_m_) &&
+      (this->gicp_nonconv_ok_max_rot_deg_ <= 0.0 ||
+       final_jump_rot_deg <= this->gicp_nonconv_ok_max_rot_deg_);
+  const bool effectively_converged = converged || nonconv_fallback_ok;
+
   // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
   // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
   // accept/reject decisions — purely a diagnostic.
@@ -3402,6 +3655,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
     publish_float(this->dbg_degen_rot_axes_pub, static_cast<double>(degen.degen_rot_axes));
     publish_float(this->dbg_degen_trans_axes_pub, static_cast<double>(degen.degen_trans_axes));
     publish_float(this->dbg_yaw_veto_pub, degen.yaw_vetoed ? 1.0 : 0.0);
+    // P1 yaw-safety: raw GICP-vs-IMU yaw disagreement (pre-veto/projection).
+    publish_float(this->dbg_yaw_innovation_pub, yaw_innov_raw_deg);
+    publish_float(this->dbg_yaw_stiffness_pub, yaw_marginal_stiffness);
     // P4#3: per-frame concat/source-set record (merged_aux_count = -1 when
     // concat disabled; aux dt = NaN when that aux did not merge this frame).
     publish_float(this->dbg_merged_aux_count_pub,
@@ -3417,7 +3673,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
 
     std_msgs::msg::Bool converged_msg;
-    converged_msg.data = (converged || (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_)) && candidate_pose_valid;
+    // PR#6: publish the same BOUNDED effective-convergence decision the
+    // acceptance gate uses (was the unbounded fitness-only fallback).
+    converged_msg.data = effectively_converged && candidate_pose_valid;
     this->dbg_converged_pub->publish(converged_msg);
 
     if (gt_pos_err >= 0.0) {
@@ -3503,6 +3761,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
         << " guess_to_solution=[" << scalarSummary(guess_to_solution_trans) << "m,"
         << scalarSummary(guess_to_solution_rot_deg) << "deg]"
         << " jump=[" << scalarSummary(jump_trans) << "m," << scalarSummary(jump_rot_deg) << "deg]"
+        << " yaw_innov=[" << scalarSummary(yaw_innov_raw_deg, 2) << "deg,fin="
+        << scalarSummary(yaw_innov_final_deg, 2) << "deg]"
+        << " yaw_stiff=" << scalarSummary(yaw_marginal_stiffness, 1)
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
         << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
@@ -3529,20 +3790,23 @@ void gicp_localization::LocalizationNode::performLocalization() {
     return oss.str();
   };
 
-  // Accept results that have good fitness even when the optimizer didn't formally
-  // converge (hit maxIterations before epsilon was met). At highway speed the
-  // initial guess can be 1-3 m away, so the solver may need more steps than
-  // maxIterations to satisfy the tight epsilon — but the result is still accurate.
-  const bool effectively_converged = converged ||
-      (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_);
+  // effectively_converged is computed above (PR#6 bounded fallback) so the
+  // debug `converged` topic publishes the same decision the gate uses.
 
   bool gicp_rejected_fitness = false;
   bool gicp_rejected_fitness_ratio = false;
   bool gicp_rejected_jump = false;
+  bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
   if (effectively_converged && candidate_pose_valid) {
     if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
+    } else if (yaw_jump_final) {
+      // P1 yaw-safety: hard yaw innovation gate vs the IMU prior, checked
+      // BEFORE the degeneracy/jump paths and independent of fitness. Only
+      // reachable when the (unconditional) yaw veto is disabled or failed to
+      // engage — the vetoed pose carries IMU yaw and passes this gate.
+      gicp_rejected_yaw = true;
     } else if (this->fitness_ratio_reject_ > 0.0 && fitness_ratio > 0.0 &&
                fitness_ratio > this->fitness_ratio_reject_) {
       // Wrong-basin gate (P1): fitness far above the map's own rolling-median
@@ -3591,7 +3855,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
   }
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
-                             !gicp_rejected_hessian && !gicp_rejected_jump;
+                             !gicp_rejected_hessian && !gicp_rejected_jump &&
+                             !gicp_rejected_yaw;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
@@ -3603,6 +3868,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
                 fitness_score, this->gicp_fitness_reject_threshold_,
                 build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_yaw) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (yaw innovation %.2f deg > eff %.2f deg vs IMU prior @ scan_dt=%.3fs — "
+                "physically impossible heading correction for a ground vehicle): %s",
+                yaw_innov_final_deg, eff_yaw_max_deg, scan_dt_clamped,
+                build_scan_debug_log("rejected_yaw").c_str());
   } else if (gicp_rejected_fitness_ratio) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",
@@ -3743,6 +4014,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
+                       : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
                        : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
                        : gicp_rejected_hessian ? "degenerate geometry"
                        : "jump rejected";
@@ -5392,6 +5664,47 @@ void gicp_localization::LocalizationNode::updateState() {
 
   // Construct error quaternion
   qe = qhat.conjugate() * qin;
+
+  // P1 yaw-safety fix #3: bound the per-update ORIENTATION correction the way
+  // position/velocity already can be bounded. qe is the body-frame rotation
+  // error the observer will pull toward with gain dt_eff*Kq (~0.45/update);
+  // without a clamp, one bad accepted scan with a large heading error injects
+  // dt_eff*Kq*err yaw in a single update (runs 19/20: tens of degrees). Clamp
+  // the error's yaw component (body z ~ heading on a near-level vehicle) and
+  // optionally its total magnitude BEFORE the gain is applied. Legitimate
+  // corrections converge unaffected: a clamped 5 deg yaw error still pulls
+  // ~2.3 deg/update at 10 Hz — over 20 deg/s of authority.
+  if (this->geo_max_yaw_correction_deg_ > 0.0 || this->geo_max_rot_correction_deg_ > 0.0) {
+    constexpr float kDeg2RadF = static_cast<float>(M_PI / 180.0);
+    Eigen::AngleAxisf aa_e(qe);
+    Eigen::Vector3f rv = aa_e.angle() * aa_e.axis();
+    bool clamped = false;
+    if (this->geo_max_yaw_correction_deg_ > 0.0) {
+      const float max_yaw = static_cast<float>(this->geo_max_yaw_correction_deg_) * kDeg2RadF;
+      if (std::abs(rv.z()) > max_yaw) {
+        rv.z() = std::copysign(max_yaw, rv.z());
+        clamped = true;
+      }
+    }
+    if (this->geo_max_rot_correction_deg_ > 0.0) {
+      const float max_rot = static_cast<float>(this->geo_max_rot_correction_deg_) * kDeg2RadF;
+      const float n = rv.norm();
+      if (n > max_rot) {
+        rv *= max_rot / n;
+        clamped = true;
+      }
+    }
+    if (clamped) {
+      const float ang = rv.norm();
+      qe = (ang > 1e-9f)
+               ? Eigen::Quaternionf(Eigen::AngleAxisf(ang, rv / ang))
+               : Eigen::Quaternionf::Identity();
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "updateState: orientation error clamped (yaw<=%.1fdeg, rot<=%.1fdeg) "
+                           "before applying observer gain — inspect yaw_innovation_deg",
+                           this->geo_max_yaw_correction_deg_, this->geo_max_rot_correction_deg_);
+    }
+  }
 
   double sgn = 1.0;
   if (qe.w() < 0) {

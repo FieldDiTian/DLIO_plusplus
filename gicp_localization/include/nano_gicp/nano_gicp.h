@@ -129,6 +129,11 @@ public:
   //   final-pose value; in non-converging cases it can lag by one LM step.
   double getFitnessScore(double max_range = std::numeric_limits<double>::max());
 
+  // HONEST fitness recomputed at final_transformation_ (fresh kd-tree pass) —
+  // use for gating on non-converged / large-final-step scans where the cached
+  // score above lags the applied pose (yaw-defect fix, P2a).
+  double getFitnessScoreAtFinal(double max_range = std::numeric_limits<double>::max());
+
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
 

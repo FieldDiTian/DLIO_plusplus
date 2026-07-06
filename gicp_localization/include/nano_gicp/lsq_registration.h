@@ -135,6 +135,33 @@ public:
   const Eigen::Matrix<double, 6, 6>& getFinalHessian() const;
   double getFinalError() const;
 
+  // ---- Ground-vehicle constraints (yaw-defect fix, 2026-07-05) -------------
+  // The LM/GN tangent is d = [omega; t] with omega a WORLD-frame rotation
+  // (left-multiplicative update x0 = exp(d) * x0). Rotation matrices are
+  // center-independent, so masking omega components constrains the pose's
+  // ATTITUDE change regardless of the rotation-about-origin parameterization.
+  //
+  // setDoFMask(fix_roll, fix_pitch, fix_yaw): masked rotation axes never move
+  // from the initial guess — 4-DoF registration (fix roll+pitch) or 3-DoF
+  // attitude-locked registration (fix all three). Translation is always free.
+  void setDoFMask(bool fix_roll, bool fix_pitch, bool fix_yaw) {
+    dof_fix_[0] = fix_roll;
+    dof_fix_[1] = fix_pitch;
+    dof_fix_[2] = fix_yaw;
+  }
+  // Soft attitude prior: adds e^T W e to the objective with
+  // e = Log(R_x0 * R_target^T) (world tangent, matches d) and
+  // W = diag(info) [rad^-2]. Zero info disables per axis. The prior is
+  // included in both the normal equations AND the LM error, so rho stays
+  // consistent. Calibrate info against the published marginal yaw stiffness
+  // (gicp/localization/debug/yaw_marginal_stiffness).
+  void setRotationPrior(const Eigen::Matrix3d& R_target, const Eigen::Vector3d& info) {
+    rot_prior_target_ = R_target;
+    rot_prior_info_ = info;
+    rot_prior_set_ = info.maxCoeff() > 0.0;
+  }
+  void clearRotationPrior() { rot_prior_set_ = false; }
+
   virtual void swapSourceAndTarget() {}
   virtual void clearSource() {}
   virtual void clearTarget() {}
@@ -165,5 +192,19 @@ protected:
 
   Eigen::Matrix<double, 6, 6> final_hessian_;
   double final_error_;
+
+  // Ground-vehicle constraints (see setDoFMask / setRotationPrior above).
+  bool dof_fix_[3] = {false, false, false};
+  bool rot_prior_set_ = false;
+  Eigen::Matrix3d rot_prior_target_ = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d rot_prior_info_ = Eigen::Vector3d::Zero();
+
+  // Apply the soft rotation prior to (y, H, b) at pose x0, and the DoF mask to
+  // (H, b). Shared by step_gn / step_lm. Returns the prior's error term.
+  double apply_constraints(const Eigen::Isometry3d& x0,
+                           Eigen::Matrix<double, 6, 6>* H,
+                           Eigen::Matrix<double, 6, 1>* b) const;
+  // Prior error contribution only (for LM's compute_error consistency).
+  double prior_error(const Eigen::Isometry3d& x0) const;
 };
 }  // namespace nano_gicp

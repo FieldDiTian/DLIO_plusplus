@@ -336,6 +336,39 @@ double NanoGICP<PointSource, PointTarget>::getFitnessScore(double max_range) {
 }
 
 template <typename PointSource, typename PointTarget>
+double NanoGICP<PointSource, PointTarget>::getFitnessScoreAtFinal(double max_range) {
+  // Yaw-defect fix (P2a): HONEST fitness at the FINAL pose. The cached-score
+  // getFitnessScore() reflects the last linearization pose; on non-converged /
+  // large-final-step scans that lags the applied pose by one LM step and can
+  // make a bad final candidate look safer than it is. This recomputes
+  // nearest-neighbor distances at final_transformation_ — one kd-tree pass
+  // (~1-3 ms at localization scan sizes); call it only on suspect frames.
+  if (!input_ || input_->empty() || !target_kdtree_) {
+    return std::numeric_limits<double>::max();
+  }
+  const Eigen::Matrix4f T = final_transformation_;
+  const float max_sq = (max_range >= 1e30)
+                           ? std::numeric_limits<float>::max()
+                           : static_cast<float>(max_range * max_range);
+  double sum = 0.0;
+  long n = 0;
+#pragma omp parallel for num_threads(num_threads_) reduction(+ : sum, n) schedule(guided, 8)
+  for (int i = 0; i < static_cast<int>(input_->size()); ++i) {
+    PointSource pt;
+    Eigen::Vector4f v = input_->at(i).getVector4fMap();
+    v[3] = 1.0f;  // homogeneous w is not guaranteed after upstream filters
+    pt.getVector4fMap() = T * v;
+    std::vector<int> k_index(1);
+    std::vector<float> k_sq_dist(1);
+    if (target_kdtree_->nearestKSearch(pt, 1, k_index, k_sq_dist) != 1) continue;
+    if (k_sq_dist[0] > max_sq) continue;
+    sum += k_sq_dist[0];
+    ++n;
+  }
+  return n > 0 ? sum / static_cast<double>(n) : std::numeric_limits<double>::max();
+}
+
+template <typename PointSource, typename PointTarget>
 double NanoGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d& trans) {
   double sum_errors = 0.0;
 
