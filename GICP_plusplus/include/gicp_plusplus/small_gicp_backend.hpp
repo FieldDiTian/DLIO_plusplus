@@ -169,6 +169,22 @@ struct PriorAwareLevenbergMarquardtOptimizer {
       }
     }
 
+    // [REVIEW FIX 2026-07-08 P3] Re-linearize at the FINAL pose so
+    // result.H / result.b / result.error describe the accepted output, not
+    // the linearization point BEFORE the last accepted step. Downstream code
+    // treats result.H as the final Hessian (degeneracy projection, legacy
+    // hessian gate, yaw-marginal stiffness): with bounded non-converged
+    // accepts, the last accepted step is exactly where it may not be tiny.
+    {
+      auto [H_final, b_final, e_final] = reduction.linearize(
+          target, source, target_tree, rejector, result.T_target_source, factors);
+      general_factor.update_linearized_system(
+          target, source, target_tree, result.T_target_source, &H_final, &b_final, &e_final);
+      result.H = H_final;
+      result.b = b_final;
+      result.error = e_final;
+    }
+
     result.num_inliers = static_cast<size_t>(std::count_if(
         factors.begin(), factors.end(), [](const auto& factor) { return factor.inlier(); }));
     return result;

@@ -46,6 +46,7 @@ ROW = re.compile(
     r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d),partial=(?P<pu>\d)\])?"
     r"(?:.*?yaw_innov=\[(?P<yi>-?[\d.]+|nan)deg,fin=(?P<yif>-?[\d.]+|nan)deg\])?"
     r"(?:.*?yaw_stiff=(?P<ys>-?[\d.]+|n/a))?"
+    r"(?:.*?ins_dyaw=(?P<idy>-?(?:[\d.]+|nan(?:\(ind\))?))deg)?"
     r"(?:.*?concat=\[(?P<cn>-?\d+)/(?P<ct>\d+)(?P<cdetail>[^\]]*)\])?"
     r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|inf)"
     r"(?:.*?gt_err=\[(?P<gtp>[\d.]+)m,(?P<gtr>[\d.]+)deg)?"
@@ -82,6 +83,7 @@ def main():
                 yi=float(d["yi"]) if d["yi"] not in (None, "nan") else float("nan"),
                 yif=float(d["yif"]) if d["yif"] not in (None, "nan") else float("nan"),
                 ys=float(d["ys"]) if d["ys"] not in (None, "n/a") else float("nan"),
+                idy=float(d["idy"]) if d["idy"] not in (None, "nan") and d["idy"] is not None and "nan" not in str(d["idy"]) else float("nan"),
                 pu=int(d["pu"]) if d["pu"] else 0,
                 dr=int(d["dr"]) if d["dr"] else 0,
                 dtx=int(d["dt"]) if d["dt"] else 0,
@@ -209,6 +211,10 @@ def main():
     if stiff:
         print(f"  yaw marginal stiffness: p10={fmt(pct(stiff,10),1)} median={fmt(pct(stiff,50),1)} "
               f"p90={fmt(pct(stiff,90),1)}  -> suggested gicp/prior/yawInfo ~ {fmt(0.2*pct(stiff,50),1)} (0.2x median)")
+    idys = sorted(abs(r["idy"]) for r in rows if not math.isnan(r["idy"]))
+    if idys:
+        print(f"  |INS-vs-prior yaw|: median={fmt(pct(idys,50),2)} p95={fmt(pct(idys,95),2)} "
+              f"max={fmt(idys[-1],1)} deg  (persistent offset = map-vs-ENU yaw misalignment)")
     ry = counts.get("rejected_yaw", 0)
     print(f"  rejected_yaw frames: {ry}  (hard innovation gate; nonzero means the veto tier was bypassed)")
 

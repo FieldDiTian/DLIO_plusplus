@@ -74,6 +74,15 @@ public:
     double cov_pos_xx = std::numeric_limits<double>::infinity();
     double cov_pos_yy = std::numeric_limits<double>::infinity();
     double cov_pos_zz = std::numeric_limits<double>::infinity();
+    // [REVIEW FIX 2026-07-08] Yaw variance (rad^2) from pose.covariance[35],
+    // populated by the adapter from Atlas rpy covariance. Default -1 =
+    // unpopulated: the INS yaw-quality gate treats <=0 as "no information"
+    // and PASSES it (mirrors GLIM gnss_global's orientation_prior_max_yaw_sigma_deg
+    // semantics, keeping compat with GT sources that don't fill covariance[35]).
+    // Note the deliberate asymmetry vs cov_pos_* (+inf default = fail-closed):
+    // position RTK gating has always been mandatory, while yaw quality is an
+    // additional opt-out gate on top of it.
+    double cov_yaw = -1.0;
   };
 
   LocalizationNode();
@@ -136,6 +145,9 @@ private:
   // Sensor-frame crop box; must run BEFORE deskew (world-frame transform).
   void cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud);
   void deskewPointcloud();
+  // Correct basePose heading (and optionally position) toward the
+  // time-matched, RTK-gated INS sample BEFORE IMU integration/deskew.
+  void applyInsHeadingPriorToBasePose();
   void performLocalization();
   void publishPose();
   void applyInitialPoseFromParams();
@@ -309,6 +321,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_veto_pub;           // 1.0 when the yaw-consistency veto zeroed the yaw correction
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_innovation_pub;      // raw GICP-vs-IMU yaw disagreement (deg, pre-veto)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_stiffness_pub;        // marginal yaw information of the scan (Schur, re-centered)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_ins_yaw_diff_pub;          // INS-vs-prior yaw at the integration seed (deg)
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
@@ -328,6 +341,25 @@ private:
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
   double prev_scan_stamp;
+  // [REVIEW FIX 2026-07-08] The timestamp basePose actually corresponds to.
+  // basePose is set from the accepted candidate / T_prior, which is the pose
+  // at the MEDIAN POINT TIME of the scan (frames[median_pt_index]) -- NOT the
+  // scan header time stored in prev_scan_stamp. The INS heading prior must
+  // query the INS buffer at this stamp; querying at prev_scan_stamp instead
+  // produced a yaw-rate-proportional comparison bias on turns
+  // (~half-sweep-time * yaw_rate, e.g. 50 ms * 30 deg/s = 1.5 deg).
+  double base_pose_stamp_ = 0.0;   // time basePose is valid at (0 = unknown)
+  double t_prior_stamp_ = 0.0;     // time T_prior is valid at for the current scan
+  // [REVIEW FIX 2026-07-08 P2] Frame of current_scan as DECLARED by
+  // deskewPointcloud(): true = world frame (points placed along the prior
+  // chain / at T_prior), false = sensor (lidar) frame. performLocalization()
+  // previously inferred the frame from deskew_ alone, but several deskew
+  // fallback branches (no IMU yet, unsupported sensor, no per-point
+  // timestamps, empty IMU buffer) return the RAW sensor-frame cloud while
+  // deskew_ is true — GICP then seeded Identity and composed
+  // candidate = solution * T_prior as if the cloud were world-frame,
+  // inviting wrong-basin matches at startup / IMU gaps / bad timestamps.
+  bool scan_in_world_frame_ = false;
   double observer_dt_;
   std::string last_scan_input_frame_;
   size_t last_raw_point_count_;
@@ -418,6 +450,17 @@ private:
   };
   // Tracked base-frame pose in map.
   Pose basePose;
+  // [REVIEW FIX 2026-07-08 P2] The scan-chain integration seed as a matrix.
+  // Deskew fallback branches previously used current_pose as T_prior, which
+  // BYPASSES the INS heading/pose prior (applyInsHeadingPriorToBasePose()
+  // corrects basePose, not current_pose) — exactly during timestamp / IMU
+  // health trouble, when the drift-free INS reference matters most.
+  Eigen::Matrix4f basePoseMatrix() const {
+    Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+    T.block<3, 3>(0, 0) = this->basePose.q.normalized().toRotationMatrix();
+    T.block<3, 1>(0, 3) = this->basePose.p;
+    return T;
+  }
   Eigen::Vector3f prev_vel;
 
   // Geometric Observer State
@@ -533,6 +576,16 @@ private:
   int dof_scan_counter_ = 0;             // scan counter for the periodic 6dof refresh
   double gicp_prior_yaw_info_;           // soft in-optimizer yaw prior info (rad^-2, 0 = off)
   double gicp_prior_rollpitch_info_;     // soft in-optimizer roll/pitch prior info (rad^-2, 0 = off)
+  // INS heading/pose prior (2026-07-06): /gps_p1/imu = propagation/deskew,
+  // /gps_p1/filtered_odom = stable heading (+ optional position) prior.
+  bool ins_prior_enable_;
+  double ins_prior_yaw_blend_;            // fraction of INS-vs-prior yaw applied per scan
+  double ins_prior_max_yaw_step_deg_;     // hard cap on the per-scan yaw correction
+  double ins_prior_sanity_max_yaw_deg_;   // above this, warn and do NOT apply (frame/INS fault)
+  double ins_prior_pos_blend_;            // optional position pull toward INS (0 = off)
+  bool ins_prior_require_rtk_;            // only consume RTK-quality samples
+  double ins_prior_max_yaw_sigma_deg_;    // heading-quality gate on sqrt(cov[35]); <=0 disables
+  double last_ins_yaw_diff_deg_ = std::numeric_limits<double>::quiet_NaN();  // diagnostic
   std::deque<double> fitness_history_;   // accepted-frame fitness ring (scan thread only)
 
   // Preprocessing parameters

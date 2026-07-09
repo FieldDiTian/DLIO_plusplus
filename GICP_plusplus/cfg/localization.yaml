@@ -72,7 +72,8 @@
     # export) otherwise builds a multi-GB kd-tree that exhausts RAM/swap and
     # stalls registration for seconds. ~0.3 m cuts point count / memory ~10x with
     # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
-    # below, 0.5 m). Set to 0.0 to disable and register against the full-res map.
+    # below — 0.3 m since the P4 density work; keep the two leaf sizes matched
+    # when retuning). Set to 0.0 to disable and register against the full-res map.
     localization/map_voxel_size: 0.3
 
     # Map visualization (separate, coarser downsample used only for RViz publishing)
@@ -570,6 +571,52 @@
     #    scorecard prints the suggestion). rollPitchInfo only matters in 6dof.
     gicp/prior/yawInfo: 0.0
     gicp/prior/rollPitchInfo: 0.0
+
+    # ===== INS heading/pose prior (division of labor, 2026-07-06) =====
+    # /gps_p1/imu           -> IMU-RATE propagation + per-point deskew (unchanged)
+    # /gps_p1/filtered_odom -> STABLE HEADING (+ optional position) prior
+    #
+    # The gyro-integrated prior chain inherits heading drift from the last
+    # accepted GICP pose; the Atlas INS heading is drift-free (dual-antenna).
+    # Before each scan's IMU integration, the integration seed's yaw is pulled
+    # toward the time-matched, RTK-gated INS attitude — so the deskewed cloud,
+    # T_prior, the initial guess, the 4-DoF fixed axes, the rotation-prior
+    # target, the yaw gates, and the delta observer all inherit the stable
+    # heading consistently. Recovery property: even if every gate missed a bad
+    # yaw accept, the next scans' priors are pulled back toward INS truth at
+    # up to max_yaw_step_deg per scan. The INS is queried at the time basePose
+    # is actually valid at (the previous scan's MEDIAN point time, not its
+    # header stamp — REVIEW FIX 2026-07-08), and the same bounded step is
+    # applied to the geometric-observer state so the IMU-rate odometry output
+    # inherits the correction too (the delta-form observer would otherwise
+    # see an identity correction when GICP merely confirms the fixed prior).
+    #
+    # BLENDED and BOUNDED, never snapped: a constant map-vs-ENU yaw
+    # misalignment would otherwise be forced into every prior. Watch
+    # debug/ins_yaw_diff_deg (ins_dyaw= in SCAN DEBUG): a persistent nonzero
+    # value MEASURES that misalignment — fix the map/frame, don't raise blend.
+    localization/ins_prior/enable: true
+    localization/ins_prior/yaw_blend: 0.25          # fraction of INS-vs-prior yaw applied per scan
+    localization/ins_prior/max_yaw_step_deg: 2.0    # per-scan cap (20 deg/s of pull at 10 Hz)
+    localization/ins_prior/sanity_max_yaw_deg: 30.0 # above this: warn + do NOT apply (frame/INS fault)
+    localization/ins_prior/pos_blend: 0.0           # optional position pull toward INS (0 = OFF;
+                                                    #  enabling makes gt_pos_err non-independent — use
+                                                    #  held-out segments when scoring). The shift is
+                                                    #  also applied to the observer state (state.p),
+                                                    #  keeping scan-time and IMU-rate output consistent.
+                                                    #  Numeric ins_prior params are sanitized at load:
+                                                    #  out-of-range values warn and fall back to defaults.
+    localization/ins_prior/require_rtk_fixed: true  # consume RTK-quality samples only
+    # Heading-quality gate (REVIEW FIX 2026-07-08), mirroring GLIM gnss_global's
+    # orientation_prior_max_yaw_sigma_deg. require_rtk_fixed above gates on
+    # POSITION covariance only; Atlas can be position-FIXED while the
+    # dual-antenna heading is degraded (baseline outage / single-antenna
+    # fallback), and the blend would steer the seed toward that bad heading.
+    # Gate on sqrt(pose.covariance[35]) [rad^2 -> deg]: healthy Atlas heading
+    # reports 0.1-0.3 deg sigma, so 3.0 passes normal operation with margin
+    # and blocks degraded heading. Unpopulated covariance (<= 0) PASSES for
+    # compat with GT sources that don't fill it. <= 0 disables the gate.
+    localization/ins_prior/max_yaw_sigma_deg: 3.0
 
     # Degeneracy TRIGGER (condition proxy of the raw 6x6 hessian). With
     # partialUpdate=true this no longer rejects — it decides when the

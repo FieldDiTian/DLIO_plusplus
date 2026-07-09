@@ -169,6 +169,49 @@ Three options, in priority order:
 2. **`localization/initial_pose/use: true`**: use the numeric `x/y/z/roll/pitch/yaw` from the yaml. The `frame: "lidar"` mode is convenient for pasting from GLIM's `traj_lidar.txt` — the node post-multiplies `inv(T_base_lidar)` automatically.
 3. **RViz "2D Pose Estimate"**: publish to `/initialpose`. Always available as a manual override.
 
+## Sensor division of labor — IMU vs INS (2026-07-06)
+
+The two Atlas streams have distinct, deliberate roles:
+
+| Stream | Role |
+|---|---|
+| `/gps_p1/imu` (imu_calibrated) | **IMU-rate propagation + per-point deskew.** High rate, low latency, body-frame — everything short-horizon. |
+| `/gps_p1/filtered_odom` (INS solution) | **Stable heading (+ optional position) prior.** Dual-antenna-aided heading is drift-free — the reference the gyro-integrated chain lacks. |
+
+Before each scan's IMU integration, the integration seed's yaw is blended
+toward the time-matched, quality-gated INS attitude
+(`localization/ins_prior/*`: blend 0.25, per-scan cap 2°, sanity guard 30°,
+position-RTK gate + heading-quality gate `max_yaw_sigma_deg: 3.0` on
+`pose.covariance[35]`, mirroring GLIM's `orientation_prior_max_yaw_sigma_deg` —
+Atlas can be position-FIXED while dual-antenna heading is degraded).
+"Time-matched" means matched to the stamp `basePose` is actually valid at —
+the previous scan's **median point time**, not its header stamp; querying at
+the header stamp injected a yaw-rate-proportional bias (~half-sweep × yaw
+rate, e.g. 50 ms × 30°/s = 1.5°) into every turn (review fix 2026-07-08).
+Because the correction lands **before** deskew/placement, the deskewed cloud,
+`T_prior`, the initial guess, the 4-DoF fixed axes, the soft rotation-prior
+target, the yaw veto/innovation gates, and the delta-form observer all
+inherit the stable heading consistently — and the yaw-safety layer is now
+anchored to a drift-free reference instead of its own integration history.
+
+The same bounded step is applied to the geometric-observer state
+(`state.q`, world-frame velocities, `geo.prev_q/prev_vel`) under the observer
+lock (review fix 2026-07-08): the observer runs in delta form, so when GICP
+merely *confirms* the corrected prior the delta is identity and the IMU-rate
+odometry would otherwise never inherit the heading fix — only the scan-time
+chain would.
+
+Recovery property: if a bad yaw accept ever slips every gate, subsequent
+priors are pulled back toward INS truth at up to 20°/s (2°/scan @ 10 Hz) — a
+5° heading error decays below 1° within ~6 scans, and (since the observer
+inherits each step) the IMU-rate output decays with it.
+
+Diagnostics: `debug/ins_yaw_diff_deg` topic and `ins_dyaw=` in SCAN DEBUG; the
+scorecard reports its distribution. **A persistent nonzero value measures
+map-vs-ENU yaw misalignment (or an INS heading fault) — fix that, don't raise
+the blend.** `pos_blend` defaults OFF; enabling it makes `gt_pos_err` against
+the same INS non-independent (score with held-out segments).
+
 ## Configuration
 
 All parameters live in `cfg/localization.yaml`. The yaml has inline comments explaining each knob; the cheat sheet below covers the parts most worth tuning.

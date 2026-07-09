@@ -72,7 +72,8 @@
     # export) otherwise builds a multi-GB kd-tree that exhausts RAM/swap and
     # stalls registration for seconds. ~0.3 m cuts point count / memory ~10x with
     # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
-    # below, 0.5 m). Set to 0.0 to disable and register against the full-res map.
+    # below — 0.3 m since the P4 density work; keep the two leaf sizes matched
+    # when retuning). Set to 0.0 to disable and register against the full-res map.
     localization/map_voxel_size: 0.3
 
     # Map visualization (separate, coarser downsample used only for RViz publishing)

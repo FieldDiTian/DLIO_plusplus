@@ -1355,7 +1355,8 @@ void gicp_localization::LocalizationNode::getParams() {
   // Voxel leaf size (m) for the GICP TARGET map / kd-tree. A dense map (e.g. a
   // 49M-point GLIM export) builds a huge kd-tree -> >10 GiB RSS and swap thrash
   // that stalls registration. Downsampling the target to ~0.3 m cuts memory and
-  // per-scan search cost with negligible accuracy loss at 0.5 m scan voxels.
+  // per-scan search cost with negligible accuracy loss at the matching 0.3 m
+  // scan voxel (dlio/preprocessing/voxelFilter/res).
   // 0.0 disables (use the full-resolution map).
   this->declare_parameter<double>("localization/map_voxel_size", 0.3);
   this->declare_parameter<double>("localization/map_rotation/roll_deg", 0.0);
@@ -1971,7 +1972,8 @@ bool gicp_localization::LocalizationNode::loadMap() {
   // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
   // kd-tree that exhausts RAM/swap and stalls registration for seconds. Voxel
   // downsampling to ~0.3 m cuts the point count (and kd-tree memory) by ~10x
-  // with negligible accuracy impact at the 0.5 m scan voxel. The dense cloud is
+  // with negligible accuracy impact at the matching 0.3 m scan voxel
+  // (dlio/preprocessing/voxelFilter/res). The dense cloud is
   // released as soon as the filter swaps in the downsampled result.
   if (this->map_voxel_size_ > 0.0) {
     const size_t before = this->map_cloud->points.size();

@@ -839,7 +839,14 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
     // deskew — warping the merged scan during turns and creating false yaw
     // pressure. When a measured offset is configured
     // (lidar_concat/aux_time_offsets), correct the absolute times by it.
-    if (abs_clock_shift_s != 0.0 && time_count == 8) {
+    // [REVIEW FIX 2026-07-08 P3] Both accepted absolute-epoch carriers hold
+    // the same raw uint64 ns bits (see luminarRawTimestampNsFromBytes):
+    // UINT8[8] (deployed Iris) AND a mislabelled FLOAT64 field. The offset
+    // correction previously keyed on count == 8 only, silently skipping the
+    // FLOAT64 carrier.
+    if (abs_clock_shift_s != 0.0 &&
+        (time_count == 8 ||
+         time_datatype == sensor_msgs::msg::PointField::FLOAT64)) {
       const int64_t shift_ns = static_cast<int64_t>(abs_clock_shift_s * 1e9);
       for (size_t i = 0; i < num_points; ++i) {
         uint8_t* time_ptr = data + i * point_step + time_off;
@@ -963,6 +970,8 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
 
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
+  this->base_pose_stamp_ = 0.0;
+  this->t_prior_stamp_ = 0.0;
   this->observer_dt_ = 0.0;
   this->last_scan_input_frame_.clear();
   this->last_raw_point_count_ = 0;
@@ -1264,6 +1273,8 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_innovation_deg", 10);
     this->dbg_yaw_stiffness_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_marginal_stiffness", 10);
+    this->dbg_ins_yaw_diff_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/ins_yaw_diff_deg", 10);
     // P4#3: per-frame lidar_concat diagnostics (one sample per processed frame).
     this->dbg_merged_aux_count_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
@@ -1355,7 +1366,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // Voxel leaf size (m) for the GICP TARGET map / kd-tree. A dense map (e.g. a
   // 49M-point GLIM export) builds a huge kd-tree -> >10 GiB RSS and swap thrash
   // that stalls registration. Downsampling the target to ~0.3 m cuts memory and
-  // per-scan search cost with negligible accuracy loss at 0.5 m scan voxels.
+  // per-scan search cost with negligible accuracy loss at the matching 0.3 m
+  // scan voxel (dlio/preprocessing/voxelFilter/res).
   // 0.0 disables (use the full-resolution map).
   this->declare_parameter<double>("localization/map_voxel_size", 0.3);
   this->declare_parameter<double>("localization/map_rotation/roll_deg", 0.0);
@@ -1529,6 +1541,15 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // the published median). rollPitchInfo only matters in 6dof mode.
   this->declare_parameter<double>("gicp/prior/yawInfo", 0.0);
   this->declare_parameter<double>("gicp/prior/rollPitchInfo", 0.0);
+  // INS heading/pose prior (division of labor): IMU for propagation/deskew,
+  // filtered_odom for the stable heading (+ optional position) prior.
+  this->declare_parameter<bool>("localization/ins_prior/enable", true);
+  this->declare_parameter<double>("localization/ins_prior/yaw_blend", 0.25);
+  this->declare_parameter<double>("localization/ins_prior/max_yaw_step_deg", 2.0);
+  this->declare_parameter<double>("localization/ins_prior/sanity_max_yaw_deg", 30.0);
+  this->declare_parameter<double>("localization/ins_prior/pos_blend", 0.0);
+  this->declare_parameter<bool>("localization/ins_prior/require_rtk_fixed", true);
+  this->declare_parameter<double>("localization/ins_prior/max_yaw_sigma_deg", 3.0);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
@@ -1562,6 +1583,41 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("gicp/dof/full6dofEveryN", this->gicp_full6dof_every_n_);
   this->get_parameter("gicp/prior/yawInfo", this->gicp_prior_yaw_info_);
   this->get_parameter("gicp/prior/rollPitchInfo", this->gicp_prior_rollpitch_info_);
+  this->get_parameter("localization/ins_prior/enable", this->ins_prior_enable_);
+  this->get_parameter("localization/ins_prior/yaw_blend", this->ins_prior_yaw_blend_);
+  this->get_parameter("localization/ins_prior/max_yaw_step_deg", this->ins_prior_max_yaw_step_deg_);
+  this->get_parameter("localization/ins_prior/sanity_max_yaw_deg", this->ins_prior_sanity_max_yaw_deg_);
+  this->get_parameter("localization/ins_prior/pos_blend", this->ins_prior_pos_blend_);
+  this->get_parameter("localization/ins_prior/require_rtk_fixed", this->ins_prior_require_rtk_);
+  this->get_parameter("localization/ins_prior/max_yaw_sigma_deg", this->ins_prior_max_yaw_sigma_deg_);
+  // [REVIEW FIX 2026-07-08 P3] Sanitize: defaults are safe, but bad YAML values
+  // would invert the prior's semantics silently — a negative max_yaw_step_deg
+  // reaches std::clamp with REVERSED bounds (UB), a negative yaw_blend steers
+  // AWAY from the INS, and a negative sanity threshold always trips (silently
+  // disabling the prior). max_yaw_sigma_deg <= 0 is a documented gate-disable
+  // and is left as-is.
+  {
+    auto sanitize = [this](const char* name, double& v, double lo, double hi,
+                           double fallback) {
+      if (!std::isfinite(v) || v < lo || v > hi) {
+        RCLCPP_WARN(this->get_logger(),
+                    "localization/ins_prior/%s = %.3f outside [%.3f, %.3f]; using %.3f",
+                    name, v, lo, hi, fallback);
+        v = fallback;
+      }
+    };
+    sanitize("yaw_blend", this->ins_prior_yaw_blend_, 0.0, 1.0, 0.25);
+    sanitize("max_yaw_step_deg", this->ins_prior_max_yaw_step_deg_, 0.0, 90.0, 2.0);
+    sanitize("sanity_max_yaw_deg", this->ins_prior_sanity_max_yaw_deg_, 1e-3, 180.0, 30.0);
+    sanitize("pos_blend", this->ins_prior_pos_blend_, 0.0, 1.0, 0.0);
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "INS prior: %s (yaw_blend=%.2f, max_step=%.1fdeg, sanity=%.1fdeg, pos_blend=%.2f, rtk_only=%s, max_yaw_sigma=%.1fdeg) — "
+              "IMU=/gps_p1/imu for propagation/deskew, filtered_odom for stable heading",
+              this->ins_prior_enable_ ? "ENABLED" : "disabled",
+              this->ins_prior_yaw_blend_, this->ins_prior_max_yaw_step_deg_,
+              this->ins_prior_sanity_max_yaw_deg_, this->ins_prior_pos_blend_,
+              this->ins_prior_require_rtk_ ? "yes" : "no", this->ins_prior_max_yaw_sigma_deg_);
   if (this->gicp_dof_mode_ != "6dof" && this->gicp_dof_mode_ != "4dof" && this->gicp_dof_mode_ != "3dof") {
     RCLCPP_WARN(this->get_logger(), "gicp/dof/mode '%s' unknown; falling back to 6dof",
                 this->gicp_dof_mode_.c_str());
@@ -1975,7 +2031,8 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
   // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
   // kd-tree that exhausts RAM/swap and stalls registration for seconds. Voxel
   // downsampling to ~0.3 m cuts the point count (and kd-tree memory) by ~10x
-  // with negligible accuracy impact at the 0.5 m scan voxel. The dense cloud is
+  // with negligible accuracy impact at the matching 0.3 m scan voxel
+  // (dlio/preprocessing/voxelFilter/res). The dense cloud is
   // released as soon as the filter swaps in the downsampled result.
   if (this->map_voxel_size_ > 0.0) {
     const size_t before = this->map_cloud->points.size();
@@ -2106,7 +2163,10 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
     this->current_pose.setIdentity();
     this->current_pose.block<3, 3>(0, 0) = orientation.toRotationMatrix();
     this->current_pose.block<3, 1>(0, 3) = position;
-    this->initialized = true;
+    // [REVIEW FIX 2026-07-08 P3] initialized is published LAST (below), after
+    // basePose/observer state are written — a MultiThreadedExecutor scan
+    // callback could otherwise pass the atomic initialized check and start
+    // deskew from a stale/default basePose.
   }
 
   {
@@ -2128,6 +2188,8 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
   }
   this->basePose.p = position;
   this->basePose.q = orientation;
+  this->base_pose_stamp_ = 0.0;  // parameter pose has no timestamp
+  this->initialized = true;  // publish only after ALL pose state is consistent
 
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
@@ -2156,7 +2218,10 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     this->current_pose.setIdentity();
     this->current_pose.block<3, 3>(0, 0) = q.toRotationMatrix();
     this->current_pose.block<3, 1>(0, 3) = p;
-    this->initialized = true;
+    // [REVIEW FIX 2026-07-08 P3] initialized is published LAST (below): with a
+    // MultiThreadedExecutor, a scan callback could pass the atomic
+    // initialized check here and start deskew from the stale/default basePose
+    // that is only written further down.
     if (stamp.nanoseconds() > 0) {
       this->scan_stamp = stamp;
     }
@@ -2182,6 +2247,10 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
   }
   this->basePose.p = p;
   this->basePose.q = q;
+  // [REVIEW FIX 2026-07-08] Valid at the provided stamp if there is one;
+  // otherwise unknown (0) -> the INS prior falls back to prev_scan_stamp.
+  this->base_pose_stamp_ = (stamp.nanoseconds() > 0) ? stamp.seconds() : 0.0;
+  this->initialized = true;  // publish only after ALL pose state is consistent
 
   // Clear trajectory path on reinitialization
   this->path_msg.poses.clear();
@@ -2924,12 +2993,163 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
   return merged;
 }
 
+
+// ---- INS heading/pose prior (division of labor, 2026-07-06) -----------------
+// /gps_p1/imu drives IMU-RATE PROPAGATION + DESKEW; /gps_p1/filtered_odom
+// supplies the STABLE HEADING (and optionally position) prior. The
+// gyro-integrated prior chain inherits heading drift from the last accepted
+// GICP pose; the Atlas INS heading is drift-free (dual-antenna aided).
+//
+// The correction is applied to basePose BEFORE integrateImu/deskew, so the
+// deskewed world-frame cloud, T_prior, the initial guess, the 4-DoF fixed
+// axes, the soft rotation-prior target, the yaw veto/innovation gates, and
+// the delta-form observer ALL inherit the stable heading consistently.
+// (Correcting T_prior after deskew would mislabel an already-placed cloud.)
+//
+// BLENDED and BOUNDED, never snapped: a constant map-vs-ENU yaw misalignment
+// would otherwise be forced into every prior. A persistent nonzero ins_dyaw
+// (debug topic / SCAN DEBUG field) MEASURES that misalignment — investigate
+// it rather than raising the blend. With this correction in place, the hard
+// yaw veto and yaw innovation gates are anchored to a drift-free reference.
+void gicp_plusplus::LocalizationNode::applyInsHeadingPriorToBasePose() {
+  this->last_ins_yaw_diff_deg_ = std::numeric_limits<double>::quiet_NaN();
+  if (!this->ins_prior_enable_ || !this->gt_odom_enabled_ ||
+      !this->gt_odom_received_.load() || this->prev_scan_stamp <= 0.0) {
+    return;
+  }
+  // [REVIEW FIX 2026-07-08] Query the INS at the time basePose is actually
+  // valid at. basePose is the pose at the MEDIAN POINT TIME of the previous
+  // scan (frames[median_pt_index] / the accepted candidate), while
+  // prev_scan_stamp is the scan HEADER time -- typically ~half a sweep
+  // (~50 ms) earlier. Comparing the median-time seed attitude against the
+  // header-time INS attitude injected a yaw-rate-proportional bias on turns
+  // (50 ms * 30 deg/s = 1.5 deg), which the blend then pulled INTO the seed.
+  // base_pose_stamp_ is maintained at every basePose write site; fall back to
+  // prev_scan_stamp only if it was never set (pre-first-scan states).
+  const double seed_stamp =
+      (this->base_pose_stamp_ > 0.0) ? this->base_pose_stamp_ : this->prev_scan_stamp;
+  GtSample ins;
+  if (!this->getGtPoseAt(seed_stamp, ins)) return;
+  if (this->ins_prior_require_rtk_ && !this->gtSampleIsRtkFixed(ins)) return;
+  // [REVIEW FIX 2026-07-08] Heading-quality gate, mirroring GLIM gnss_global's
+  // orientation_prior_max_yaw_sigma_deg. The position RTK gate above says
+  // nothing about dual-antenna heading health: Atlas can be position-FIXED
+  // while the heading solution is degraded (baseline outage, single-antenna
+  // fallback), and a 0.25 blend at 2 deg/scan would happily steer the seed
+  // toward that degraded heading. Yaw variance (rad^2) arrives per-sample in
+  // pose.covariance[35] via the adapter; unpopulated (<=0) passes for compat
+  // with GT sources that do not fill it (same convention as GLIM).
+  if (this->ins_prior_max_yaw_sigma_deg_ > 0.0 && ins.cov_yaw > 0.0) {
+    const double yaw_sigma_deg = std::sqrt(ins.cov_yaw) * 180.0 / M_PI;
+    if (yaw_sigma_deg > this->ins_prior_max_yaw_sigma_deg_) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "INS prior: heading quality gate — yaw sigma %.2f deg > %.2f deg, "
+                           "prior NOT applied (position RTK may still be FIXED).",
+                           yaw_sigma_deg, this->ins_prior_max_yaw_sigma_deg_);
+      return;
+    }
+  }
+
+  Eigen::Vector3f ins_p;
+  Eigen::Quaternionf ins_q;
+  if (!this->composeGtPoseInBase(ins, ins_p, ins_q)) {
+    ins_p = ins.p;
+    ins_q = ins.q;
+  }
+
+  // World-frame yaw difference: INS attitude vs the integration seed.
+  const Eigen::Matrix3d R_seed = this->basePose.q.normalized().toRotationMatrix().cast<double>();
+  const Eigen::Matrix3d R_ins = ins_q.normalized().toRotationMatrix().cast<double>();
+  const Eigen::AngleAxisd aa(R_ins * R_seed.transpose());
+  const double dyaw_deg = (aa.angle() * aa.axis()).z() * 180.0 / M_PI;
+  this->last_ins_yaw_diff_deg_ = dyaw_deg;
+
+  if (std::abs(dyaw_deg) > this->ins_prior_sanity_max_yaw_deg_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "INS prior: |INS-vs-prior yaw|=%.1f deg exceeds sanity %.1f deg — NOT "
+                         "applied. Check map/ENU yaw alignment or INS attitude health.",
+                         dyaw_deg, this->ins_prior_sanity_max_yaw_deg_);
+    return;
+  }
+
+  double step_deg = this->ins_prior_yaw_blend_ * dyaw_deg;
+  step_deg = std::clamp(step_deg, -this->ins_prior_max_yaw_step_deg_,
+                        this->ins_prior_max_yaw_step_deg_);
+  if (step_deg != 0.0) {
+    const Eigen::Quaternionf rz(Eigen::AngleAxisf(
+        static_cast<float>(step_deg * M_PI / 180.0), Eigen::Vector3f::UnitZ()));
+    // Heading-only: rotate the seed ATTITUDE about world Z; position is
+    // untouched (a heading prior must not translate the vehicle).
+    this->basePose.q = (rz * this->basePose.q).normalized();
+    // [REVIEW FIX 2026-07-08] Apply the SAME world-Z step to the IMU-rate
+    // observer state. The observer runs in delta form: updateState() applies
+    // T_corr = T_meas * T_prior^-1 to the current state, so when GICP simply
+    // CONFIRMS the corrected prior the delta is identity and state.q — the
+    // attitude the IMU-rate odometry (propagateState) publishes from — would
+    // never inherit the heading fix; only the scan-time chain would converge.
+    // Rotating seed and observer state by the identical bounded step keeps the
+    // two chains consistent (their relative geometry is unchanged, so the
+    // delta correction is unaffected) and makes the "INS pull decays the yaw
+    // error within a few scans" property true for the IMU-rate output too.
+    // World-frame quantities rotate; body-frame ones (v.lin.b, v.ang.b,
+    // biases) and position (rotation is about the vehicle) are invariant.
+    {
+      std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+      this->state.q = (rz * this->state.q).normalized();
+      this->state.v.lin.w = rz * this->state.v.lin.w;
+      this->state.v.ang.w = rz * this->state.v.ang.w;
+      this->geo.prev_q = (rz * this->geo.prev_q).normalized();
+      this->geo.prev_vel = rz * this->geo.prev_vel;
+      ++this->geo.update_seq;  // discard any in-flight propagateState computations
+    }
+    // Scan-thread integration seed velocity is world-frame as well.
+    this->prev_vel = rz * this->prev_vel;
+  }
+  // Optional position blend (default 0 = OFF). NOTE the evaluation
+  // circularity: with this on, gt_pos_err against the same INS is no longer
+  // an independent metric — use held-out segments when scoring.
+  if (this->ins_prior_pos_blend_ > 0.0) {
+    const Eigen::Vector3f dp = static_cast<float>(this->ins_prior_pos_blend_) *
+                               (ins_p - this->basePose.p);
+    this->basePose.p += dp;
+    // [REVIEW FIX 2026-07-08] Mirror the yaw handling: shift the IMU-rate
+    // observer state by the SAME translation so the delta-form observer sees
+    // a consistent correction. Without this, a GICP result that merely
+    // confirms the shifted prior yields an identity delta and the IMU-rate
+    // odometry (propagateState from state.p) never inherits the position
+    // pull — scan-time and IMU-rate state split again. Velocities and
+    // attitude are invariant under a pure translation.
+    {
+      std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+      this->state.p += dp;
+      this->geo.prev_p += dp;
+      ++this->geo.update_seq;  // discard any in-flight propagateState computations
+    }
+  }
+}
+
 void gicp_plusplus::LocalizationNode::deskewPointcloud() {
 
   // REVIEW FIX: reset the per-frame sweep-span diagnostic up front so early
   // returns (deskew off, unsupported sensor, empty IMU buffer, ...) publish
   // -1 instead of the previous frame's stale span.
   this->last_scan_time_span_s_ = -1.0;
+
+  // INS heading/pose prior — must run BEFORE any IMU integration or cloud
+  // placement so the whole prior chain is consistent (see helper above).
+  this->applyInsHeadingPriorToBasePose();
+
+  // [REVIEW FIX 2026-07-08] Default validity time for this scan's T_prior /
+  // basePose: the scan header stamp. Every fallback branch below (deskew off,
+  // unsupported sensor, first scan, empty/short IMU history, integration
+  // failure) produces a pose that is best described by the header time; the
+  // main deskew path overrides this with the actual median point time.
+  this->t_prior_stamp_ = this->scan_stamp.seconds();
+
+  // [REVIEW FIX 2026-07-08 P2] Default: cloud NOT world-frame. Only branches
+  // that actually transform/place points into the world set this true.
+  // performLocalization() keys its seed/composition on this flag, not deskew_.
+  this->scan_in_world_frame_ = false;
 
   if (!this->deskew_ || !this->first_imu_received) {
     this->current_scan = this->original_scan;
@@ -2952,10 +3172,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
       if (frames.size() == 1 && matrixFinite(frames[0])) {
         this->T_prior = frames[0];
       } else {
-        this->T_prior = this->current_pose;
+        this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
       }
     } else {
-      this->T_prior = this->current_pose;
+      this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     }
 
     this->prev_scan_stamp = this->scan_stamp.seconds();
@@ -3041,6 +3261,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "Unsupported localization/sensor_type for deskew; using scan without motion "
                          "compensation");
+    // [REVIEW FIX 2026-07-08 P2] Sensor-frame cloud (scan_in_world_frame_
+    // stays false) and a VALID prior for this scan — previously T_prior kept
+    // its stale value from the last scan here.
+    this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     this->current_scan = this->original_scan;
     this->prev_scan_stamp = this->scan_stamp.seconds();
     return;
@@ -3072,7 +3296,12 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   if (timestamps.empty()) {
     RCLCPP_WARN(this->get_logger(), "No timestamps extracted from point cloud, skipping deskewing");
     this->last_scan_time_span_s_ = -1.0;
+    // [REVIEW FIX 2026-07-08 P2] Sensor-frame cloud (scan_in_world_frame_
+    // stays false); refresh T_prior and prev_scan_stamp (both previously left
+    // stale in this branch).
+    this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     this->current_scan = this->original_scan;
+    this->prev_scan_stamp = this->scan_stamp.seconds();
     return;
   }
 
@@ -3097,9 +3326,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   // Don't process scans on first iteration
   if (this->prev_scan_stamp == 0.0) {
     this->prev_scan_stamp = this->scan_stamp.seconds();
-    this->T_prior = this->current_pose;
+    this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
     this->current_scan = deskewed_scan_;
+    this->scan_in_world_frame_ = true;
     return;
   }
 
@@ -3109,6 +3339,9 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     if (this->imu_buffer.empty()) {
       RCLCPP_WARN(this->get_logger(), "IMU buffer is empty, skipping deskewing");
+      // [REVIEW FIX 2026-07-08 P2] Sensor-frame cloud (scan_in_world_frame_
+      // stays false); refresh T_prior (previously left stale here).
+      this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
       this->current_scan = this->original_scan;
       this->prev_scan_stamp = this->scan_stamp.seconds();  // Update timestamp
       return;
@@ -3122,9 +3355,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                            "Waiting for sufficient IMU history (oldest: %.3f, need: %.3f). Skipping deskewing.",
                            oldest_imu_time, this->prev_scan_stamp);
-      this->T_prior = this->current_pose;
+      this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
       pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
       this->current_scan = deskewed_scan_;
+      this->scan_in_world_frame_ = true;
       this->prev_scan_stamp = this->scan_stamp.seconds();  // Update timestamp
       return;
     }
@@ -3166,9 +3400,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
                 this->prev_scan_stamp, timestamps.back(),
                 this->imu_buffer.size(),
                 this->imu_buffer.empty() ? 0.0 : this->imu_buffer.back().stamp);
-    this->T_prior = this->current_pose;
+    this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
     this->current_scan = deskewed_scan_;
+    this->scan_in_world_frame_ = true;
     this->prev_scan_stamp = this->scan_stamp.seconds();  // Update timestamp
     return;
   }
@@ -3179,6 +3414,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
 
   // Update prior to be the estimated pose at the median time of the scan
   this->T_prior = frames[median_pt_index];
+  // [REVIEW FIX 2026-07-08] ...and record that time: basePose inherits it via
+  // the accept/reject paths in performLocalization, and the INS heading prior
+  // queries the INS buffer at exactly this stamp on the next scan.
+  this->t_prior_stamp_ = timestamps[median_pt_index];
 
   // Deskew each point using its timestamp
   #pragma omp parallel for
@@ -3194,6 +3433,7 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   }
 
   this->current_scan = deskewed_scan_;
+  this->scan_in_world_frame_ = true;
   this->prev_scan_stamp = this->scan_stamp.seconds();
 }
 
@@ -3272,17 +3512,22 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   // transformed cloud — LsqRegistration skips the fill, so this stays empty.
   pcl::PointCloud<PointType> aligned_scratch;
 
-  // When deskewing is enabled, points are already in world frame at T_prior,
-  // so GICP initial guess is Identity and final pose = T_corr * T_prior.
-  // When deskewing is disabled, points are still in lidar frame, so seed/solve
-  // in map<-lidar, then convert the optimizer output back to map<-base.
+  // When the cloud was actually placed in the world frame (main deskew path
+  // and the transforming fallbacks), GICP's initial guess is Identity and the
+  // final pose = T_corr * T_prior. Otherwise the points are still in the
+  // lidar frame, so seed/solve in map<-lidar and convert the optimizer output
+  // back to map<-base. [REVIEW FIX 2026-07-08 P2] Keyed on the per-scan
+  // scan_in_world_frame_ flag set by deskewPointcloud(), NOT on deskew_:
+  // several deskew fallback branches return a sensor-frame cloud while
+  // deskew_ is true, and registering that cloud under the world-frame
+  // assumption produced wrong-basin candidates at startup / IMU gaps.
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
   // PR#6: plain if-assignment instead of a ternary mixing two different
   // Eigen expression types (CwiseNullaryOp vs Product) — the ternary broke
   // package builds and had to be hot-patched in every replay worktree.
   Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
-  if (!this->deskew_) {
+  if (!this->scan_in_world_frame_) {
     initial_guess = this->T_prior * T_base_lidar;
   }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
@@ -3355,7 +3600,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
   const double hessian_condition = hessianConditionProxy(final_hessian);
   const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
-  const Eigen::Matrix4f candidate_pose = this->deskew_
+  const Eigen::Matrix4f candidate_pose = this->scan_in_world_frame_
       ? (optimizer_solution * this->T_prior)
       : (optimizer_solution * T_lidar_base);
   const bool candidate_pose_valid = matrixFinite(candidate_pose);
@@ -3661,6 +3906,10 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // P1 yaw-safety: raw GICP-vs-IMU yaw disagreement (pre-veto/projection).
     publish_float(this->dbg_yaw_innovation_pub, yaw_innov_raw_deg);
     publish_float(this->dbg_yaw_stiffness_pub, yaw_marginal_stiffness);
+    // INS-vs-prior yaw difference at this scan's integration seed (NaN when
+    // the INS prior did not run). Persistent nonzero = map-vs-ENU yaw
+    // misalignment or INS heading fault — measure, don't just blend harder.
+    publish_float(this->dbg_ins_yaw_diff_pub, this->last_ins_yaw_diff_deg_);
     // P4#3: per-frame concat/source-set record (merged_aux_count = -1 when
     // concat disabled; aux dt = NaN when that aux did not merge this frame).
     publish_float(this->dbg_merged_aux_count_pub,
@@ -3767,6 +4016,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " yaw_innov=[" << scalarSummary(yaw_innov_raw_deg, 2) << "deg,fin="
         << scalarSummary(yaw_innov_final_deg, 2) << "deg]"
         << " yaw_stiff=" << scalarSummary(yaw_marginal_stiffness, 1)
+        << " ins_dyaw=" << scalarSummary(this->last_ins_yaw_diff_deg_, 2) << "deg"
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
         << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
@@ -3802,7 +4052,15 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
   if (effectively_converged && candidate_pose_valid) {
-    if (fitness_score > this->gicp_fitness_reject_threshold_) {
+    if (!final_hessian.allFinite()) {
+      // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
+      // returns +inf, but every Hessian gate below requires
+      // std::isfinite(hessian_condition) — so these scans previously skipped
+      // Hessian protection entirely. A candidate whose curvature cannot even
+      // be evaluated offers nothing to trust or project: reject it and hold
+      // the IMU/INS prior.
+      gicp_rejected_hessian = true;
+    } else if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
     } else if (yaw_jump_final) {
       // P1 yaw-safety: hard yaw innovation gate vs the IMU prior, checked
@@ -3927,6 +4185,9 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
 
     this->basePose.p = new_p;
     this->basePose.q = q;
+    // [REVIEW FIX 2026-07-08] The accepted candidate is the pose at the median
+    // point time of this scan (the cloud was deskewed to frames[median]).
+    this->base_pose_stamp_ = this->t_prior_stamp_;
     // P3: pair the measurement with the IMU prior it was registered against
     // (both at median scan time) so updateState can form the time-free delta.
     this->observer_prior_pose_ = this->T_prior;
@@ -4028,6 +4289,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       q.normalize();
       this->basePose.p = new_p;
       this->basePose.q = q;
+      // [REVIEW FIX 2026-07-08] T_prior is also a median-point-time pose.
+      this->base_pose_stamp_ = this->t_prior_stamp_;
       {
         // P2#1 (stale-velocity bug): seed the next scan's IMU integration from
         // the CURRENT IMU-propagated velocity, not geo.prev_vel. geo.prev_vel
@@ -4163,6 +4426,11 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
   s.cov_pos_xx = msg->pose.covariance[0];
   s.cov_pos_yy = msg->pose.covariance[7];
   s.cov_pos_zz = msg->pose.covariance[14];
+  // [REVIEW FIX 2026-07-08] Carry the yaw variance (rad^2) the adapter
+  // publishes in pose.covariance[35] (Atlas rpy covariance, deg^2 -> rad^2).
+  // Consumed by the INS heading prior's yaw-quality gate. Generic publishers
+  // that leave the field at 0 are treated as "unpopulated" downstream.
+  s.cov_yaw = msg->pose.covariance[35];
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
@@ -4318,6 +4586,11 @@ bool gicp_plusplus::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
   out.cov_pos_xx = std::max(a->cov_pos_xx, b->cov_pos_xx);
   out.cov_pos_yy = std::max(a->cov_pos_yy, b->cov_pos_yy);
   out.cov_pos_zz = std::max(a->cov_pos_zz, b->cov_pos_zz);
+  // Same conservative-max policy for yaw variance (mirrors GLIM gnss_global's
+  // interpolation): an interpolated sample only reports healthy heading when
+  // BOTH bracketing samples do. max() also does the right thing when one
+  // neighbour is unpopulated (-1): the populated (real) variance wins.
+  out.cov_yaw = std::max(a->cov_yaw, b->cov_yaw);
   return true;
 }
 
@@ -4503,32 +4776,66 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
     return false;
   }
 
-  // Apply biases + seed state from the latest GT sample.
-  this->state.b.gyro = gyro_bias;
-  this->state.b.accel = accel_bias;
+  // [REVIEW FIX 2026-07-08 P2] Apply biases; seed POSE state only when
+  // nothing else has initialized the filter yet. Previously this always
+  // re-seeded state/geo.prev_* from the latest RTK sample but left
+  // current_pose / basePose / base_pose_stamp_ / prev_vel untouched:
+  //   * use_odom_init=true (already initialized): the observer state jumped
+  //     to the RTK sample while the GICP scan chain kept integrating from the
+  //     old basePose — two briefly divergent pose chains.
+  //   * use_odom_init=false: state was seeded but `initialized` was never
+  //     set, so callbackPointCloud waited forever.
+  // Now: bias-only once initialized; otherwise a FULL seed that mirrors
+  // applyInitialPose()/maybeSnapPoseToGT() (current_pose, basePose,
+  // base_pose_stamp_, prev_vel, observer state), publishing initialized=true
+  // LAST so a concurrent scan callback never sees a half-written seed.
+  const bool already_seeded = this->initialized.load();
+  const Eigen::Vector3f v_seed_world =
+      this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_lin_body;
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
-    this->state.p = this->latest_rtk_seed_.p;
-    this->state.q = this->latest_rtk_seed_.q;
-    this->state.v.lin.b = this->latest_rtk_seed_.v_lin_body;
-    this->state.v.lin.w = this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_lin_body;
-    this->state.v.ang.b = this->latest_rtk_seed_.v_ang_body;
-    this->state.v.ang.w = this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_ang_body;
-    this->geo.prev_p = this->latest_rtk_seed_.p;
-    this->geo.prev_q = this->latest_rtk_seed_.q;
-    this->geo.prev_vel = this->state.v.lin.w;
+    this->state.b.gyro = gyro_bias;
+    this->state.b.accel = accel_bias;
+    if (!already_seeded) {
+      this->state.p = this->latest_rtk_seed_.p;
+      this->state.q = this->latest_rtk_seed_.q;
+      this->state.v.lin.b = this->latest_rtk_seed_.v_lin_body;
+      this->state.v.lin.w = v_seed_world;
+      this->state.v.ang.b = this->latest_rtk_seed_.v_ang_body;
+      this->state.v.ang.w = this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_ang_body;
+      this->geo.prev_p = this->latest_rtk_seed_.p;
+      this->geo.prev_q = this->latest_rtk_seed_.q;
+      this->geo.prev_vel = v_seed_world;
+    }
+    ++this->geo.update_seq;  // discard in-flight propagateState computations
+  }
+  if (!already_seeded) {
+    Eigen::Matrix4f T_seed = Eigen::Matrix4f::Identity();
+    T_seed.block<3, 3>(0, 0) = this->latest_rtk_seed_.q.toRotationMatrix();
+    T_seed.block<3, 1>(0, 3) = this->latest_rtk_seed_.p;
+    {
+      std::lock_guard<std::mutex> lock(this->pose_mutex);
+      this->current_pose = T_seed;
+    }
+    this->basePose.p = this->latest_rtk_seed_.p;
+    this->basePose.q = this->latest_rtk_seed_.q;
+    this->base_pose_stamp_ = this->latest_rtk_seed_.stamp;
+    this->prev_vel = v_seed_world;
+    this->initialized = true;  // publish only after ALL pose state is consistent
   }
 
   this->imu_calibrated_ = true;
   RCLCPP_INFO(this->get_logger(),
-              "IMU calibrated (RTK-driven, %d samples, %.1fs): "
+              "IMU calibrated (RTK-driven, %d samples, %.1fs, %s): "
               "gyro_bias=[%.4f,%.4f,%.4f] accel_bias=[%.3f,%.3f,%.3f] "
               "seed_pos=[%.2f,%.2f,%.2f] seed_v=[%.2f,%.2f,%.2f]m/s",
               this->rtk_calib_count_, elapsed,
+              already_seeded ? "bias-only, pose chains already seeded"
+                             : "full pose seed",
               gyro_bias.x(), gyro_bias.y(), gyro_bias.z(),
               accel_bias.x(), accel_bias.y(), accel_bias.z(),
               this->latest_rtk_seed_.p.x(), this->latest_rtk_seed_.p.y(), this->latest_rtk_seed_.p.z(),
-              this->state.v.lin.w.x(), this->state.v.lin.w.y(), this->state.v.lin.w.z());
+              v_seed_world.x(), v_seed_world.y(), v_seed_world.z());
   return true;
 }
 
@@ -4688,6 +4995,8 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   }
   this->basePose.p = p_new;
   this->basePose.q = q_new;
+  // [REVIEW FIX 2026-07-08] The snap pose is the GT sample at the scan stamp.
+  this->base_pose_stamp_ = this->scan_stamp.seconds();
   this->prev_vel = v_base_world;
 
   RCLCPP_WARN(this->get_logger(),
