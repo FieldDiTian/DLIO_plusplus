@@ -212,6 +212,11 @@ bool LsqRegistration<PointTarget, PointSource>::step_gn(Eigen::Isometry3d& x0, E
   Eigen::Matrix<double, 6, 6> H;
   Eigen::Matrix<double, 6, 1> b;
   double y0 = linearize(x0, &H, &b);
+  // [REVIEW FIX 2026-07-08 P1] Keep the RAW LiDAR-geometry hessian for the
+  // consumer-facing final_hessian_: apply_constraints injects the DoF-mask
+  // pinning and rotation-prior information, which would otherwise leak
+  // artificial stiffness into the degeneracy / yaw-stiffness diagnostics.
+  const Eigen::Matrix<double, 6, 6> H_raw = H;
   y0 += apply_constraints(x0, &H, &b);
 
   Eigen::LDLT<Eigen::Matrix<double, 6, 6>> solver(H);
@@ -222,7 +227,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_gn(Eigen::Isometry3d& x0, E
   delta.translation() = d.tail<3>();
 
   x0 = delta * x0;
-  final_hessian_ = H;
+  final_hessian_ = H_raw;  // raw LiDAR geometry (see comment above)
   final_error_ = y0;
 
   return true;
@@ -233,6 +238,9 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
   Eigen::Matrix<double, 6, 6> H;
   Eigen::Matrix<double, 6, 1> b;
   double y0 = linearize(x0, &H, &b);
+  // [REVIEW FIX 2026-07-08 P1] Same raw-hessian capture as step_gn: the
+  // augmented system drives the LM solve only; diagnostics get pure geometry.
+  const Eigen::Matrix<double, 6, 6> H_raw = H;
   y0 += apply_constraints(x0, &H, &b);
 
   if (lm_lambda_ < 0.0) {
@@ -272,7 +280,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
 
     x0 = xi;
     lm_lambda_ = lm_lambda_ * std::max(1.0 / 3.0, 1 - std::pow(2 * rho - 1, 3));
-    final_hessian_ = H;
+    final_hessian_ = H_raw;  // raw LiDAR geometry (see comment above)
     final_error_ = yi;
     return true;
   }

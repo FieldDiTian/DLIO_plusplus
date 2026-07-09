@@ -163,21 +163,26 @@ private:
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
   // Geometric Observer functions
-  void propagateState();
+  void propagateState(const ImuMeas& imu_local);
   void updateState();
 
   // IMU integration functions
+  // [REVIEW FIX 2026-07-08 P1] Returns a COPY of the needed IMU slice
+  // (forward time order) taken while holding mtx_imu. The previous interface
+  // handed out boost::circular_buffer iterators that integrateImu()
+  // dereferenced lock-free while the (concurrent) IMU callback push_fronts —
+  // circular_buffer mutation invalidates/rotates those iterators: normal-path
+  // UB that could corrupt T_prior, per-point deskew and the yaw-vs-IMU gates
+  // exactly during high-rate turn segments.
   bool imuMeasFromTimeRange(double start_time, double end_time,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
+                            std::vector<ImuMeas>& out);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                  const std::vector<double>& sorted_timestamps);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                          const std::vector<double>& sorted_timestamps,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
+                         const std::vector<ImuMeas>& imu_slice);
 
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub;
@@ -388,7 +393,14 @@ private:
   Eigen::Matrix4f last_gicp_pose_;
   rclcpp::Time last_gicp_stamp_;
   bool last_gicp_valid_;
-  double last_fitness_score_{-1.0};  // -1 = no scan yet
+  double last_fitness_score_{-1.0};  // -1 = no scan yet (latest ATTEMPT, incl. rejected)
+  // [REVIEW FIX 2026-07-08 P2] Fitness of the last ACCEPTED scan only. The
+  // IMU-rate odometry covariance keys on this; last_fitness_score_ is written
+  // before the accept/reject decision (and can be +inf on a failed applied-
+  // pose re-score), so one rejected scan would otherwise publish huge or
+  // infinite covariance while last_gicp_valid_ was still true from an older
+  // accepted scan.
+  double last_accepted_fitness_score_{-1.0};
   double last_accepted_scan_stamp_{-1.0};  // s — stamp of last accepted GICP scan (P3 dead-reckon cov)
 
   // Trajectory. The actual ring of poses lives in path_buffer_ (deque, O(1)
@@ -416,6 +428,13 @@ private:
 
   // IMU calibration state
   std::atomic<bool> imu_calibrated_;
+  // [REVIEW FIX 2026-07-08 P2] Serializes the init/bias-calibration state
+  // machine (init_phase_, RTK/stationary accumulators, finalization). The IMU
+  // subscription is in a REENTRANT callback group under a
+  // MultiThreadedExecutor, so parallel IMU callbacks could otherwise corrupt
+  // the accumulator sums or double-finalize the calibration. Locked only
+  // while !imu_calibrated_ (startup); steady state never touches it.
+  std::mutex calib_mtx_;
   double imu_calib_time_;           // seconds to accumulate for calibration
   double imu_calib_start_stamp_;
   int imu_calib_count_;
@@ -570,6 +589,8 @@ private:
   double yaw_gate_hard_max_corr_deg_;    // HARD veto: unconditional yaw-corr bound (<=0 off) — P1 yaw-safety
   double gicp_nonconv_ok_max_trans_m_;   // PR#6: max correction for the non-converged fitness fallback (<=0 off)
   double gicp_nonconv_ok_max_rot_deg_;   // PR#6: max rotation for the non-converged fitness fallback (<=0 off)
+  int gicp_min_correspondences_;         // support gate: min inlier correspondences (<=0 off)
+  double gicp_min_corr_ratio_;           // support gate: min inliers/points ratio (<=0 off)
   // Algorithmic yaw-defect fixes (optimizer-level, 2026-07-05):
   std::string gicp_dof_mode_;            // "6dof" | "4dof" (fix roll/pitch, default) | "3dof" (fix attitude)
   int gicp_full6dof_every_n_;            // periodic unconstrained scan to re-anchor roll/pitch (0 = never)

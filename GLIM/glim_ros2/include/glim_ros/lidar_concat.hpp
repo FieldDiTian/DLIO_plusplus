@@ -31,9 +31,13 @@ struct AuxLidarSensor {
   Eigen::Isometry3d T_primary_sensor;
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> buffer;
   size_t buffer_size;
-  // P4#3 (GLIM parity with gicp_localization): signed header-time offset stats
-  // vs the primary (aux - primary), over MERGED scans only. A stable nonzero
-  // mean is the constant-per-aux-clock-offset signature vs the P1 timebase.
+  // Seconds ADDED to this aux LiDAR's header stamp and Luminar absolute
+  // per-point timestamps so matching/deskew use the primary/IMU timebase.
+  double time_offset = 0.0;
+  // P4#3 (GLIM parity with gicp_localization): signed corrected header-time
+  // offset stats vs the primary (aux + time_offset - primary), over MERGED
+  // scans only. A stable nonzero mean after correction means the configured
+  // per-aux clock offset is still wrong or missing.
   double dt_sum = 0.0;
   double dt_min = std::numeric_limits<double>::infinity();
   double dt_max = -std::numeric_limits<double>::infinity();
@@ -121,11 +125,12 @@ inline void transform_cloud_data(
 inline sensor_msgs::msg::PointCloud2::SharedPtr find_nearest(
   const std::deque<sensor_msgs::msg::PointCloud2::SharedPtr>& buffer,
   double target_sec,
-  double threshold) {
+  double threshold,
+  double aux_time_offset = 0.0) {
   sensor_msgs::msg::PointCloud2::SharedPtr best;
   double best_dt = std::numeric_limits<double>::max();
   for (const auto& msg : buffer) {
-    double dt = std::abs(stamp_to_sec(msg->header.stamp) - target_sec);
+    double dt = std::abs(stamp_to_sec(msg->header.stamp) + aux_time_offset - target_sec);
     if (dt < best_dt) {
       best_dt = dt;
       best = msg;
@@ -166,10 +171,9 @@ inline bool find_time_field(const sensor_msgs::msg::PointCloud2& msg, int& time_
 // untouched below (e.g. skip the shift when values look epoch-scaled).
 //
 // ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns):
-// must NOT be shifted. Each point already carries its absolute capture
-// time; the deskewer computes (t_i - merged_header.stamp) and naturally
-// produces the correct (T_aux - T_primary + intra-aux-offset). Adding dt
-// here would double-count the inter-scan offset.
+// do not get the header-relative dt shift. They are shifted only by the
+// configured constant aux clock correction, if any, because TimeKeeper uses
+// absolute epoch values directly for deskew.
 //
 // Luminar timestamp format (Luminar Iris Data Output Specification v1.3.0):
 // the sensor does NOT emit a single uint64 epoch-ns field -- it carries
@@ -186,15 +190,14 @@ inline void shift_cloud_timestamps(
   int time_off,
   uint8_t time_datatype,
   int time_count,
-  double dt) {
+  double dt,
+  double abs_clock_shift_s = 0.0) {
   if (time_off < 0) return;
 
   // UINT8[8] (Luminar Iris uint64 PTP epoch nanoseconds -- driver reconstruction of
-  // header seconds + per-ray nanoseconds) is ABSOLUTE and must never be shifted, so
-  // skip the whole per-point loop for it. The count check is done ONCE here (not per
-  // point): any UINT8 count != 8 is not a recognised timestamp encoding, so warn once
-  // -- mirroring extract_raw_points()'s `count != 8` rejection -- and leave untouched
-  // (there is no correct shift for an unknown layout).
+  // header seconds + per-ray nanoseconds) is ABSOLUTE: skip the header-relative dt
+  // shift, but apply a configured constant clock correction so aux clouds align with
+  // the primary/IMU timebase before GLIM deskew.
   if (time_datatype == sensor_msgs::msg::PointField::UINT8) {
     if (time_count != 8) {
       static bool warned_uint8_count = false;
@@ -202,6 +205,60 @@ inline void shift_cloud_timestamps(
         spdlog::warn("shift_cloud_timestamps: UINT8 time field with count={} (expected 8 for Luminar epoch-ns); leaving unshifted", time_count);
         warned_uint8_count = true;
       }
+      (void)dt;
+      (void)abs_clock_shift_s;
+      return;
+    }
+    if (abs_clock_shift_s == 0.0) {
+      (void)dt;
+      return;
+    }
+    if (!std::isfinite(abs_clock_shift_s)) {
+      static bool warned_uint8_nonfinite = false;
+      if (!warned_uint8_nonfinite) {
+        spdlog::warn("shift_cloud_timestamps: non-finite UINT8[8] clock correction {}; leaving unshifted",
+                     abs_clock_shift_s);
+        warned_uint8_nonfinite = true;
+      }
+      (void)dt;
+      return;
+    }
+    if (point_step == 0 || static_cast<uint32_t>(time_off) + sizeof(uint64_t) > point_step) {
+      static bool warned_uint8_bounds = false;
+      if (!warned_uint8_bounds) {
+        spdlog::warn("shift_cloud_timestamps: UINT8[8] time field offset={} does not fit point_step={}; leaving unshifted",
+                     time_off, point_step);
+        warned_uint8_bounds = true;
+      }
+      (void)dt;
+      return;
+    }
+    const double offset_ns_d = abs_clock_shift_s * 1e9;
+    if (offset_ns_d > static_cast<double>(std::numeric_limits<int64_t>::max()) ||
+        offset_ns_d < static_cast<double>(std::numeric_limits<int64_t>::min())) {
+      static bool warned_uint8_range = false;
+      if (!warned_uint8_range) {
+        spdlog::warn("shift_cloud_timestamps: UINT8[8] clock correction {}s is out of int64 ns range; leaving unshifted",
+                     abs_clock_shift_s);
+        warned_uint8_range = true;
+      }
+      (void)dt;
+      return;
+    }
+    const int64_t offset_ns = static_cast<int64_t>(offset_ns_d);
+    const size_t num_points = data.size() / point_step;
+    for (size_t i = 0; i < num_points; i++) {
+      uint8_t* time_ptr = &data[i * point_step + time_off];
+      uint64_t val;
+      std::memcpy(&val, time_ptr, sizeof(uint64_t));
+      if (offset_ns >= 0) {
+        const uint64_t add = static_cast<uint64_t>(offset_ns);
+        val = (std::numeric_limits<uint64_t>::max() - val < add) ? std::numeric_limits<uint64_t>::max() : val + add;
+      } else {
+        const uint64_t sub = static_cast<uint64_t>(-(offset_ns + 1)) + 1ULL;
+        val = (val > sub) ? (val - sub) : 0;
+      }
+      std::memcpy(time_ptr, &val, sizeof(uint64_t));
     }
     (void)dt;
     return;
@@ -410,7 +467,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 
   for (size_t aux_i = 0; aux_i < aux_sensors.size(); ++aux_i) {
     auto& aux = aux_sensors[aux_i];
-    auto match = find_nearest(aux.buffer, t_primary, time_threshold);
+    auto match = find_nearest(aux.buffer, t_primary, time_threshold, aux.time_offset);
     if (!match) {
       spdlog::debug("lidar_concat: no match for {} (t={:.3f})", aux.topic, t_primary);
       continue;
@@ -447,10 +504,12 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     int time_off;
     uint8_t time_datatype;
     int time_count;
-    const double dt = stamp_to_sec(match->header.stamp) - t_primary;
+    const double raw_dt = stamp_to_sec(match->header.stamp) - t_primary;
+    const double dt = raw_dt + aux.time_offset;
     if (find_time_field(*match, time_off, time_datatype, time_count)) {
-      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt);
-      spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s", aux.topic, dt);
+      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt, aux.time_offset);
+      spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s (raw_dt={:.6f}s, clock_offset={:.6f}s)",
+                    aux.topic, dt, raw_dt, aux.time_offset);
     }
 
     const size_t aux_pts = data.size() / point_step;
@@ -460,13 +519,12 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     total_points += aux_pts;
     ++merged_aux_count;
 
-    spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, std::abs(dt), aux_pts);
+    spdlog::debug("lidar_concat: merged {} (corrected_dt={:.4f}s, raw_dt={:.4f}s, {} pts)",
+                  aux.topic, std::abs(dt), raw_dt, aux_pts);
 
     // P4#3: per-frame + running merge-timing diagnostics (parity with
-    // gicp_localization). dt here is SIGNED (aux header - primary header): a
-    // stable nonzero mean across the run is the constant per-aux clock-offset
-    // signature vs the P1 timebase, and it distorts the map's deskew at high
-    // yaw rates exactly like it does localization's.
+    // gicp_localization). dt here is SIGNED and corrected into the primary/IMU
+    // timebase: (aux header + configured offset - primary header).
     diag_aux_dt[aux_i] = dt;
     diag_aux_pts[aux_i] = aux_pts;
     aux.dt_sum += dt;
@@ -475,9 +533,9 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     if (++aux.dt_count % 512 == 0) {  // ~every 50 s at 10 Hz
       const double mean = aux.dt_sum / static_cast<double>(aux.dt_count);
       spdlog::info(
-        "lidar_concat: '{}' header offset vs primary over {} merges: mean={:+.1f} ms, min={:+.1f} ms, max={:+.1f} ms{}",
+        "lidar_concat: '{}' corrected header offset vs primary over {} merges: mean={:+.1f} ms, min={:+.1f} ms, max={:+.1f} ms{}",
         aux.topic, aux.dt_count, 1e3 * mean, 1e3 * aux.dt_min, 1e3 * aux.dt_max,
-        std::abs(mean) > 0.02 ? " — mean >20 ms: likely constant clock offset, consider a per-aux time correction" : "");
+        std::abs(mean) > 0.02 ? " -- mean >20 ms: configured per-aux time correction is missing or wrong" : "");
     }
   }
 
@@ -558,6 +616,19 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   }
 
   const auto aux_topics = config_sensors.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
+  const auto aux_time_offsets = config_sensors.param<std::vector<double>>("lidar_concat", "aux_time_offsets", {});
+  if (!aux_topics.empty()) {
+    if (aux_time_offsets.size() < aux_topics.size()) {
+      spdlog::warn(
+        "lidar_concat: aux_time_offsets has {}/{} entries; missing entries default to 0.0. "
+        "If aux LiDAR clocks have a constant offset vs the primary/IMU clock, configure "
+        "lidar_concat/aux_time_offsets in aux_topics order.",
+        aux_time_offsets.size(), aux_topics.size());
+    } else if (aux_time_offsets.size() > aux_topics.size()) {
+      spdlog::warn("lidar_concat: aux_time_offsets has {} entries for {} aux lidars; extra entries will be ignored",
+                   aux_time_offsets.size(), aux_topics.size());
+    }
+  }
 
   // A REQUIRED merge that is enabled with no aux topics is a config error. Hard-fail
   // only when the strict path is also set to abort; otherwise it is handled at
@@ -596,6 +667,7 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     AuxLidarSensor sensor;
     sensor.topic = topic;
     sensor.buffer_size = out.buffer_size;
+    sensor.time_offset = (i < aux_time_offsets.size()) ? aux_time_offsets[i] : 0.0;
 
     if (use_urdf) {
       const std::string& aux_frame = aux_frames[i];
@@ -629,7 +701,7 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
       sensor.T_primary_sensor = Eigen::Isometry3d(mat);
     }
 
-    spdlog::info("lidar_concat: auxiliary sensor {} enabled", sensor.topic);
+    spdlog::info("lidar_concat: auxiliary sensor {} enabled (time_offset={:+.6f}s)", sensor.topic, sensor.time_offset);
     out.aux_sensors.push_back(std::move(sensor));
   }
   spdlog::info("lidar_concat: {} auxiliary sensors, threshold={:.3f}s", out.aux_sensors.size(), out.time_threshold);

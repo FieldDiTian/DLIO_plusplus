@@ -478,6 +478,18 @@
     # 99->3; p90 INS err 21.6->12.7 m.
     gicp/nonConvergedFitnessOkMaxTransM: 3.0
     gicp/nonConvergedFitnessOkMaxRotDeg: 5.0
+
+    # Minimum correspondence-support gate (REVIEW FIX 2026-07-08). Mean
+    # fitness over a handful of inliers can look excellent while the scan
+    # barely overlaps the map (front-only frames with require_all_aux: false,
+    # heavy crop/blockage) — require both an absolute inlier count and an
+    # inlier fraction of the (voxel-filtered) scan. Support is re-evaluated at
+    # the APPLIED pose whenever degeneracy projection / the yaw veto modified
+    # it (status: rejected_support; SCAN DEBUG: support=[count,ratio,reeval]).
+    # <=0 disables either bound. Re-baseline against a replay scorecard if the
+    # scan preprocessing (voxel size, crop) changes materially.
+    gicp/minCorrespondences: 500
+    gicp/minCorrespondenceRatio: 0.2
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
 
     # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========
@@ -559,6 +571,8 @@
     #    only via GT snap); "6dof" restores upstream behavior. Every
     #    full6dofEveryN-th scan runs unconstrained so roll/pitch re-anchor to
     #    map structure and slow gyro drift cannot accumulate in fixed axes.
+    #    Since 2026-07-08 the mask is EXACT (masked delta components zeroed
+    #    each LM step), not a soft 1e9 damping — "fixed" now means fixed.
     gicp/dof/mode: "4dof"
     gicp/dof/full6dofEveryN: 10
     # 2) Soft attitude prior INSIDE the optimizer (the deep P1 cause: no IMU

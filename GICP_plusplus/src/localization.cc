@@ -1087,8 +1087,17 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
     }
   }
 
-  // Use Reentrant callback group so IMU can process in parallel with pointcloud processing
-  this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  // [REVIEW FIX 2026-07-08 P1] MutuallyExclusive, not Reentrant. IMU still
+  // runs in PARALLEL with pointcloud processing (different callback groups) —
+  // exclusivity only serializes IMU-vs-IMU. Reentrant IMU callbacks could
+  // interleave so an older callback propagated a newer sample (or two
+  // callbacks propagated the same one), and the propagateState() commit
+  // guard (geo.update_seq, which IMU commits do not advance) let the older
+  // propagation overwrite the newer state. Serial in-order IMU processing
+  // removes the entire class: monotonic buffer, one propagation per sample,
+  // ordered commits, and the function-local static counters become safe.
+  // Cost: none in practice — propagateState is O(100 us) at ~100 Hz.
+  this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto imu_sub_opt = rclcpp::SubscriptionOptions();
   imu_sub_opt.callback_group = this->imu_cb_group;
 
@@ -1527,6 +1536,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // performLocalization). Defaults from the PR validation replay.
   this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxTransM", 3.0);
   this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxRotDeg", 5.0);
+  this->declare_parameter<int>("gicp/minCorrespondences", 500);
+  this->declare_parameter<double>("gicp/minCorrespondenceRatio", 0.2);
   // ---- Algorithmic yaw-defect fixes (2026-07-05 deep-cause report) ----
   // Registration DoF for a ground vehicle. "4dof" (default) fixes roll+pitch
   // to the IMU prior inside the optimizer (translation+yaw free); "3dof"
@@ -1579,6 +1590,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("gicp/yawGate/hardMaxCorrDeg", this->yaw_gate_hard_max_corr_deg_);
   this->get_parameter("gicp/nonConvergedFitnessOkMaxTransM", this->gicp_nonconv_ok_max_trans_m_);
   this->get_parameter("gicp/nonConvergedFitnessOkMaxRotDeg", this->gicp_nonconv_ok_max_rot_deg_);
+  this->get_parameter("gicp/minCorrespondences", this->gicp_min_correspondences_);
+  this->get_parameter("gicp/minCorrespondenceRatio", this->gicp_min_corr_ratio_);
   this->get_parameter("gicp/dof/mode", this->gicp_dof_mode_);
   this->get_parameter("gicp/dof/full6dofEveryN", this->gicp_full6dof_every_n_);
   this->get_parameter("gicp/prior/yawInfo", this->gicp_prior_yaw_info_);
@@ -1756,6 +1769,17 @@ void gicp_plusplus::LocalizationNode::getParams() {
       RCLCPP_INFO(this->get_logger(),
                   "lidar_concat enabled: %zu aux lidars, time_threshold=%.3fs, buffer_size=%zu",
                   this->aux_lidars_.size(), this->concat_time_threshold_, this->concat_buffer_size_);
+      if (this->concat_aux_time_offsets_.size() < this->aux_lidars_.size()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "lidar_concat: aux_time_offsets has %zu/%zu entries; missing entries default to 0.0. "
+                    "If aux LiDAR clocks have a constant offset vs the primary/IMU clock, configure "
+                    "localization/lidar_concat/aux_time_offsets in aux_topics order.",
+                    this->concat_aux_time_offsets_.size(), this->aux_lidars_.size());
+      } else if (this->concat_aux_time_offsets_.size() > this->aux_lidars_.size()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "lidar_concat: aux_time_offsets has %zu entries for %zu aux lidars; extra entries will be ignored",
+                    this->concat_aux_time_offsets_.size(), this->aux_lidars_.size());
+      }
       for (const auto& a : this->aux_lidars_) {
         RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
                     a->topic.c_str(), a->frame.c_str());
@@ -2177,8 +2201,14 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
     this->state.v.lin.b = Eigen::Vector3f::Zero();
     this->state.v.ang.w = Eigen::Vector3f::Zero();
     this->state.v.ang.b = Eigen::Vector3f::Zero();
-    this->state.b.accel = Eigen::Vector3f::Zero();
-    this->state.b.gyro = Eigen::Vector3f::Zero();
+    // [REVIEW FIX 2026-07-08 P3] Preserve calibrated IMU biases: reinit moves
+    // the POSE estimate, it does not invalidate the sensor calibration.
+    // Zeroing here while imu_calibrated_ stayed true meant callbackImu kept
+    // subtracting a zero bias — calibration silently stopped being used.
+    if (!this->imu_calibrated_.load()) {
+      this->state.b.accel = Eigen::Vector3f::Zero();
+      this->state.b.gyro = Eigen::Vector3f::Zero();
+    }
     this->geo.prev_p = position;
     this->geo.prev_q = orientation;
     this->geo.prev_vel = Eigen::Vector3f::Zero();
@@ -2236,8 +2266,13 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     this->state.v.lin.b = Eigen::Vector3f::Zero();
     this->state.v.ang.w = Eigen::Vector3f::Zero();
     this->state.v.ang.b = Eigen::Vector3f::Zero();
-    this->state.b.accel = Eigen::Vector3f::Zero();
-    this->state.b.gyro = Eigen::Vector3f::Zero();
+    // [REVIEW FIX 2026-07-08 P3] Same bias preservation as the param-pose
+    // path — /initialpose (RViz) reinit must not discard RTK/stationary
+    // calibration while imu_calibrated_ remains true.
+    if (!this->imu_calibrated_.load()) {
+      this->state.b.accel = Eigen::Vector3f::Zero();
+      this->state.b.gyro = Eigen::Vector3f::Zero();
+    }
     this->geo.prev_p = p;
     this->geo.prev_q = q;
     this->geo.prev_vel = Eigen::Vector3f::Zero();
@@ -2916,20 +2951,40 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     uint8_t time_dt_type;
     int time_count;
     const bool has_time_field = findTimeField(*match, time_off, time_dt_type, time_count);
-    if (has_time_field) {
+    const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
+    // [REVIEW FIX 2026-07-08 P3] For Luminar, "a time field exists" is not
+    // "the time field is usable": the decoder accepts ONLY the 8-byte
+    // absolute carriers (UINT8[8] raw uint64 epoch ns, or the same bits
+    // mislabelled FLOAT64). Any other schema (e.g. a UINT32 relative counter)
+    // is rejected per point later, silently collapsing deskew to a rigid
+    // transform for rays that were merged as if they carried time. Treat an
+    // unsupported Luminar schema like a missing time field here so the aux is
+    // DROPPED under deskew instead.
+    const bool usable_time_field = has_time_field &&
+        (!luminar_u64 ||
+         time_dt_type == sensor_msgs::msg::PointField::FLOAT64 ||
+         (time_dt_type == sensor_msgs::msg::PointField::UINT8 && time_count == 8));
+    if (usable_time_field) {
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
       const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
-      const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
       shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64,
                            aux_clock_off);
     } else if (this->deskew_) {
       // Without per-point timestamps the aux rays would deskew against the
       // primary scan's IMU integration with a stale (aux-header) reference,
-      // smearing them. Drop the aux when deskew is enabled and times are absent.
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "lidar_concat: skipping '%s' — deskew enabled but no time field found",
-                           aux.topic.c_str());
+      // smearing them. Drop the aux when deskew is enabled and times are
+      // absent or (Luminar) unusable.
+      if (has_time_field) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "lidar_concat: skipping '%s' — unsupported Luminar time schema "
+                             "(datatype=%u count=%d; need UINT8[8] or FLOAT64 epoch-ns)",
+                             aux.topic.c_str(), static_cast<unsigned>(time_dt_type), time_count);
+      } else {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "lidar_concat: skipping '%s' — deskew enabled but no time field found",
+                             aux.topic.c_str());
+      }
       merged->data.resize(old_size);
       continue;
     }
@@ -3393,13 +3448,22 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
 
   // If there are no frames between the start and end of the sweep, use previous transform
   if (frames.size() != timestamps.size()) {
+    // [REVIEW FIX 2026-07-08 P3] Snapshot buffer stats under mtx_imu — the
+    // IMU callback push_fronts concurrently, so even this log-only read of
+    // size()/back() was a data race.
+    size_t imu_buf_size = 0;
+    double imu_oldest_stamp = 0.0;
+    {
+      std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
+      imu_buf_size = this->imu_buffer.size();
+      if (!this->imu_buffer.empty()) imu_oldest_stamp = this->imu_buffer.back().stamp;
+    }
     RCLCPP_WARN(this->get_logger(),
                 "IMU integration failed! Got %lu frames for %lu timestamps. "
                 "Time range: [%.3f, %.3f], IMU buffer size: %lu, first IMU: %.3f",
                 frames.size(), timestamps.size(),
                 this->prev_scan_stamp, timestamps.back(),
-                this->imu_buffer.size(),
-                this->imu_buffer.empty() ? 0.0 : this->imu_buffer.back().stamp);
+                imu_buf_size, imu_oldest_stamp);
     this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
     this->current_scan = deskewed_scan_;
@@ -3719,6 +3783,44 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       (degen.valid && degen.modified && matrixFinite(degen.projected_pose))
           ? degen.projected_pose : candidate_pose;
 
+  // [REVIEW FIX 2026-07-08 P1] When the pose being APPLIED differs from the
+  // optimizer solution (degeneracy projection and/or yaw veto modified it),
+  // re-validate fitness and correspondence support AT final_candidate. The
+  // raw optimizer fitness describes a pose nobody is applying: a wrong-basin
+  // solution with plausible raw fitness could have its yaw vetoed and still
+  // land its translation unvalidated. One extra kd-tree/linearize pass, and
+  // only on modified (degenerate/vetoed) frames. If the modified pose cannot
+  // be evaluated at all, fail safe: force the fitness gate to reject.
+  int support_corr = num_correspondences;
+  double support_ratio = correspondence_ratio;
+  bool fitness_reevaluated = false;
+  if (candidate_pose_valid && degen.valid && degen.modified &&
+      matrixFinite(final_candidate)) {
+    const Eigen::Matrix4f T_eval = this->scan_in_world_frame_
+        ? Eigen::Matrix4f(final_candidate * this->T_prior.inverse())
+        : Eigen::Matrix4f(final_candidate * T_base_lidar);
+    double fit_applied = std::numeric_limits<double>::quiet_NaN();
+    int corr_applied = 0;
+    fitness_reevaluated = true;
+    if (this->gicp.evaluateFitnessAt(T_eval, &fit_applied, &corr_applied)) {
+      fitness_score = fit_applied;
+      this->last_fitness_score_ = fitness_score;
+      support_corr = corr_applied;
+      support_ratio = this->current_scan->points.empty()
+          ? 0.0
+          : static_cast<double>(corr_applied) /
+                static_cast<double>(this->current_scan->points.size());
+      if (fitness_baseline > 1e-9 && std::isfinite(fitness_score)) {
+        fitness_ratio = fitness_score / fitness_baseline;
+      }
+    } else {
+      fitness_score = std::numeric_limits<double>::infinity();
+      this->last_fitness_score_ = fitness_score;
+      support_corr = 0;
+      support_ratio = 0.0;
+    }
+  }
+
   double guess_to_solution_trans = -1.0;
   double guess_to_solution_rot_deg = -1.0;
   if (candidate_pose_valid) {
@@ -4010,6 +4112,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " final_error=" << scalarSummary(final_error, 6)
         << " correspondences=" << num_correspondences << "/" << this->current_scan->points.size()
         << " ratio=" << scalarSummary(correspondence_ratio, 3)
+        << " support=[" << support_corr << "," << scalarSummary(support_ratio, 3)
+        << ",reeval=" << (fitness_reevaluated ? 1 : 0) << "]"
         << " guess_to_solution=[" << scalarSummary(guess_to_solution_trans) << "m,"
         << scalarSummary(guess_to_solution_rot_deg) << "deg]"
         << " jump=[" << scalarSummary(jump_trans) << "m," << scalarSummary(jump_rot_deg) << "deg]"
@@ -4051,6 +4155,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_jump = false;
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
+  bool gicp_rejected_support = false;
   if (effectively_converged && candidate_pose_valid) {
     if (!final_hessian.allFinite()) {
       // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
@@ -4060,7 +4165,20 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       // be evaluated offers nothing to trust or project: reject it and hold
       // the IMU/INS prior.
       gicp_rejected_hessian = true;
-    } else if (fitness_score > this->gicp_fitness_reject_threshold_) {
+    } else if ((this->gicp_min_correspondences_ > 0 &&
+                support_corr < this->gicp_min_correspondences_) ||
+               (this->gicp_min_corr_ratio_ > 0.0 &&
+                support_ratio < this->gicp_min_corr_ratio_)) {
+      // [REVIEW FIX 2026-07-08 P3] Minimum-support gate: mean fitness over a
+      // HANDFUL of inliers can look excellent while the scan barely overlaps
+      // the map (require_all_aux=false front-only frames, crop/blockage).
+      // Support is evaluated at the APPLIED pose when it was re-scored above.
+      gicp_rejected_support = true;
+    } else if (!std::isfinite(fitness_score) ||
+               fitness_score > this->gicp_fitness_reject_threshold_) {
+      // [REVIEW FIX 2026-07-08 P2] NaN fitness fails CLOSED: `NaN > x` is
+      // false, so without this check a NaN score sailed through every
+      // fitness comparison and the scan was accepted unvalidated.
       gicp_rejected_fitness = true;
     } else if (yaw_jump_final) {
       // P1 yaw-safety: hard yaw innovation gate vs the IMU prior, checked
@@ -4117,7 +4235,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_hessian && !gicp_rejected_jump &&
-                             !gicp_rejected_yaw;
+                             !gicp_rejected_yaw && !gicp_rejected_support;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
@@ -4129,6 +4247,12 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
                 fitness_score, this->gicp_fitness_reject_threshold_,
                 build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_support) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (support: corr=%d ratio=%.3f below min [%d, %.3f]): %s",
+                support_corr, support_ratio,
+                this->gicp_min_correspondences_, this->gicp_min_corr_ratio_,
+                build_scan_debug_log("rejected_support").c_str());
   } else if (gicp_rejected_yaw) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (yaw innovation %.2f deg > eff %.2f deg vs IMU prior @ scan_dt=%.3fs — "
@@ -4201,15 +4325,25 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     } else {
       // Initialize or update geometric observer
       if (!this->geo.first_opt_done) {
-        // First time: initialize state to GICP result
+        // First time: initialize state to GICP result.
+        // [REVIEW FIX 2026-07-08 P2/P3] Under geo.mtx — IMU callbacks are in a
+        // REENTRANT group and propagateState may be mid-flight — and the
+        // calibrated IMU biases are PRESERVED: the RTK / stationary
+        // calibration paths write state.b.* before the first accepted scan,
+        // and unconditionally zeroing them here silently discarded that
+        // calibration on non-odom-init setups (use_odom_init=true was immune
+        // only because odom init sets first_opt_done, skipping this branch).
+        std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
         this->state.p = new_p;
         this->state.q = q;
         this->state.v.lin.w = Eigen::Vector3f::Zero();
         this->state.v.lin.b = Eigen::Vector3f::Zero();
         this->state.v.ang.w = Eigen::Vector3f::Zero();
         this->state.v.ang.b = Eigen::Vector3f::Zero();
-        this->state.b.accel = Eigen::Vector3f::Zero();
-        this->state.b.gyro = Eigen::Vector3f::Zero();
+        if (!this->imu_calibrated_.load()) {
+          this->state.b.accel = Eigen::Vector3f::Zero();
+          this->state.b.gyro = Eigen::Vector3f::Zero();
+        }
 
         // Initialize geo tracking
         this->geo.prev_p = this->state.p;
@@ -4218,6 +4352,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
 
         // Mark as initialized
         this->geo.first_opt_done = true;
+        ++this->geo.update_seq;  // discard in-flight propagateState computations
 
         RCLCPP_INFO(this->get_logger(), "Geometric observer initialized to pos=[%.2f,%.2f,%.2f]",
                     new_p.x(), new_p.y(), new_p.z());
@@ -4250,6 +4385,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       this->last_gicp_pose_ = this->current_pose;
       this->last_gicp_stamp_ = this->scan_stamp;
       this->last_gicp_valid_ = true;
+      // [REVIEW FIX 2026-07-08 P2] Record the ACCEPTED fitness here (and only
+      // here) so the IMU-rate odometry covariance reflects the last accepted
+      // scan's quality — not the latest attempt, which may be a rejection
+      // with an inflated/+inf score.
+      if (std::isfinite(fitness_score) && fitness_score >= 0.0) {
+        this->last_accepted_fitness_score_ = fitness_score;
+      }
     }
 
     // Reset consecutive-failure counter on any accepted scan so the GT-recovery
@@ -4277,6 +4419,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
+                       : gicp_rejected_support ? "insufficient correspondence support"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
                        : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
@@ -4806,6 +4949,12 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
       this->geo.prev_p = this->latest_rtk_seed_.p;
       this->geo.prev_q = this->latest_rtk_seed_.q;
       this->geo.prev_vel = v_seed_world;
+      // [REVIEW FIX 2026-07-08 P2] The state is a complete, valid estimate
+      // (pose + velocities + biases): mark the observer initialized, exactly
+      // as GT odom-init does. Otherwise the first accepted GICP scan entered
+      // the first-time observer branch, which (previously) zeroed the freshly
+      // calibrated biases and (still) discards the seeded velocities.
+      this->geo.first_opt_done = true;
     }
     ++this->geo.update_seq;  // discard in-flight propagateState computations
   }
@@ -5143,7 +5292,23 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
   {
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     if (!this->imu_buffer.empty()) {
-      imu_meas_temp.dt = stamp - this->imu_buffer.front().stamp;
+      const double newest_stamp = this->imu_buffer.front().stamp;
+      // [REVIEW FIX 2026-07-08 P2] Enforce buffer monotonicity. The IMU
+      // subscription is in a REENTRANT callback group: two callbacks can
+      // finish out of timestamp order, which previously produced a NEGATIVE
+      // dt and a non-monotonic buffer — imuMeasFromTimeRange() assumes strict
+      // newest-to-oldest order, so a single inversion corrupts propagation,
+      // deskew and the yaw priors. Drop the regressed/duplicate sample; at
+      // 100+ Hz the information loss is negligible and every downstream
+      // invariant holds.
+      if (stamp <= newest_stamp) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "IMU sample out of order (%.6f <= newest %.6f) — dropped to keep "
+                             "the buffer monotonic (reentrant callback race)",
+                             stamp, newest_stamp);
+        return;
+      }
+      imu_meas_temp.dt = stamp - newest_stamp;
     } else {
       imu_meas_temp.dt = 0.0;
     }
@@ -5181,6 +5346,19 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
   // that unseeded window the original WAITING -> RTK/STATIONARY fallback logic
   // still applies so we reach a first fix as fast as possible.
   if (!this->imu_calibrated_) {
+    // [REVIEW FIX 2026-07-08 P2] Serialize the init/bias-calibration state
+    // machine. The IMU subscription is in a REENTRANT callback group under a
+    // MultiThreadedExecutor: without this lock, parallel IMU callbacks could
+    // interleave in the WAITING/RTK/STATIONARY phase transitions, corrupt the
+    // RTK/stationary accumulator sums, or double-finalize the calibration.
+    // Scope: startup only — once imu_calibrated_ is true the outer atomic
+    // check bypasses the lock forever.
+    std::lock_guard<std::mutex> calib_lock(this->calib_mtx_);
+    if (this->imu_calibrated_) {
+      // Another IMU thread finalized calibration while we waited on the
+      // lock; fall through to normal propagation below.
+    } else {
+
     InitPhase phase = this->init_phase_.load();
 
     // True once we have something stable to propagate from. Mirrors the
@@ -5261,25 +5439,32 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
         Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
         Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
 
-        this->state.b.gyro = gyro_avg;
-
         Eigen::Vector3f grav_world(0.f, 0.f, -1.f);
         Eigen::Vector3f grav_body = accel_avg.normalized();
         Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(grav_body, grav_world);
 
         Eigen::Vector3f expected_grav_body = q_init.conjugate()._transformVector(
             Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
-        this->state.b.accel = accel_avg - expected_grav_body;
 
-        // Only adopt the accel-derived orientation when we have no better one.
-        // If a pose source already seeded orientation (param or GT odom-init),
-        // keep it -- overwriting it here would jerk the already-published
-        // estimate, and the stationary assumption is invalid if that seed came
-        // from a moving vehicle.
-        if (!this->use_param_initial_pose_ && !this->use_odom_init_applied_) {
+        // [REVIEW FIX 2026-07-08 P3] ALL observer-state writes under geo.mtx.
+        // The IMU subscription runs in a REENTRANT callback group, so parallel
+        // IMU callbacks can be inside propagateState()/bias reads while this
+        // branch fires — the previous unlocked state.b.gyro / state.b.accel
+        // stores were a real data race.
+        {
           std::lock_guard<std::mutex> lock(this->geo.mtx);
-          this->state.q = q_init;
-          this->geo.prev_q = q_init;
+          this->state.b.gyro = gyro_avg;
+          this->state.b.accel = accel_avg - expected_grav_body;
+          // Only adopt the accel-derived orientation when we have no better
+          // one. If a pose source already seeded orientation (param or GT
+          // odom-init), keep it -- overwriting it here would jerk the
+          // already-published estimate, and the stationary assumption is
+          // invalid if that seed came from a moving vehicle.
+          if (!this->use_param_initial_pose_ && !this->use_odom_init_applied_) {
+            this->state.q = q_init;
+            this->geo.prev_q = q_init;
+          }
+          ++this->geo.update_seq;  // discard in-flight propagateState computations
         }
 
         this->imu_calibrated_ = true;
@@ -5300,17 +5485,22 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
       // Seeded: fall through and propagate while stationary stats accumulate.
     }
   }
+  }
 
   // Propagate state with geometric observer (only after initialization)
-  // Note: counters are member-like but use thread_local to avoid data races
-  // when the Reentrant callback group processes IMU concurrently.
-  thread_local int propagate_calls = 0;
-  thread_local int imu_total = 0;
-  thread_local bool logged_first_propagate = false;
+  // Note: function-local statics here and in propagateState() (skip_count,
+  // propagate_count, logged_first_publish, path_decimator, odom_publish_count,
+  // last_report_time) are safe ONLY because the IMU callback group is
+  // MutuallyExclusive (see its creation) — no two IMU callbacks run
+  // concurrently. thread_local was wrong under exclusivity too: exclusive
+  // callbacks can hop threads, splitting the counts.
+  static int propagate_calls = 0;
+  static int imu_total = 0;
+  static bool logged_first_propagate = false;
   imu_total++;
 
   if (this->initialized && (this->geo.first_opt_done || this->imu_only_mode_)) {
-    this->propagateState();
+    this->propagateState(imu_meas_temp);
     propagate_calls++;
 
     // Log first successful propagation
@@ -5321,7 +5511,7 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
   }
 
   // Debug: Log IMU and propagation rates periodically
-  thread_local int imu_count = 0;
+  static int imu_count = 0;
   if (++imu_count % 100 == 0) {  // Log every 100 IMU messages (~1 second)
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     RCLCPP_INFO(this->get_logger(), "IMU rate check: %d callbacks, %d propagations, initialized=%d, geo_init=%d",
@@ -5332,9 +5522,7 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
 }
 
 bool gicp_plusplus::LocalizationNode::imuMeasFromTimeRange(
-    double start_time, double end_time,
-    boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-    boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
+    double start_time, double end_time, std::vector<ImuMeas>& out) {
 
   std::lock_guard<std::mutex> lock(this->mtx_imu);
 
@@ -5362,9 +5550,12 @@ bool gicp_plusplus::LocalizationNode::imuMeasFromTimeRange(
   }
   imu_it++;
 
-  // Set reverse iterators (to iterate forward in time)
-  end_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(last_imu_it);
-  begin_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(imu_it);
+  // [REVIEW FIX 2026-07-08 P1] Copy the slice out (forward time order: from
+  // the sample just before start_time through the sample at/after end_time)
+  // while STILL holding mtx_imu. Iterators into the circular buffer must not
+  // survive past the lock: a concurrent IMU push_front invalidates them.
+  out.assign(boost::circular_buffer<ImuMeas>::reverse_iterator(imu_it),
+             boost::circular_buffer<ImuMeas>::reverse_iterator(last_imu_it));
 
   return true;
 }
@@ -5388,9 +5579,8 @@ gicp_plusplus::LocalizationNode::integrateImu(
     return empty;
   }
 
-  boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it;
-  boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it;
-  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), begin_imu_it, end_imu_it) == false) {
+  std::vector<ImuMeas> imu_slice;
+  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_slice) == false) {
     double front_s = -1, back_s = -1;
     size_t sz = 0;
     {
@@ -5408,19 +5598,20 @@ gicp_plusplus::LocalizationNode::integrateImu(
     return empty;
   }
 
-  if ((begin_imu_it + 1) == end_imu_it) {
+  if (imu_slice.size() < 2) {
     if (this->verbose_) {
       std::fprintf(stderr,
-                   "[IMU_INT] REJECT begin+1==end: start=%.6f end=%.6f begin.stamp=%.6f end.base.stamp=%.6f\n",
+                   "[IMU_INT] REJECT slice<2: start=%.6f end=%.6f first.stamp=%.6f last.stamp=%.6f\n",
                    start_time, sorted_timestamps.back(),
-                   begin_imu_it->stamp, end_imu_it.base()->stamp);
+                   imu_slice.empty() ? 0.0 : imu_slice.front().stamp,
+                   imu_slice.empty() ? 0.0 : imu_slice.back().stamp);
       std::fflush(stderr);
     }
     return empty;
   }
 
-  const ImuMeas& f1 = *begin_imu_it;
-  const ImuMeas& f2 = *(begin_imu_it+1);
+  const ImuMeas& f1 = imu_slice[0];
+  const ImuMeas& f2 = imu_slice[1];
 
   // Time between first two IMU samples
   double dt = f2.dt;
@@ -5482,15 +5673,14 @@ gicp_plusplus::LocalizationNode::integrateImu(
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_slice);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 gicp_plusplus::LocalizationNode::integrateImuInternal(
     Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
     const std::vector<double>& sorted_timestamps,
-    boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-    boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+    const std::vector<ImuMeas>& imu_slice) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -5498,16 +5688,17 @@ gicp_plusplus::LocalizationNode::integrateImuInternal(
   Eigen::Quaternionf q = q_init;
   Eigen::Vector3f p = p_init;
   Eigen::Vector3f v = v_init;
-  Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
+  Eigen::Vector3f a = q._transformVector(imu_slice.front().lin_accel);
   a[2] -= this->gravity_;
 
-  // Iterate over IMU measurements and timestamps
-  auto prev_imu_it = begin_imu_it;
+  // Iterate over IMU measurements and timestamps (imu_slice is a private
+  // copy in forward time order — no shared-buffer iterators, see P1 fix)
+  auto prev_imu_it = imu_slice.begin();
   auto imu_it = prev_imu_it + 1;
 
   auto stamp_it = sorted_timestamps.begin();
 
-  for (; imu_it != end_imu_it; imu_it++) {
+  for (; imu_it != imu_slice.end(); imu_it++) {
 
     const ImuMeas& f0 = *prev_imu_it;
     const ImuMeas& f = *imu_it;
@@ -5589,13 +5780,14 @@ gicp_plusplus::LocalizationNode::integrateImuInternal(
 
 }
 
-void gicp_plusplus::LocalizationNode::propagateState() {
+void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
 
-  ImuMeas imu_local;
-  {
-    std::lock_guard<std::mutex> lock(this->mtx_imu);
-    imu_local = this->imu_meas;
-  }
+  // [REVIEW FIX 2026-07-08 P1] The caller's OWN sample is propagated, not the
+  // shared this->imu_meas latest — under the old Reentrant group, reading the
+  // global latest meant an older callback could propagate a newer sample or
+  // two callbacks could propagate the same one. With the now-exclusive IMU
+  // group this is belt-and-braces, but it also makes the data flow exact:
+  // each sample is propagated exactly once, in arrival order.
 
   double dt = imu_local.dt;
 
@@ -5735,10 +5927,21 @@ void gicp_plusplus::LocalizationNode::propagateState() {
     const double kBaseSigmaZ   = 0.10;   // m   — z less constrained by LiDAR
     const double kBaseSigmaRot = 0.01;   // rad — roll/pitch/yaw floor
     const double kFitnessScale = 1.0;    // sigma_xy = max(base, scale * sqrt(fitness))
+    bool cov_last_gicp_valid = false;
+    double cov_last_accepted_fitness = -1.0;
+    int cov_consecutive_failures = 0;
+    double cov_last_accepted_scan_stamp = -1.0;
+    {
+      std::lock_guard<std::mutex> pose_lock(this->pose_mutex);
+      cov_last_gicp_valid = this->last_gicp_valid_;
+      cov_last_accepted_fitness = this->last_accepted_fitness_score_;
+      cov_consecutive_failures = this->consecutive_failures_;
+      cov_last_accepted_scan_stamp = this->last_accepted_scan_stamp_;
+    }
 
     double s_xy, s_z, s_rot;
-    if (this->last_gicp_valid_ && this->last_fitness_score_ >= 0.0) {
-      double f_sigma = kFitnessScale * std::sqrt(this->last_fitness_score_);
+    if (cov_last_gicp_valid && cov_last_accepted_fitness >= 0.0) {
+      double f_sigma = kFitnessScale * std::sqrt(cov_last_accepted_fitness);
       s_xy  = std::max(kBaseSigmaXY,  f_sigma);
       s_z   = std::max(kBaseSigmaZ,   2.0 * f_sigma);
       s_rot = std::max(kBaseSigmaRot, 0.1 * f_sigma);
@@ -5755,9 +5958,9 @@ void gicp_plusplus::LocalizationNode::propagateState() {
     // count-based term under-reports uncertainty exactly when it matters. Keyed on
     // consecutive_failures_ (the real dead-reckon signal) and added on top of the
     // base/fitness sigma above. dr_cov_time_rate_ = dr_cov_dist_frac_ = 0 disables.
-    if (this->consecutive_failures_ > 0) {
-      const double elapsed_dr = (this->last_accepted_scan_stamp_ > 0.0)
-          ? std::max(0.0, imu_local.stamp - this->last_accepted_scan_stamp_)
+    if (cov_consecutive_failures > 0) {
+      const double elapsed_dr = (cov_last_accepted_scan_stamp > 0.0)
+          ? std::max(0.0, imu_local.stamp - cov_last_accepted_scan_stamp)
           : 0.0;
       const double speed = static_cast<double>(new_v_lin_w.norm());
       const double drift = this->dr_cov_time_rate_ * elapsed_dr +
@@ -6097,8 +6300,14 @@ void gicp_plusplus::LocalizationNode::updateState() {
     this->state.p = pin;
     this->state.q = qin;
     this->state.v.lin.w = Eigen::Vector3f::Zero();
-    this->state.b.accel = Eigen::Vector3f::Zero();
-    this->state.b.gyro = Eigen::Vector3f::Zero();
+    // [REVIEW FIX 2026-07-08 P3] Keep the calibrated biases through the
+    // emergency reset when they are still finite — they are calibration, not
+    // drifting state. Zero them only if uncalibrated or themselves corrupt.
+    if (!this->imu_calibrated_.load() ||
+        !this->state.b.accel.allFinite() || !this->state.b.gyro.allFinite()) {
+      this->state.b.accel = Eigen::Vector3f::Zero();
+      this->state.b.gyro = Eigen::Vector3f::Zero();
+    }
   }
 
   // Store previous pose, orientation, and velocity

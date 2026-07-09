@@ -38,7 +38,6 @@ inline Eigen::Vector3d so3LogVector(const Eigen::Matrix3d& R) {
 
 struct GroundVehicleGeneralFactor {
   GroundVehicleGeneralFactor() {
-    dof_lambda = 1e9;
     dof_mask.setOnes();
     rotation_prior_R.setIdentity();
     rotation_prior_info.setZero();
@@ -58,16 +57,36 @@ struct GroundVehicleGeneralFactor {
     }
 
     // small_gicp uses right-multiplicative se(3) perturbations ordered
-    // [rx, ry, rz, tx, ty, tz]. Penalizing the restricted update axes keeps
-    // the optimizer near the IMU-propagated initial guess on those axes.
-    *H += dof_lambda * (dof_mask - 1.0).abs().matrix().asDiagonal();
-
+    // [rx, ry, rz, tx, ty, tz]. Soft rotation prior first, exact mask last
+    // (so a fixed axis stays fixed even where the prior touches it).
     if ((rotation_prior_info.array() > 0.0).any()) {
       const Eigen::Vector3d r = so3LogVector(rotation_prior_R.transpose() * T.linear());
       const Eigen::Matrix3d W = rotation_prior_info.asDiagonal();
       H->template block<3, 3>(0, 0) += W;
       b->template head<3>() += W * r;
       *e += 0.5 * r.transpose() * W * r;
+    }
+
+    // [REVIEW FIX 2026-07-08 P2/P3] EXACT delta masking, not soft damping.
+    // The previous dof_lambda=1e9 diagonal boost only shrank the masked
+    // increments; there was no residual back to the initial guess and no
+    // exact zeroing, so the "fixed" axes could still creep across LM
+    // iterations — and 3dof was not a hard yaw lock even though the caller
+    // documents it as one. Zeroing the masked rows/cols of H and entries of
+    // b (with the diagonal pinned for conditioning) makes each LM step's
+    // delta EXACTLY zero on those axes: with right-multiplicative
+    // perturbations the masked DoF then hold the values of init_T for the
+    // whole solve, which is precisely the documented "fixed to the IMU
+    // prior" contract.
+    if ((dof_mask.array() < 1.0).any()) {
+      const double pin = std::max(1.0, H->diagonal().cwiseAbs().maxCoeff());
+      for (int axis = 0; axis < 6; ++axis) {
+        if (dof_mask(axis) >= 1.0) continue;
+        H->row(axis).setZero();
+        H->col(axis).setZero();
+        (*H)(axis, axis) = pin;
+        (*b)(axis) = 0.0;
+      }
     }
   }
 
@@ -84,7 +103,6 @@ struct GroundVehicleGeneralFactor {
     *e += 0.5 * r.transpose() * rotation_prior_info.asDiagonal() * r;
   }
 
-  double dof_lambda;
   Eigen::Array<double, 6, 1> dof_mask;
   Eigen::Matrix3d rotation_prior_R;
   Eigen::Vector3d rotation_prior_info;
@@ -171,15 +189,23 @@ struct PriorAwareLevenbergMarquardtOptimizer {
 
     // [REVIEW FIX 2026-07-08 P3] Re-linearize at the FINAL pose so
     // result.H / result.b / result.error describe the accepted output, not
-    // the linearization point BEFORE the last accepted step. Downstream code
-    // treats result.H as the final Hessian (degeneracy projection, legacy
-    // hessian gate, yaw-marginal stiffness): with bounded non-converged
-    // accepts, the last accepted step is exactly where it may not be tiny.
+    // the linearization point BEFORE the last accepted step (with bounded
+    // non-converged accepts, that step is exactly where it may not be tiny).
+    //
+    // [REVIEW FIX 2026-07-08 P1] Deliberately WITHOUT the general factor:
+    // result.H must be the raw LiDAR-geometry Hessian. The ground-vehicle
+    // factor pins the masked axes (exact delta masking) and the rotation
+    // prior adds its information matrix — with the shipped 4dof default that
+    // artificial roll/pitch stiffness would dominate lambda_max, distort the
+    // relFloor* degeneracy floors, and make "well-constrained" axes reflect
+    // the prior/DoF mask instead of map evidence in hessian_condition, the
+    // eigen-projection, and yaw_marginal_stiffness. Likewise result.error
+    // stays pure point residual, so fitness (= error / num_inliers) measures
+    // map agreement, not prior disagreement. The augmented system exists only
+    // inside the LM iterations above.
     {
       auto [H_final, b_final, e_final] = reduction.linearize(
           target, source, target_tree, rejector, result.T_target_source, factors);
-      general_factor.update_linearized_system(
-          target, source, target_tree, result.T_target_source, &H_final, &b_final, &e_final);
       result.H = H_final;
       result.b = b_final;
       result.error = e_final;
@@ -284,6 +310,44 @@ class SmallGicpBackend {
     rotation_prior_info_.setZero();
   }
 
+  // [REVIEW FIX 2026-07-08 P1] Evaluate the pure point-residual fitness
+  // (error / inliers) and correspondence support at an ARBITRARY pose in the
+  // same solution space align() used. Needed because degeneracy projection /
+  // the yaw veto can modify the applied pose AFTER the solve: gating that
+  // modified pose on the raw optimizer fitness would validate a pose nobody
+  // is applying. Requires a prior align() on the same source/target (reuses
+  // its covariances); returns false when evaluation is impossible.
+  bool evaluateFitnessAt(const Eigen::Matrix4f& T, double* fitness, int* inliers) {
+    if (!target_ || target_->empty() || !target_tree_ || !input_ || input_->empty() ||
+        source_covs_.size() != input_->size() || target_covs_.size() != target_->size() ||
+        !T.allFinite()) {
+      return false;
+    }
+    small_gicp::PointCloudProxy<PointSource> source_proxy(*input_, source_covs_);
+    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, target_covs_);
+    std::vector<small_gicp::GICPFactor> factors(input_->size());
+    small_gicp::ParallelReductionOMP reduction;
+    reduction.num_threads = num_threads_;
+    small_gicp::DistanceRejector rejector;
+    rejector.max_dist_sq = max_corr_dist_ * max_corr_dist_;
+    const auto [H, b, e] = reduction.linearize(
+        target_proxy, source_proxy, *target_tree_, rejector,
+        Eigen::Isometry3d(T.cast<double>()), factors);
+    (void)H;
+    (void)b;
+    const size_t n = static_cast<size_t>(std::count_if(
+        factors.begin(), factors.end(), [](const auto& f) { return f.inlier(); }));
+    if (inliers) *inliers = static_cast<int>(n);
+    const double f = (n > 0) ? e / static_cast<double>(n)
+                             : std::numeric_limits<double>::infinity();
+    if (fitness) {
+      *fitness = std::isfinite(f) ? f : std::numeric_limits<double>::infinity();
+    }
+    // [REVIEW FIX 2026-07-08 P2] Non-finite error/fitness = evaluation
+    // failed; callers treat `false` as fail-closed (fitness forced to +inf).
+    return n > 0 && std::isfinite(f);
+  }
+
   void align(PointCloudSource& output, const Eigen::Matrix4f& guess) {
     converged_ = false;
     final_transformation_ = guess;
@@ -345,6 +409,12 @@ class SmallGicpBackend {
     final_fitness_ = num_correspondences > 0
         ? result_.error / static_cast<double>(num_correspondences)
         : std::numeric_limits<double>::infinity();
+    // [REVIEW FIX 2026-07-08 P2] NaN error (degenerate covariances, NaN
+    // points) must fail CLOSED: a NaN fitness makes every `>` threshold
+    // comparison false downstream, silently accepting the scan.
+    if (!std::isfinite(final_fitness_)) {
+      final_fitness_ = std::numeric_limits<double>::infinity();
+    }
 
     pcl::transformPointCloud(*input_, output, final_transformation_);
   }

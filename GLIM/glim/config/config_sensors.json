@@ -12,6 +12,11 @@
     "enabled": true,
     "primary_frame": "luminar_front",
     "time_threshold": 0.1,
+    // Constant per-aux clock offsets (seconds, order = aux_topics) ADDED to
+    // aux header stamps for matching and to Luminar UINT8[8] absolute per-point
+    // timestamps for deskew. From diagnostics: mean=+X ms -> enter -X/1000.
+    // Empty keeps 0 for every aux.
+    "aux_time_offsets": [],
     "urdf_path": "av24.urdf",
     // Strict merge guard. Parity with GICP localization/lidar_concat/require_all_aux.
     // false = OPERATIONAL default: build/localize on whatever LiDARs merged this scan
@@ -30,10 +35,10 @@
     "abort_on_merge_failure": true,
     "max_consecutive_aux_merge_failures": 10,
     // P4#3: one parseable "CONCAT DEBUG | ..." INFO line per primary scan
-    // (merged n/N, per-aux signed dt + point counts, total points) — the
+    // (merged n/N, per-aux corrected signed dt + point counts, total points) — the
     // map-side merge evidence, mirroring gicp_localization's per-frame debug
-    // topics. Per-aux mean/min/max header offset is also summarized every 512
-    // merges, warning when |mean| > 20 ms (constant clock-offset signature).
+    // topics. Per-aux mean/min/max corrected header offset is also summarized
+    // every 512 merges, warning when |mean| > 20 ms (missing/wrong correction).
     "frame_diag_log": true
   },
   "sensors": {
