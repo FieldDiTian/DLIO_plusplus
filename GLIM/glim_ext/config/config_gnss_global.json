@@ -72,6 +72,14 @@
     // otherwise ingest. <= 0 disables the gate; samples without populated
     // yaw covariance pass (covariance-less publishers keep old behavior).
     "orientation_prior_max_yaw_sigma_deg": 3.0,
+    // [P1 FIX 2026-07-09] Max GNSS bracket width (seconds) for submap
+    // association. Submaps whose bracketing samples are further apart than
+    // this (i.e., inside an RTK dropout) are left UN-ANCHORED instead of
+    // being pinned to a straight-line chord between dropout entry and exit.
+    // Healthy filtered-odom output is ~10 Hz+, so 1.0 s passes normal
+    // operation with wide margin and blocks every real dropout. <= 0
+    // restores the legacy (chord-interpolating) behavior.
+    "max_interp_gap_sec": 1.0,
     // Software antenna -> IMU lever-arm compensation.
     //
     // Set to FALSE for tightly-coupled INS receivers (Point One Atlas,

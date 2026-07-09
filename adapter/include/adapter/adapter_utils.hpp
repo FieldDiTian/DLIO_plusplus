@@ -50,6 +50,10 @@ private:
   double bin_seconds_;
   double first_p1_ = std::numeric_limits<double>::quiet_NaN();
   std::vector<Bin> bins_;
+  // [P2 FIX 2026-07-09] consecutive forward-glitch counter: a persistent
+  // forward jump (device epoch change) resets the mapper after
+  // kGlitchResetCount rejects instead of freezing it forever.
+  int forward_glitch_streak_ = 0;
 };
 
 }  // namespace adapter

@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -132,6 +133,15 @@ int main(int argc, char** argv) {
   // PCAP source config — single source of truth for inactivity_sec.
   glim::Config config_pcap(glim::GlobalConfig::get_config_path("config_pcap"));
   IrisPcapConfig pcap_cfg = load_pcap_config_from_json(config_pcap);
+  // [P2 FIX 2026-07-09] Fail closed. An array-length mismatch (loader logs
+  // and returns empty) or a missing/empty config previously produced ZERO
+  // configured lidars: every packet was dropped as unknown traffic and the
+  // run completed "successfully" with an empty map, exit 0.
+  if (pcap_cfg.lidars.empty()) {
+    spdlog::critical("config_pcap.json defines no lidars (missing file, empty arrays, or "
+                     "length-mismatched lidar_ips/lidar_topics/lidar_frame_ids/lidar_dst_ports) — aborting");
+    return 1;
+  }
 
   IrisPcapReader pcap;
   try {
@@ -294,6 +304,36 @@ int main(int argc, char** argv) {
     s.t_ns = static_cast<uint64_t>(out_ns);
     s.cloud->header.stamp.sec = static_cast<int32_t>(s.t_ns / 1'000'000'000ULL);
     s.cloud->header.stamp.nanosec = static_cast<uint32_t>(s.t_ns % 1'000'000'000ULL);
+
+    // [P2 FIX 2026-07-09] Shift the PER-POINT absolute PTP timestamps too.
+    // Previously only the header moved: for any wall-vs-PTP offset <= 1 s the
+    // downstream converter's epoch-rebase safeguard (|header - min_point| >
+    // 1.0 s) does NOT fire, and TimeKeeper then overwrites the frame stamp
+    // with the UNSHIFTED min point time — silently reintroducing the exact
+    // scan-vs-IMU desync this shift exists to remove (the >1 s case was
+    // ironically safe because the rebase fired). Shifting the points keeps
+    // header and points on one time axis for every offset magnitude.
+    if (ptp_to_ros_shift_ns != 0 && s.cloud && s.cloud->point_step > 0) {
+      int ts_off = -1;
+      for (const auto& f : s.cloud->fields) {
+        if (f.name == "timestamp" && f.datatype == sensor_msgs::msg::PointField::UINT8 && f.count == 8) {
+          ts_off = static_cast<int>(f.offset);
+          break;
+        }
+      }
+      if (ts_off >= 0 && static_cast<uint32_t>(ts_off) + 8 <= s.cloud->point_step) {
+        const size_t n = s.cloud->data.size() / s.cloud->point_step;
+        for (size_t i = 0; i < n; i++) {
+          uint8_t* tp = s.cloud->data.data() + i * s.cloud->point_step + ts_off;
+          uint64_t v;
+          std::memcpy(&v, tp, sizeof(uint64_t));
+          int64_t shifted = static_cast<int64_t>(v) + ptp_to_ros_shift_ns;
+          if (shifted < 0) shifted = 0;
+          v = static_cast<uint64_t>(shifted);
+          std::memcpy(tp, &v, sizeof(uint64_t));
+        }
+      }
+    }
   };
 
   // Runtime parameters (same names as glim_rosbag).
@@ -443,6 +483,7 @@ int main(int argc, char** argv) {
   // Dispatch counters (per-second window). Declared above the lambdas that
   // capture them.
   uint64_t cnt_pcap_primary = 0, cnt_pcap_aux = 0, cnt_imu = 0, cnt_image = 0, cnt_ext = 0, cnt_dropped_primary = 0;
+  uint64_t total_pcap_primary = 0;  // [P2 FIX 2026-07-09] cumulative (cnt_ resets every second)
   uint64_t window_t0_ns = 0;
 
   auto bag_dispatch_fanout = [&](const Event& e) {
@@ -491,12 +532,24 @@ int main(int argc, char** argv) {
           auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
           image_ser.deserialize_message(&serialized_msg, image_msg.get());
           glim->image_callback(image_msg);
+          cnt_image++;
         } else if (topic_type == "sensor_msgs/msg/CompressedImage") {
           auto cm = std::make_shared<sensor_msgs::msg::CompressedImage>();
           compressed_image_ser.deserialize_message(&serialized_msg, cm.get());
-          auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
-          cv_bridge::toCvCopy(*cm, "bgr8")->toImageMsg(*image_msg);
-          glim->image_callback(image_msg);
+          // [P2 FIX 2026-07-09] Guarded decode: one corrupt/truncated
+          // compressed frame previously threw out of main() and killed the
+          // whole run before save() (the exact failure image_callback's own
+          // guard was added for, re-introduced on this path).
+          try {
+            auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+            cv_bridge::toCvCopy(*cm, "bgr8")->toImageMsg(*image_msg);
+            glim->image_callback(image_msg);
+            cnt_image++;
+          } catch (const std::exception& e) {
+            spdlog::warn("skipping malformed CompressedImage: {}", e.what());
+          }
+        } else if (topic_type == "sensor_msgs/msg/Image") {
+          // counted below in the Image branch
         }
       }
 #endif
@@ -597,6 +650,7 @@ int main(int argc, char** argv) {
           workload = glim->points_callback(final_points, epoch_anchor_count);
         }
         cnt_pcap_primary++;
+        total_pcap_primary++;
         if (s.cloud->header.stamp.sec + s.cloud->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");
           stop = true;
@@ -660,6 +714,19 @@ int main(int argc, char** argv) {
       bag_dispatch_fanout(ev);
     }
     glim->timer_callback();
+  }
+
+  // [P2 FIX 2026-07-09, moved 2026-07-09b] Zero dispatched primary scans =
+  // the pcap did not overlap the bag (wrong-session file, clock skew
+  // misclassified as NATURAL overlap because peek_last is unbounded) or every
+  // packet was filtered. Previously this saved an empty/IMU-only dump and
+  // exited 0 — and after the first fix it still sat in rclcpp::spin()
+  // forever in the default auto_quit=false mode, APPEARING hung instead of
+  // failing closed. The guard must run BEFORE the spin.
+  if (total_pcap_primary == 0) {
+    spdlog::critical("no primary pcap scans were dispatched — pcap/bag window mismatch or "
+                     "packet filtering removed everything; NOT saving, exiting nonzero");
+    return 1;
   }
 
   if (!auto_quit) {

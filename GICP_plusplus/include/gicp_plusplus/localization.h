@@ -218,7 +218,10 @@ private:
   bool gt_recovery_enabled_;
   int gt_recovery_min_consecutive_failures_;
   int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
-  bool gt_extrinsics_cached_;
+  // [P2 FIX 2026-07-09] atomic + written LAST inside gt_init_mtx_: the
+  // scan/IMU threads read this flag lock-free and must never observe it true
+  // before T_base_gtbody_/gt_body_frame_ are fully written.
+  std::atomic<bool> gt_extrinsics_cached_;
   Eigen::Matrix4f T_base_gtbody_;     // pose of gt_body expressed in base_frame
   std::string gt_body_frame_;          // captured from msg->child_frame_id
 
@@ -435,6 +438,20 @@ private:
   // the accumulator sums or double-finalize the calibration. Locked only
   // while !imu_calibrated_ (startup); steady state never touches it.
   std::mutex calib_mtx_;
+  // [P2 FIX 2026-07-09] Serializes the first-GT-message extrinsic cache +
+  // odom-init block in callbackGtOdom (Reentrant group: two 100 Hz callbacks
+  // can run concurrently — std::string assignment to gt_body_frame_ was UB,
+  // and applyInitialPose could run twice, interleaved). Leaf-only from the
+  // GT thread; never taken while holding pose/geo, never held by anyone who
+  // calls back into pose/geo holders.
+  std::mutex gt_init_mtx_;
+  // [P2 FIX 2026-07-09] Owner lock for the scan-chain seed (basePose,
+  // base_pose_stamp_, prev_vel): held by the scan thread across the whole
+  // deskew phase, and by the cross-thread reinit writers (applyInitialPose /
+  // param pose / RTK full seed) around their seed writes — so a mid-run
+  // re-initialization lands atomically BETWEEN scans instead of tearing a
+  // quaternion under an in-flight deskew.
+  std::mutex seed_mtx_;
   double imu_calib_time_;           // seconds to accumulate for calibration
   double imu_calib_start_stamp_;
   int imu_calib_count_;
@@ -545,7 +562,7 @@ private:
   bool publish_tf_;
   bool imu_only_mode_;
   bool use_odom_init_;
-  bool use_odom_init_applied_{false};
+  std::atomic<bool> use_odom_init_applied_{false};  // P2 fix: read cross-thread (stationary calib guard)
   bool use_param_initial_pose_;
   std::string initial_pose_frame_;  // "lidar" or "base_link"
   bool pending_initial_pose_;  // true when initial pose needs conversion via baselink2lidar_T

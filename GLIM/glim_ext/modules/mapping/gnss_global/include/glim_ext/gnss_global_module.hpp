@@ -1,5 +1,6 @@
 #include <deque>
 #include <cmath>
+#include <limits>
 #include <atomic>
 #include <thread>
 #include <numeric>
@@ -100,6 +101,16 @@ public:
     // yaw covariance pass (backwards compatible with covariance-less sources).
     orientation_prior_max_yaw_sigma_deg = config.param<double>("gnss", "orientation_prior_max_yaw_sigma_deg", 3.0);
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
+    // [P1 FIX 2026-07-09] Maximum GNSS bracket width for submap association.
+    // Without this bound, an RTK dropout leaves the queue with (last sample
+    // before the gap, first sample after it) and every submap inside the gap
+    // is anchored to a STRAIGHT-LINE chord between dropout entry and exit —
+    // at prior_inf_scale stiffness (~1 cm) that warps the map by the chord
+    // sagitta on any curved segment, exactly where the documented contract
+    // says the factor stream must go silent. Submaps whose bracket exceeds
+    // this width are left un-anchored (LiDAR+IMU only). <= 0 disables the
+    // bound (legacy behavior).
+    max_interp_gap_sec = config.param<double>("gnss", "max_interp_gap_sec", 1.0);
 
     if (enable_orientation_prior && orientation_prior_inf_scale.minCoeff() < 0.0) {
       logger->warn("orientation prior enabled but orientation_prior_inf_scale has negative values; disabling orientation prior");
@@ -188,14 +199,20 @@ public:
   // optimize. The backend produces position/heading factors on its own thread
   // and delivers them only through on_smoother_update(); if save() ran while we
   // still had undelivered factors they would never reach the serialized graph.
-  // We are NOT done while: a batch is mid-process (processing_); submaps or GNSS
-  // are still queued for us (input_*_queue -- the latter closes the bag-EOF race
-  // where the GNSS that brackets the last submap hasn't been drained yet); or a
-  // submap in our local queue is still bracketable by available GNSS
-  // (pending_associable_). Un-bracketable trailing submaps are excluded so we
-  // don't block save() on factors that can never be produced.
+  // We are NOT done while: a batch is mid-process (processing_); submaps are
+  // queued for us; a submap in our local queue is still bracketable
+  // (pending_associable_); or GNSS is queued WHILE a submap is waiting for it
+  // (closes the bag-EOF race where the bracketing GNSS hasn't been drained).
+  // [P2 FIX 2026-07-09] A GNSS backlog with NO submap waiting is deliberately
+  // NOT pending work: the old predicate counted every queued GNSS message,
+  // and since glim_rosbag/glim_pcap_rosbag poll needs_wait() after EVERY bag
+  // message while this queue drains only at the backend's 100 ms cadence,
+  // offline replay was throttled to roughly the GNSS message rate regardless
+  // of playback_speed — with the 1 s throttle timeout spamming "extension
+  // module may be hanged" warnings.
   virtual bool needs_wait() const override {
-    return processing_ || !input_submap_queue.empty() || !input_gnss_queue.empty() || pending_associable_;
+    return processing_ || !input_submap_queue.empty() || pending_associable_ ||
+           (!input_gnss_queue.empty() && submaps_waiting_);
   }
 
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
@@ -214,14 +231,14 @@ public:
   void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
-    const double yaw_var = gnss_msg->pose.covariance[35] > 0.0 ? gnss_msg->pose.covariance[35] : -1.0;
+    const double yaw_var = sanitize_yaw_var(gnss_msg->pose.covariance[35]);
     push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
   }
 
   void gnss_callback(const OdometryConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
-    const double yaw_var = gnss_msg->pose.covariance[35] > 0.0 ? gnss_msg->pose.covariance[35] : -1.0;
+    const double yaw_var = sanitize_yaw_var(gnss_msg->pose.covariance[35]);
     push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
   }
 
@@ -245,13 +262,40 @@ public:
       // (below) cannot busy-spin while a submap waits to be bracketed.
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+      // [P2 FIX 2026-07-09] Raise processing_ BEFORE draining the input
+      // queues. Previously the queues were cleared first and processing_ was
+      // raised only after the early-continue check: in that window ALL
+      // needs_wait() observables read false while this thread held an
+      // undelivered batch — a save() polling at 50 ms could flush past it
+      // and the final submaps' GNSS factors silently never reached the
+      // serialized graph (TOCTOU). With the flag raised first, at least one
+      // observable is true whenever work exists; the early-continue branch
+      // lowers it again immediately when there is nothing to do.
+      processing_ = true;
+
       // Convert GeoPoint(lat/lon) to UTM
       const auto gnss_data = input_gnss_queue.get_all_and_clear();
-      utm_queue.insert(utm_queue.end(), gnss_data.begin(), gnss_data.end());
+      // [P2 FIX 2026-07-09] Enforce stamp monotonicity on insert. Duplicate
+      // stamps make interpolate_gnss_data divide by zero (NaN position ->
+      // NaN factor); out-of-order stamps break std::lower_bound's
+      // partitioning precondition below (potential begin()-1 dereference).
+      // Realistic producers: overlapping multi-bag globs, filter-node
+      // restarts re-emitting samples.
+      for (const auto& g : gnss_data) {
+        if (!utm_queue.empty() && g.stamp <= utm_queue.back().stamp) {
+          if (!warned_nonmonotonic_gnss) {
+            logger->warn("dropping non-monotonic GNSS sample (stamp={:.6f} <= newest {:.6f}) — further drops silent", g.stamp, utm_queue.back().stamp);
+            warned_nonmonotonic_gnss = true;
+          }
+          continue;
+        }
+        utm_queue.push_back(g);
+      }
 
       // Add new submaps to the local queue.
       const auto new_submaps = input_submap_queue.get_all_and_clear();
       submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
+      submaps_waiting_ = !submap_queue.empty();  // [P2 FIX 2026-07-09] see needs_wait()
 
       // Attempt association whenever there is a pending submap AND something new
       // arrived this cycle: new submaps to place, OR new GNSS that may have just
@@ -261,10 +305,10 @@ public:
       if (submap_queue.empty() || (gnss_data.empty() && new_submaps.empty())) {
         pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
                               submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
-        processing_ = false;
+        processing_ = false;  // nothing to do this cycle
         continue;
       }
-      processing_ = true;  // busy until this batch is associated + factored
+      // (processing_ already true — raised before the queue drain above)
 
       // Remove submaps that are created earlier than the oldest GNSS data
       while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front().stamp) {
@@ -278,12 +322,42 @@ public:
         const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
 
         const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const GNSSData& utm, const double t) { return utm.stamp < t; });
-        if (right == utm_queue.end() || (right + 1) == utm_queue.end()) {
+        // [P3 FIX 2026-07-09] right == LAST sample is a perfectly valid
+        // bracket (interpolation needs only left/right). The old extra
+        // refusal of (right + 1) == end demanded a SECOND sample after the
+        // submap while pending_associable_ counted the submap as bracketable
+        // with just one — on a dropout-at-EOF the two criteria disagreed
+        // forever: the loop broke every cycle, needs_wait() never cleared,
+        // and save() burned its full flush timeout before dropping the
+        // submap's factors.
+        if (right == utm_queue.end()) {
           logger->warn("invalid condition in GNSS global module!!");
           break;
         }
+        // [P2 FIX 2026-07-09] Belt-and-braces for the lower_bound
+        // precondition: with the monotonic insert above this cannot fire,
+        // but right == begin() would make (right - 1) UB.
+        if (right == utm_queue.begin()) {
+          logger->warn("GNSS association: bracket left edge missing (right == begin); skipping submap");
+          submap_queue.pop_front();
+          continue;
+        }
         const auto left = right - 1;
         logger->debug("submap={:.6f} utm_left={:.6f} utm_right={:.6f}", stamp, left->stamp, right->stamp);
+
+        // [P1 FIX 2026-07-09] Do NOT interpolate across a GNSS dropout. When
+        // the bracket spans more than max_interp_gap_sec, the submap sits
+        // inside a gap where the RTK filter went silent — a chord between
+        // dropout entry/exit is NOT a measurement. Leave the submap
+        // un-anchored (LiDAR+IMU odometry + loop closures carry it), exactly
+        // as the documented GNSS-denied contract promises.
+        if (max_interp_gap_sec > 0.0 && (right->stamp - left->stamp) > max_interp_gap_sec) {
+          logger->warn(
+            "GNSS association: bracket gap {:.2f}s > max_interp_gap_sec {:.2f}s (dropout) — submap at {:.3f} left un-anchored",
+            right->stamp - left->stamp, max_interp_gap_sec, stamp);
+          submap_queue.pop_front();
+          continue;
+        }
 
         const GNSSData interpolated = interpolate_gnss_data(*left, *right, stamp);
 
@@ -396,6 +470,7 @@ public:
       // waiting on them.
       pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
                             submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
+      submaps_waiting_ = !submap_queue.empty();
       processing_ = false;
     }
   }
@@ -430,7 +505,28 @@ private:
     logger->info("saved T_world_utm (4x4 SE(3)) to: {}", filename);
   }
 
+  // [P3 FIX 2026-07-09] NaN yaw covariance is KNOWN-BAD (invalid heading
+  // solution propagated through the adapter's deg^2->rad^2 conversion), not
+  // "unpopulated": map it to +inf so the yaw-quality gate rejects it.
+  // 0/negative keep the documented legacy "unpopulated passes" semantics.
+  static double sanitize_yaw_var(double c35) {
+    if (std::isnan(c35)) return std::numeric_limits<double>::infinity();
+    return c35 > 0.0 ? c35 : -1.0;
+  }
+
   void push_gnss_data(double stamp, double x, double y, double z, double qx, double qy, double qz, double qw, double yaw_var = -1.0) {
+    // [P2 FIX 2026-07-09] Fail closed on non-finite input. A single NaN
+    // position either poisons the one-shot T_world_utm fit (latched true
+    // forever) or reaches iSAM2 as a NaN factor and destroys the graph.
+    // FusionEngine emits NaN lla/rpy for SolutionType::Invalid (cold start,
+    // full outage); the RTK filter gates on covariance, not finiteness.
+    if (!std::isfinite(stamp) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      if (!warned_nonfinite_gnss) {
+        logger->warn("dropping GNSS sample with non-finite stamp/position (stamp={}, p=[{}, {}, {}]) — further drops silent", stamp, x, y, z);
+        warned_nonfinite_gnss = true;
+      }
+      return;
+    }
     GNSSData gnss_data;
     gnss_data.stamp = stamp;
     gnss_data.position << x, y, z;
@@ -490,6 +586,10 @@ private:
   // Lets needs_wait() block save() until that submap is factored, without
   // blocking on un-bracketable trailing submaps.
   std::atomic_bool pending_associable_{false};
+  // [P2 FIX 2026-07-09] mirrors "local submap_queue non-empty" for
+  // needs_wait(): queued GNSS blocks save()/replay only while a submap is
+  // actually waiting to be bracketed by it.
+  std::atomic_bool submaps_waiting_{false};
   std::thread thread;
 
   ConcurrentVector<GNSSData, Eigen::aligned_allocator<GNSSData>> input_gnss_queue;
@@ -512,9 +612,12 @@ private:
   double orientation_prior_max_yaw_sigma_deg;  // P5#1 yaw-quality gate (<=0 disables)
   size_t yaw_gate_skip_count = 0;              // heading priors skipped by the gate
   double min_baseline;
+  double max_interp_gap_sec;  // P1 fix: max GNSS bracket width for association (<=0 disables)
 
   Eigen::Vector3d t_imu_gnss;
   bool warned_missing_orientation_for_lever_arm;
+  bool warned_nonfinite_gnss = false;      // P2 fix: non-finite input drop warn-once
+  bool warned_nonmonotonic_gnss = false;   // P2 fix: non-monotonic stamp drop warn-once
 
   bool transformation_initialized;
   Eigen::Isometry3d T_world_utm;

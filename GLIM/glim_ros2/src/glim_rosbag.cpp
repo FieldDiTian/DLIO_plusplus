@@ -1,3 +1,4 @@
+#include <cctype>
 #include <glob.h>
 #include <termios.h>
 #include <unistd.h>
@@ -157,7 +158,34 @@ int main(int argc, char** argv) {
 
     bag_filenames.insert(bag_filenames.end(), filenames.begin(), filenames.end());
   }
-  std::sort(bag_filenames.begin(), bag_filenames.end());
+  // [P3 FIX 2026-07-09] Natural-numeric sort: plain lexicographic ordering
+  // put split "_10" before "_2", dispatching a large backward time jump into
+  // the estimator. Compare digit runs numerically, everything else bytewise.
+  std::sort(bag_filenames.begin(), bag_filenames.end(), [](const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+      if (std::isdigit(static_cast<unsigned char>(a[i])) && std::isdigit(static_cast<unsigned char>(b[j]))) {
+        size_t i2 = i, j2 = j;
+        while (i2 < a.size() && std::isdigit(static_cast<unsigned char>(a[i2]))) i2++;
+        while (j2 < b.size() && std::isdigit(static_cast<unsigned char>(b[j2]))) j2++;
+        const long long na = std::stoll(a.substr(i, i2 - i));
+        const long long nb = std::stoll(b.substr(j, j2 - j));
+        if (na != nb) return na < nb;
+        i = i2; j = j2;
+      } else {
+        if (a[i] != b[j]) return a[i] < b[j];
+        i++; j++;
+      }
+    }
+    return a.size() < b.size();
+  });
+
+  // [P3 FIX 2026-07-09] An empty glob previously fell through to
+  // rclcpp::spin() and sat forever with no data and no error.
+  if (bag_filenames.empty()) {
+    spdlog::critical("no rosbag files matched the given path(s) — aborting");
+    return 1;
+  }
 
   spdlog::info("bag_filenames:");
   for (const auto& bag_filename : bag_filenames) {
@@ -413,9 +441,15 @@ int main(int argc, char** argv) {
           auto compressed_image_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
           compressed_image_serialization.deserialize_message(&serialized_msg, compressed_image_msg.get());
 
-          auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
-          cv_bridge::toCvCopy(*compressed_image_msg, "bgr8")->toImageMsg(*image_msg);
-          glim->image_callback(image_msg);
+          // [P2 FIX 2026-07-09] Guarded decode: a corrupt compressed frame
+          // previously threw out of read_bag and killed the run before save().
+          try {
+            auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+            cv_bridge::toCvCopy(*compressed_image_msg, "bgr8")->toImageMsg(*image_msg);
+            glim->image_callback(image_msg);
+          } catch (const std::exception& e) {
+            spdlog::warn("skipping malformed CompressedImage: {}", e.what());
+          }
         } else {
           spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/(Image|CompressedImage) (topic={})", topic_type, msg->topic_name);
           return false;

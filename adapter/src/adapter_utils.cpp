@@ -117,10 +117,49 @@ bool posePassesRtkGate(const fusion_engine_msgs::msg::Pose& msg,
          msg.position_covariance[8] <= max_var_z;
 }
 
-P1ClockMapper::P1ClockMapper(double bin_seconds) : bin_seconds_(bin_seconds) {}
+// [P2 FIX 2026-07-09] bin_seconds <= 0 previously produced NaN/inf bins and
+// UB int casts; clamp to a sane floor.
+P1ClockMapper::P1ClockMapper(double bin_seconds) : bin_seconds_(std::max(1.0, bin_seconds)) {}
 
 void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
 {
+  // [P2 FIX 2026-07-09] Input validation + epoch-reset handling. FusionEngine
+  // encodes "time not yet available" as 0xFFFFFFFF in both Timestamp fields
+  // (~4.29e9 s): as the FIRST sample it used to poison first_p1_ (every later
+  // genuine sample -> bin < 0 -> mapper never ready -> zero IMU all run); as a
+  // LATER sample it triggered a ~1.7 GB bins_.resize() inside a callback.
+  // A P1 regression (device power-cycle, bag loop) used to freeze the mapper
+  // forever (bin < 0 on every subsequent pair).
+  constexpr double kInvalidP1SentinelSec = 4.0e9;  // sentinel converts to ~4.29e9
+  constexpr double kResetThresholdSec = 5.0;       // backward jump = epoch change
+  constexpr double kMaxSessionSec = 24.0 * 3600.0; // forward cap (bin count <= 1440)
+  constexpr int kGlitchResetCount = 100;           // persistent forward jump = epoch change
+
+  if (!std::isfinite(arrival_ros) || !std::isfinite(p1_time) || p1_time < 0.0 ||
+      p1_time >= kInvalidP1SentinelSec) {
+    return;
+  }
+  if (std::isfinite(first_p1_)) {
+    const double rel = p1_time - first_p1_;
+    if (rel < -kResetThresholdSec) {
+      // Backward epoch change: re-learn from scratch.
+      bins_.clear();
+      first_p1_ = p1_time;
+      forward_glitch_streak_ = 0;
+    } else if (rel > kMaxSessionSec) {
+      // Single forward glitches are rejected; a persistent forward jump is a
+      // real epoch change and resets the mapper.
+      if (++forward_glitch_streak_ >= kGlitchResetCount) {
+        bins_.clear();
+        first_p1_ = p1_time;
+        forward_glitch_streak_ = 0;
+      } else {
+        return;
+      }
+    } else {
+      forward_glitch_streak_ = 0;
+    }
+  }
   if (!std::isfinite(first_p1_)) {
     first_p1_ = p1_time;
   }

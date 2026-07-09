@@ -2216,9 +2216,12 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
       this->geo.first_opt_done = true;
     }
   }
-  this->basePose.p = position;
-  this->basePose.q = orientation;
-  this->base_pose_stamp_ = 0.0;  // parameter pose has no timestamp
+  {
+    std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);  // [P2 FIX 2026-07-09]
+    this->basePose.p = position;
+    this->basePose.q = orientation;
+    this->base_pose_stamp_ = 0.0;  // parameter pose has no timestamp
+  }
   this->initialized = true;  // publish only after ALL pose state is consistent
 
   this->path_msg.poses.clear();
@@ -2252,7 +2255,10 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     // MultiThreadedExecutor, a scan callback could pass the atomic
     // initialized check here and start deskew from the stale/default basePose
     // that is only written further down.
-    if (stamp.nanoseconds() > 0) {
+    // [P2 FIX 2026-07-09] Overwrite scan_stamp only on the FIRST seed:
+    // callbackPointCloud writes it on the scan thread without this mutex, so
+    // a mid-run reinit retimed an in-flight scan's deskew/publish.
+    if (stamp.nanoseconds() > 0 && !this->initialized.load()) {
       this->scan_stamp = stamp;
     }
   }
@@ -2280,11 +2286,15 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
       this->geo.first_opt_done = true;
     }
   }
-  this->basePose.p = p;
-  this->basePose.q = q;
-  // [REVIEW FIX 2026-07-08] Valid at the provided stamp if there is one;
-  // otherwise unknown (0) -> the INS prior falls back to prev_scan_stamp.
-  this->base_pose_stamp_ = (stamp.nanoseconds() > 0) ? stamp.seconds() : 0.0;
+  {
+    // [P2 FIX 2026-07-09] Seed writes land atomically between scans.
+    std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+    this->basePose.p = p;
+    this->basePose.q = q;
+    // [REVIEW FIX 2026-07-08] Valid at the provided stamp if there is one;
+    // otherwise unknown (0) -> the INS prior falls back to prev_scan_stamp.
+    this->base_pose_stamp_ = (stamp.nanoseconds() > 0) ? stamp.seconds() : 0.0;
+  }
   this->initialized = true;  // publish only after ALL pose state is consistent
 
   // Clear trajectory path on reinitialization
@@ -3184,6 +3194,14 @@ void gicp_plusplus::LocalizationNode::applyInsHeadingPriorToBasePose() {
 }
 
 void gicp_plusplus::LocalizationNode::deskewPointcloud() {
+
+  // [P2 FIX 2026-07-09] Hold the seed owner lock for the whole deskew phase:
+  // basePose/base_pose_stamp_/prev_vel are read (and, via the INS prior,
+  // written) throughout, and the reinit writers (applyInitialPose, param
+  // pose, RTK full seed) run on other threads. Cost: contended only during a
+  // reinit. Lock order: seed -> {geo, imu}; no holder of pose/geo ever takes
+  // seed, so no cycle.
+  std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
 
   // REVIEW FIX: reset the per-frame sweep-span diagnostic up front so early
   // returns (deskew off, unsupported sensor, empty IMU buffer, ...) publish
@@ -4307,11 +4325,17 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     Eigen::Quaternionf q(rotSO3);
     q.normalize();
 
-    this->basePose.p = new_p;
-    this->basePose.q = q;
-    // [REVIEW FIX 2026-07-08] The accepted candidate is the pose at the median
-    // point time of this scan (the cloud was deskewed to frames[median]).
-    this->base_pose_stamp_ = this->t_prior_stamp_;
+    {
+      // [P2 FIX 2026-07-09] Seed writes under the owner lock (see seed_mtx_
+      // in the header): a cross-thread reinit (RViz / RTK full seed) must
+      // never interleave with these. Lock order here: pose -> seed.
+      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+      this->basePose.p = new_p;
+      this->basePose.q = q;
+      // [REVIEW FIX 2026-07-08] The accepted candidate is the pose at the median
+      // point time of this scan (the cloud was deskewed to frames[median]).
+      this->base_pose_stamp_ = this->t_prior_stamp_;
+    }
     // P3: pair the measurement with the IMU prior it was registered against
     // (both at median scan time) so updateState can form the time-free delta.
     this->observer_prior_pose_ = this->T_prior;
@@ -4364,6 +4388,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
 
     // Use geometric observer velocity for next IMU integration
     {
+      // [P2 FIX 2026-07-09] seed -> geo (matches deskewPointcloud's order).
+      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
       std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
       this->prev_vel = this->geo.prev_vel;
     }
@@ -4430,6 +4456,9 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       const Eigen::Vector3f new_p = this->T_prior.block<3, 1>(0, 3);
       Eigen::Quaternionf q(this->T_prior.block<3, 3>(0, 0));
       q.normalize();
+      // [P2 FIX 2026-07-09] Seed writes under the owner lock (order:
+      // pose -> seed -> geo, consistent with the accept path and deskew).
+      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
       this->basePose.p = new_p;
       this->basePose.q = q;
       // [REVIEW FIX 2026-07-08] T_prior is also a median-point-time pose.
@@ -4581,7 +4610,13 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
   // samples even while TF is missing.  Runs BEFORE the odom-init block below
   // so composeGtPoseInBase has the extrinsic ready to bring the first GT
   // sample into base_frame coordinates before applyInitialPose seeds the state.
-  if (!this->gt_extrinsics_cached_) {
+  if (!this->gt_extrinsics_cached_.load()) {
+    // [P2 FIX 2026-07-09] Serialize: this callback runs in a REENTRANT group,
+    // so two first messages could execute this block concurrently
+    // (std::string assignment race = UB, torn T_base_gtbody_ publication).
+    // Re-check under the lock; gt_extrinsics_cached_ (atomic) is written LAST.
+    std::lock_guard<std::mutex> init_lock(this->gt_init_mtx_);
+    if (!this->gt_extrinsics_cached_.load()) {
     if (this->gt_body_frame_.empty()) {
       this->gt_body_frame_ = msg->child_frame_id;
       if (this->gt_body_frame_.empty()) {
@@ -4621,6 +4656,7 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
                              this->base_frame.c_str(), this->gt_body_frame_.c_str(), ex.what());
       }
     }
+    }  // re-check scope (gt_init_mtx_ held)
   }
 
   // Odom init: on the first GT odom message (after the TF cache above is
@@ -4635,10 +4671,16 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
   // seeding from a frame we can't compose.
   // Overrides any param-based initial pose. Sets first_opt_done so odom starts
   // publishing immediately without waiting for the first accepted GICP scan.
-  if (this->use_odom_init_ && !this->use_odom_init_applied_) {
+  if (this->use_odom_init_ && !this->use_odom_init_applied_.load()) {
+    // [P2 FIX 2026-07-09] Serialize + re-check: without this, two concurrent
+    // GT callbacks could both pass the flag test and run applyInitialPose
+    // twice, interleaving their (sequential) lock scopes.
+    std::lock_guard<std::mutex> init_lock(this->gt_init_mtx_);
     Eigen::Vector3f init_p;
     Eigen::Quaternionf init_q;
-    if (this->composeGtPoseInBase(s, init_p, init_q)) {
+    // Re-check under the lock: a concurrent callback may have seeded while
+    // we waited. The && short-circuit skips the compose entirely then.
+    if (!this->use_odom_init_applied_.load() && this->composeGtPoseInBase(s, init_p, init_q)) {
       this->use_odom_init_applied_ = true;
       const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
       this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom");
@@ -4966,10 +5008,13 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
       std::lock_guard<std::mutex> lock(this->pose_mutex);
       this->current_pose = T_seed;
     }
-    this->basePose.p = this->latest_rtk_seed_.p;
-    this->basePose.q = this->latest_rtk_seed_.q;
-    this->base_pose_stamp_ = this->latest_rtk_seed_.stamp;
-    this->prev_vel = v_seed_world;
+    {
+      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);  // [P2 FIX 2026-07-09]
+      this->basePose.p = this->latest_rtk_seed_.p;
+      this->basePose.q = this->latest_rtk_seed_.q;
+      this->base_pose_stamp_ = this->latest_rtk_seed_.stamp;
+      this->prev_vel = v_seed_world;
+    }
     this->initialized = true;  // publish only after ALL pose state is consistent
   }
 
@@ -4994,7 +5039,10 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
               "GT recovery: maybeSnapPoseToGT entered (enabled=%d streak=%d/%d gt_received=%d cached=%d) reason='%s'",
               this->gt_recovery_enabled_,
               this->consecutive_failures_, this->gt_recovery_min_consecutive_failures_,
-              this->gt_odom_received_.load(), this->gt_extrinsics_cached_, reason);
+              this->gt_odom_received_.load() ? 1 : 0,
+              // [P1 FIX 2026-07-09] atomic<bool> cannot be passed to a vararg
+              // (deleted copy ctor -> build break); load and promote explicitly.
+              this->gt_extrinsics_cached_.load() ? 1 : 0, reason);
   // Guards. Below-threshold guard is silent (frequent on every rejection until
   // streak builds up); the others log throttled info so a misconfiguration
   // doesn't silently disable recovery.
@@ -5142,11 +5190,16 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
     this->geo.prev_vel = v_base_world;
     ++this->geo.update_seq;  // discard any in-flight propagateState computations
   }
-  this->basePose.p = p_new;
-  this->basePose.q = q_new;
-  // [REVIEW FIX 2026-07-08] The snap pose is the GT sample at the scan stamp.
-  this->base_pose_stamp_ = this->scan_stamp.seconds();
-  this->prev_vel = v_base_world;
+  {
+    // [P2 FIX 2026-07-09] Seed writes under the owner lock (pose -> seed:
+    // maybeSnapPoseToGT runs inside performLocalization's pose_mutex scope).
+    std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+    this->basePose.p = p_new;
+    this->basePose.q = q_new;
+    // [REVIEW FIX 2026-07-08] The snap pose is the GT sample at the scan stamp.
+    this->base_pose_stamp_ = this->scan_stamp.seconds();
+    this->prev_vel = v_base_world;
+  }
 
   RCLCPP_WARN(this->get_logger(),
               "Localization: ⟳ snapped pose to GT (%s after %d consecutive non-accepts) — "
@@ -5439,12 +5492,25 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
         Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
         Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
 
-        Eigen::Vector3f grav_world(0.f, 0.f, -1.f);
+        // [P2 FIX 2026-07-09] Gravity SIGN. This rig's documented convention
+        // (see the specific-force note in tryRtkCalibrationStep) is that a
+        // level stationary body reads accel ~= (0,0,+g), and the propagation
+        // math (integrateImu / propagateState) computes world_accel = q*accel
+        // then subtracts +g on world Z — which requires q_init to map the
+        // measured accel direction onto world +Z. The previous (0,0,-1)
+        // target was a pi flip: FromTwoVectors(+z, -z) started the observer
+        // upside-down with arbitrary yaw; the bias math was self-consistent
+        // with the flip (so nothing caught it), propagateState produced -2g
+        // vertical acceleration, and the delta-form updateState never
+        // corrects absolute attitude, so the IMU-rate output stayed flipped
+        // until a GT snap. Both the target vector and expected_grav_body
+        // flip TOGETHER so the bias estimate stays correct.
+        Eigen::Vector3f grav_world(0.f, 0.f, +1.f);
         Eigen::Vector3f grav_body = accel_avg.normalized();
         Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(grav_body, grav_world);
 
         Eigen::Vector3f expected_grav_body = q_init.conjugate()._transformVector(
-            Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
+            Eigen::Vector3f(0.f, 0.f, +static_cast<float>(this->gravity_)));
 
         // [REVIEW FIX 2026-07-08 P3] ALL observer-state writes under geo.mtx.
         // The IMU subscription runs in a REENTRANT callback group, so parallel
@@ -5456,11 +5522,17 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
           this->state.b.gyro = gyro_avg;
           this->state.b.accel = accel_avg - expected_grav_body;
           // Only adopt the accel-derived orientation when we have no better
-          // one. If a pose source already seeded orientation (param or GT
-          // odom-init), keep it -- overwriting it here would jerk the
-          // already-published estimate, and the stationary assumption is
-          // invalid if that seed came from a moving vehicle.
-          if (!this->use_param_initial_pose_ && !this->use_odom_init_applied_) {
+          // one. [P2 FIX 2026-07-09] "Better one" must cover ALL seed
+          // sources: the old guard checked only the param-pose and GT
+          // odom-init flags, so an /initialpose (RViz) seed — which sets
+          // `initialized` and possibly `first_opt_done` but neither flag —
+          // was clobbered when the stationary window completed seconds
+          // later, permanently (the delta-form observer never restores
+          // absolute attitude, and first_opt_done being true blocks the
+          // first-scan re-init). Overwriting a live estimate also violates
+          // the stationary assumption if the vehicle has started moving.
+          if (!this->use_param_initial_pose_ && !this->use_odom_init_applied_ &&
+              !this->initialized.load() && !this->geo.first_opt_done.load()) {
             this->state.q = q_init;
             this->geo.prev_q = q_init;
           }
@@ -5927,16 +5999,26 @@ void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
     const double kBaseSigmaZ   = 0.10;   // m   — z less constrained by LiDAR
     const double kBaseSigmaRot = 0.01;   // rad — roll/pitch/yaw floor
     const double kFitnessScale = 1.0;    // sigma_xy = max(base, scale * sqrt(fitness))
-    bool cov_last_gicp_valid = false;
-    double cov_last_accepted_fitness = -1.0;
-    int cov_consecutive_failures = 0;
-    double cov_last_accepted_scan_stamp = -1.0;
+    // [P2 FIX 2026-07-09] NON-BLOCKING covariance snapshot. performLocalization
+    // holds pose_mutex across the entire GICP solve (p50 18 ms, p99 68 ms);
+    // taking it here — on EVERY IMU callback, in a MutuallyExclusive group —
+    // stalled the whole IMU pipeline for up to gicp_ms each scan (output gaps
+    // + delayed buffering => staler deskew clamp). try_lock instead: on
+    // contention we publish the previous snapshot (covariance inputs change
+    // once per scan; one-cycle staleness is immaterial). Statics are safe:
+    // the IMU group is MutuallyExclusive.
+    static bool cov_last_gicp_valid = false;
+    static double cov_last_accepted_fitness = -1.0;
+    static int cov_consecutive_failures = 0;
+    static double cov_last_accepted_scan_stamp = -1.0;
     {
-      std::lock_guard<std::mutex> pose_lock(this->pose_mutex);
-      cov_last_gicp_valid = this->last_gicp_valid_;
-      cov_last_accepted_fitness = this->last_accepted_fitness_score_;
-      cov_consecutive_failures = this->consecutive_failures_;
-      cov_last_accepted_scan_stamp = this->last_accepted_scan_stamp_;
+      std::unique_lock<std::mutex> pose_lock(this->pose_mutex, std::try_to_lock);
+      if (pose_lock.owns_lock()) {
+        cov_last_gicp_valid = this->last_gicp_valid_;
+        cov_last_accepted_fitness = this->last_accepted_fitness_score_;
+        cov_consecutive_failures = this->consecutive_failures_;
+        cov_last_accepted_scan_stamp = this->last_accepted_scan_stamp_;
+      }
     }
 
     double s_xy, s_z, s_rot;

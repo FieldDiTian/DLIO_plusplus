@@ -41,7 +41,10 @@ public:
     imu_input_topic_ = declare_parameter("imu_input_topic", "/atlas/imu_calibrated");
     imu_stamp_mode_ = declare_parameter("imu_stamp_mode", "auto");
     p1_like_threshold_sec_ = declare_parameter("p1_like_threshold_sec", 100000000.0);
-    imu_lookahead_ = static_cast<size_t>(declare_parameter("imu_arrival_retime_lookahead", 128));
+    // [P2 FIX 2026-07-09] clamp: a negative value wrapped to SIZE_MAX and the
+    // arrival-retime queue never published during continuous streaming.
+    imu_lookahead_ = static_cast<size_t>(
+        std::clamp<int64_t>(declare_parameter("imu_arrival_retime_lookahead", 128), 1, 4096));
     imu_flush_timeout_sec_ = declare_parameter("imu_flush_timeout_sec", 0.5);
     nominal_imu_period_sec_ = declare_parameter("nominal_imu_period_sec", 0.01);
     imu_period_sec_ = nominal_imu_period_sec_;
@@ -268,6 +271,11 @@ private:
     if (reliability == "reliable") {
       qos.reliable();
     } else {
+      if (reliability != "best_effort") {
+        RCLCPP_WARN(get_logger(),
+                    "Unrecognized reliability '%s'; using best_effort (check for a typo in YAML)",
+                    reliability.c_str());
+      }
       qos.best_effort();
     }
     qos.durability_volatile();
@@ -280,7 +288,46 @@ private:
     ++pose_in_count_;
     const double arrival = stampToSec(msg->header.stamp);
     const double p1_time = p1ToSec(msg->p1_time);
+
+    // [P2 FIX 2026-07-09] P1 epoch-reset detection (device power-cycle or
+    // bag loop): the clock mapper re-learns internally (see addPosePair);
+    // the node-side stamp map and sidecar cursor must reset with it or every
+    // subsequent output stays frozen at last+1us / the sidecar never matches.
+    if (std::isfinite(last_p1_time_) && p1_time < last_p1_time_ - 5.0) {
+      RCLCPP_WARN(get_logger(),
+                  "P1 time regressed %.3f -> %.3f (device power-cycle or bag loop); "
+                  "resetting stamp map and sidecar cursor",
+                  last_p1_time_, p1_time);
+      last_stamp_by_topic_.clear();
+      imu_p1_sidecar_index_ = 0;
+    }
+    if (std::isfinite(p1_time) && p1_time > 0.0 && p1_time < 4.0e9) {
+      last_p1_time_ = p1_time;
+    }
     clock_mapper_.addPosePair(arrival, p1_time);
+
+    // [P2 FIX 2026-07-09] Fail closed on invalid solutions. FusionEngine
+    // emits solution_type=Invalid(0) with NaN lla/rpy on every cold start
+    // and during full outages; LocalCartesian/rpyToQuat propagate the NaNs
+    // into /gps_p1/filtered_odom and /gnss, which downstream uses for INS
+    // heading priors and GT-snap recovery. The clock mapper above is still
+    // fed (it validates its own inputs).
+    const bool pose_finite =
+        std::isfinite(msg->latitude) && std::isfinite(msg->longitude) &&
+        std::isfinite(msg->altitude) && std::isfinite(msg->rpy.roll) &&
+        std::isfinite(msg->rpy.pitch) && std::isfinite(msg->rpy.yaw) &&
+        std::isfinite(msg->velflu.x) && std::isfinite(msg->velflu.y) &&
+        std::isfinite(msg->velflu.z);
+    if (msg->solution_type == 0 || !pose_finite) {
+      ++pose_dropped_invalid_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping invalid FusionEngine pose (solution_type=%u, finite=%d) — "
+                           "%lu dropped so far",
+                           static_cast<unsigned>(msg->solution_type),
+                           pose_finite ? 1 : 0,
+                           static_cast<unsigned long>(pose_dropped_invalid_count_));
+      return;
+    }
 
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = monotonicStamp("/gps_p1/filtered_odom", clock_mapper_.toRos(p1_time));
@@ -388,10 +435,18 @@ private:
         flushP1ImuQueue();
         return;
       }
+      // [P2 FIX 2026-07-09] With a sidecar configured, a tolerance miss must
+      // DROP the sample, not fall through to arrival-retime: the fallback
+      // stranded the sample in the arrival queue (which only drains at
+      // 128-depth or a full-stream stall), then injected it minutes later,
+      // stale and with a fabricated last+1us stamp. Losing ~1 sample per
+      // burst at 100+ Hz is negligible; mixing stamp domains is not.
+      ++sidecar_miss_drop_count_;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
-        "No IMU P1 sidecar match for capture stamp %.6f; falling back to imu_stamp_mode=%s.",
-        stamp, imu_stamp_mode_.c_str());
+        "No IMU P1 sidecar match for capture stamp %.6f; sample dropped (%lu so far).",
+        stamp, static_cast<unsigned long>(sidecar_miss_drop_count_));
+      return;
     }
 
     const bool p1_like = stamp > 0.0 && stamp < p1_like_threshold_sec_;
@@ -463,6 +518,24 @@ private:
   void flushP1ImuQueue()
   {
     if (!clock_mapper_.ready()) {
+      // [P2 FIX 2026-07-09] Previously this returned silently forever: with a
+      // wrong pose topic or GNSS down, every IMU sample queued unbounded and
+      // /gps_p1/imu published NOTHING with no diagnostic. Bound the queue
+      // (~10 s at 200 Hz) and say why the output is silent.
+      constexpr size_t kMaxP1ImuQueue = 2000;
+      if (p1_imu_queue_.size() > kMaxP1ImuQueue) {
+        while (p1_imu_queue_.size() > kMaxP1ImuQueue) {
+          p1_imu_queue_.pop_front();
+          ++p1_imu_dropped_not_ready_count_;
+        }
+      }
+      if (!p1_imu_queue_.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "/gps_p1/imu silent: %zu IMU samples queued but no pose pair yet on '%s' "
+                             "(clock mapper not ready; %lu oldest dropped)",
+                             p1_imu_queue_.size(), pose_input_topic_.c_str(),
+                             static_cast<unsigned long>(p1_imu_dropped_not_ready_count_));
+      }
       return;
     }
     while (!p1_imu_queue_.empty()) {
@@ -510,6 +583,17 @@ private:
   {
     double& last = last_stamp_by_topic_[topic];
     if (last > 0.0 && sec <= last) {
+      // [P2 FIX 2026-07-09] The +1us nudge is for us-scale jitter only. A
+      // regression larger than 1 s is a legitimate time reset (bag loop,
+      // device power-cycle): pass it through and re-anchor, instead of
+      // freezing the topic at last+1us forever.
+      if (last - sec > 1.0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Stamp on '%s' regressed by %.3f s — re-anchoring (time reset)",
+                             topic.c_str(), last - sec);
+        last = sec;
+        return secToStamp(sec);
+      }
       sec = last + 1e-6;
     }
     last = sec;
@@ -551,6 +635,10 @@ private:
   std::deque<QueuedImu> p1_imu_queue_;
   std::vector<ImuP1SidecarSample> imu_p1_sidecar_;
   size_t imu_p1_sidecar_index_ = 0;
+  double last_p1_time_ = std::numeric_limits<double>::quiet_NaN();  // P2 fix: epoch-reset detection
+  uint64_t pose_dropped_invalid_count_ = 0;       // P2 fix: NaN/Invalid solution drops
+  uint64_t sidecar_miss_drop_count_ = 0;          // P2 fix: sidecar tolerance misses
+  uint64_t p1_imu_dropped_not_ready_count_ = 0;   // P2 fix: bounded not-ready queue drops
   std::map<std::string, double> last_stamp_by_topic_;
 
   rclcpp::CallbackGroup::SharedPtr pose_group_;
