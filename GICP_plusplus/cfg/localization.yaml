@@ -151,9 +151,10 @@
     # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
     # time-matched GT sample so GICP can re-acquire from a known-good state.
     # The GT pose+twist is transformed from msg->child_frame_id into base_frame
-    # via TF (cached on first GT message). IMU biases are preserved. Disabled by
-    # default — production deployments without a GT topic keep the existing
-    # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
+    # via TF (cached on first GT message). IMU biases are preserved. This
+    # local-ENU profile enables recovery and therefore forces gt_odom/enable.
+    # Deployments without Atlas odometry must disable both GT recovery and the
+    # velocity shadow; rejected frames then retain IMU dead-reckoning behavior.
     localization/gt_recovery/enable: true
     # P2#3: raised 1 -> 5. With min=1 the snap fired on EVERY rejected frame
     # (1,860 snaps in run 12), masking dead-reckoning quality in all replay
@@ -161,9 +162,22 @@
     # gating, long rejection streaks should no longer occur, so the snap is
     # back to what it was meant to be: a last-resort recovery after a
     # sustained losing streak (~0.5 s at 10 Hz), not a per-frame crutch.
-    # Validation runs should ALSO do one pass with enable=false to expose the
-    # true dead-reckoning behavior (production has no GT topic).
     localization/gt_recovery/min_consecutive_failures: 5
+
+    # Stateful wrong-basin watchdog. Known-pose events (odom init and explicit
+    # GT recovery snaps) anchor an independent position track. Between anchors
+    # it consumes only Atlas body-frame velocity plus orientation; ordinary
+    # Atlas position is not used by the acceptance gate. Retained history uses
+    # cubic-Hermite interpolation for delayed scan queries, while forward
+    # holdover is bounded by maxAgeS. Once armed, stale/unavailable shadow state
+    # fails closed and enters the same five-frame recovery path above.
+    gicp/velocityShadow/enable: true
+    gicp/velocityShadow/maxHorizontalDivergenceM: 4.0
+    gicp/velocityShadow/maxAgeS: 0.15
+    gicp/velocityShadow/maxIntegrationGapS: 0.50
+    gicp/velocityShadow/maxAnchorAgeS: 300.0
+    gicp/velocityShadow/historyDurationS: 2.0
+    gicp/velocityShadow/failClosedAfterAnchor: true
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -495,7 +509,8 @@
     # the 120 s Run3->Run5 and Run5->Run3 smokes had medians 2.26 and 1.32.
     # A 1.0 cap therefore rejected essentially every usable solution. Keep a
     # 3.0 catastrophic cap while the relative, support, yaw, degeneracy and
-    # jump gates below continue to reject inconsistent candidates.
+    # jump and velocity-shadow gates below continue to reject inconsistent
+    # candidates.
     gicp/fitnessRejectThreshold: 3.0
     # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
     # converged"). The fallback exists for max-iterations-at-speed scans whose
