@@ -490,12 +490,13 @@
     gicp/transformationEpsilon: 0.004
     gicp/rotationEpsilon: 0.004
 
-    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
-    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
-    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
-    # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # small_gicp reports a Mahalanobis-style score whose measured cross-run
+    # floor on the 2026-07-11 full local-ENU maps is much higher than NanoGICP:
+    # the 120 s Run3->Run5 and Run5->Run3 smokes had medians 2.26 and 1.32.
+    # A 1.0 cap therefore rejected essentially every usable solution. Keep a
+    # 3.0 catastrophic cap while the relative, support, yaw, degeneracy and
+    # jump gates below continue to reject inconsistent candidates.
+    gicp/fitnessRejectThreshold: 3.0
     # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
     # converged"). The fallback exists for max-iterations-at-speed scans whose
     # correction is small; unbounded, it also admitted wrong-basin results
@@ -550,16 +551,16 @@
     #      This is the wrong-basin ENTRY signature the jump gate can't see
     #      (bad accepts had jump medians of only 1.87 m / 1.38 deg).
     gicp/fitnessBaseline/enable: true
-    gicp/fitnessBaseline/window: 201     # accepted-frame samples in the rolling median (~20 s @ 10 Hz)
+    gicp/fitnessBaseline/window: 101     # accepted-frame samples in the rolling median (~10 s @ 10 Hz)
     gicp/fitnessBaseline/minSamples: 50  # rolling median takes over after this many accepted frames
     # Warm-up seed (review fix): baseline used until minSamples accepted frames
     # exist, so the ratio gates and yaw veto are live from frame 1 — a replay
     # that starts mid-turn is otherwise unprotected during its most fragile
-    # window. Set from the previous run's scorecard floor
-    # (scripts/analyze_scan_debug_log.py; run-12 sparse cross-run map: 0.28).
-    # RE-MEASURE after the dense-map rebuild. 0 = off (absolute-only warm-up).
-    gicp/fitnessBaseline/seedBaseline: 0.28
-    gicp/fitnessRatioRejectThreshold: 2.0  # <=0 disables the wrong-basin ratio reject
+    # window. The 1.50 seed lies between the two measured small_gicp medians
+    # above; after 50 accepts the rolling per-map median takes over. 0 = off
+    # (absolute-only warm-up).
+    gicp/fitnessBaseline/seedBaseline: 1.50
+    gicp/fitnessRatioRejectThreshold: 2.25  # <=0 disables the wrong-basin ratio reject
     gicp/degeneracy/partialUpdate: true    # false = restore legacy binary hessian gate below
     # Full 6D coupled solution remapping (default). The re-centered hessian's
     # rotation coordinates are scaled by couplingLengthM (the typical
