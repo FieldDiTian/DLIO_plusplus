@@ -214,7 +214,10 @@
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
     # runs 19/20 measured 80-90 ms offsets.
-    localization/lidar_concat/aux_time_offsets: []
+    # ROS 2 cannot infer a typed double array from an empty YAML sequence when
+    # applying parameter overrides.  Two explicit zeros preserve the intended
+    # "missing entries = 0" behavior for the two configured auxiliary LiDARs.
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer

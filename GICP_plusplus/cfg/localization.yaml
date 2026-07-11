@@ -219,7 +219,10 @@
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
     # runs 19/20 measured 80-90 ms offsets.
-    localization/lidar_concat/aux_time_offsets: []
+    # ROS 2 cannot infer a typed double array from an empty YAML sequence when
+    # applying parameter overrides.  Two explicit zeros preserve the intended
+    # "missing entries = 0" behavior for the two configured auxiliary LiDARs.
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -483,11 +486,11 @@
     gicp/rotationEpsilon: 0.004
 
     # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
-    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
-    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
-    # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # small_gicp's score floor on the 2026-07-11 cross-run local-ENU maps is
+    # around 1.3--2.3, so the original 1.0 cap rejects geometrically usable
+    # solutions.  Keep this as a catastrophic cap; the existing relative,
+    # support, yaw, degeneracy and jump gates remain active below.
+    gicp/fitnessRejectThreshold: 3.0
     # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
     # converged"). The fallback exists for max-iterations-at-speed scans whose
     # correction is small; unbounded, it also admitted wrong-basin results
@@ -542,16 +545,15 @@
     #      This is the wrong-basin ENTRY signature the jump gate can't see
     #      (bad accepts had jump medians of only 1.87 m / 1.38 deg).
     gicp/fitnessBaseline/enable: true
-    gicp/fitnessBaseline/window: 201     # accepted-frame samples in the rolling median (~20 s @ 10 Hz)
+    gicp/fitnessBaseline/window: 101     # accepted-frame samples in the rolling median (~10 s @ 10 Hz)
     gicp/fitnessBaseline/minSamples: 50  # rolling median takes over after this many accepted frames
     # Warm-up seed (review fix): baseline used until minSamples accepted frames
     # exist, so the ratio gates and yaw veto are live from frame 1 — a replay
     # that starts mid-turn is otherwise unprotected during its most fragile
-    # window. Set from the previous run's scorecard floor
-    # (scripts/analyze_scan_debug_log.py; run-12 sparse cross-run map: 0.28).
-    # RE-MEASURE after the dense-map rebuild. 0 = off (absolute-only warm-up).
-    gicp/fitnessBaseline/seedBaseline: 0.28
-    gicp/fitnessRatioRejectThreshold: 2.0  # <=0 disables the wrong-basin ratio reject
+    # window. 1.50 is between the measured cross-run small_gicp floors; after
+    # 50 accepts the rolling per-map median takes over. 0 disables warm-up.
+    gicp/fitnessBaseline/seedBaseline: 1.50
+    gicp/fitnessRatioRejectThreshold: 2.25  # <=0 disables the wrong-basin ratio reject
     gicp/degeneracy/partialUpdate: true    # false = restore legacy binary hessian gate below
     # Full 6D coupled solution remapping (default). The re-centered hessian's
     # rotation coordinates are scaled by couplingLengthM (the typical
