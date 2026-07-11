@@ -27,13 +27,20 @@ def _launch_nodes(context, *args, **kwargs):
             "Pass p1_imu_pcap_path:=/path/to/ins.pcap, or set "
             "use_p1_imu_pcap:=false to consume the upstream IMU ROS topic."
         )
+    # [P2 FIX 2026-07-10j] Force IMU wiring ONLY in PCAP mode (the topic and
+    # stamp mode are then genuinely computed). On the live path, an unset
+    # launch argument must NOT be materialized into a parameter — the old
+    # code substituted "/atlas/imu_calibrated" for an empty argument and
+    # always injected it plus imu_stamp_mode, so YAML could never select a
+    # live IMU topic or a non-"auto" stamp mode. The node's own declared
+    # defaults already cover the unset case.
+    force_imu_keys = False
     if use_pcap:
         imu_input_topic = pcap_output_topic
         if imu_stamp_mode == "auto":
             # The PCAP replay node decodes IMU_OUTPUT.p1_time into header.stamp.
             imu_stamp_mode = "p1"
-    elif not imu_input_topic:
-        imu_input_topic = "/atlas/imu_calibrated"
+        force_imu_keys = True
 
     # [P3 FIX 2026-07-10] Only pass a launch value when it differs from the
     # launch-argument default: this dict OVERRIDES params_file, so passing the
@@ -55,10 +62,16 @@ def _launch_nodes(context, *args, **kwargs):
     _maybe(adapter_params, "use_sim_time", _text(context, "use_sim_time"),
            lambda v: _bool_text(v))
     _maybe(adapter_params, "pose_input_topic", _text(context, "pose_input_topic"))
-    # imu_input_topic / imu_stamp_mode carry pcap-derived logic — always pass
-    # (they are computed, not raw defaults).
-    adapter_params["imu_input_topic"] = imu_input_topic
-    adapter_params["imu_stamp_mode"] = imu_stamp_mode
+    # imu_input_topic / imu_stamp_mode: forced only in PCAP mode; on the live
+    # path pass them only when the operator set them explicitly.
+    if force_imu_keys:
+        adapter_params["imu_input_topic"] = imu_input_topic
+        adapter_params["imu_stamp_mode"] = imu_stamp_mode
+    else:
+        if imu_input_topic:
+            adapter_params["imu_input_topic"] = imu_input_topic
+        if imu_stamp_mode != "auto":
+            adapter_params["imu_stamp_mode"] = imu_stamp_mode
     _maybe(adapter_params, "publish_gnss_pose", _text(context, "publish_gnss_pose"),
            lambda v: _bool_text(v))
     _maybe(adapter_params, "summary_output_path", _text(context, "summary_output_path"))

@@ -1416,6 +1416,8 @@ void gicp_localization::LocalizationNode::getParams() {
   // Map parameters
   this->declare_parameter<std::string>("localization/map_path", "");
   this->declare_parameter<std::string>("localization/utm_transform_path", "");
+  // [P3 FIX 2026-07-10] optional ENU-datum enforcement against the map manifest
+  this->declare_parameter<std::string>("localization/expected_enu_origin", "");
   this->declare_parameter<std::string>("localization/utm_frame", "utm");
   this->declare_parameter<bool>("localization/visualize_map", true);
   this->declare_parameter<double>("localization/map_voxel_size_vis", 0.5);
@@ -2024,6 +2026,72 @@ bool gicp_localization::LocalizationNode::loadMap() {
   }
 
   RCLCPP_INFO(this->get_logger(), "Loading map from: %s", this->map_path_.c_str());
+
+  // [P3 FIX 2026-07-10] Map-provenance enforcement. The exporter writes
+  // <map>.pcd.manifest.yaml recording the frame and ENU datum; a map built
+  // with one origin used against an adapter configured for another is
+  // numerically valid but silently incompatible. Rules: a manifest declaring
+  // a non-ENU frame is FATAL; a configured localization/expected_enu_origin
+  // that mismatches the manifest is FATAL; a missing manifest (legacy map)
+  // or unspecified origin warns and proceeds.
+  {
+    const std::string manifest_path = this->map_path_ + ".manifest.yaml";
+    std::ifstream mf(manifest_path);
+    if (!mf.is_open()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "No map manifest at '%s' — cannot verify the map's frame/ENU datum "
+                  "(legacy export?). Re-export with scripts/export_glim_dump_to_pcd.py.",
+                  manifest_path.c_str());
+    } else {
+      std::string line, mf_frame, mf_origin;
+      while (std::getline(mf, line)) {
+        auto value_of = [&](const char* key) -> std::string {
+          const std::string k(key);
+          if (line.rfind(k, 0) != 0) return "";
+          std::string v = line.substr(k.size());
+          const size_t h = v.find('#');
+          if (h != std::string::npos) v = v.substr(0, h);
+          const auto b = v.find_first_not_of(" \t");
+          const auto e = v.find_last_not_of(" \t");
+          return (b == std::string::npos) ? "" : v.substr(b, e - b + 1);
+        };
+        if (mf_frame.empty()) { const auto v = value_of("frame:"); if (!v.empty()) mf_frame = v; }
+        if (mf_origin.empty()) { const auto v = value_of("enu_origin:"); if (!v.empty()) mf_origin = v; }
+      }
+      if (!mf_frame.empty() && mf_frame != "enu") {
+        RCLCPP_FATAL(this->get_logger(),
+                     "Map manifest declares frame='%s' (not 'enu'): this map is NOT compatible "
+                     "with the Atlas ENU seeds/GT this node consumes directly. Re-export with "
+                     "--frame enu.", mf_frame.c_str());
+        return false;
+      }
+      std::string expected_origin;
+      this->get_parameter("localization/expected_enu_origin", expected_origin);
+      if (!expected_origin.empty()) {
+        if (mf_origin.empty() || mf_origin.rfind("UNSPECIFIED", 0) == 0) {
+          RCLCPP_WARN(this->get_logger(),
+                      "localization/expected_enu_origin is set but the map manifest carries no "
+                      "datum — origin compatibility CANNOT be verified.");
+        } else if (mf_origin != expected_origin) {
+          RCLCPP_FATAL(this->get_logger(),
+                       "ENU datum mismatch: map manifest origin '%s' != expected '%s' — the map "
+                       "and the live adapter use different datums; localization would be "
+                       "silently wrong everywhere. Aborting.",
+                       mf_origin.c_str(), expected_origin.c_str());
+          return false;
+        } else {
+          RCLCPP_INFO(this->get_logger(), "Map manifest verified: frame=enu, origin matches ('%s')",
+                      mf_origin.c_str());
+        }
+      } else if (!mf_frame.empty()) {
+        RCLCPP_INFO(this->get_logger(),
+                    "Map manifest: frame=%s origin=%s (set localization/expected_enu_origin to "
+                    "enforce datum matching)", mf_frame.c_str(),
+                    mf_origin.empty() ? "(none)" : mf_origin.c_str());
+      }
+    }
+  }
+
 
   // Load PCD file
   if (pcl::io::loadPCDFile<PointType>(this->map_path_, *this->map_cloud) == -1) {
@@ -4952,10 +5020,19 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
       buf_newest = this->gt_odom_buffer_.back().stamp;
     }
   }
-  bool got = this->getGtPoseAt(this->scan_stamp.seconds(), gt);
+  // [P1 FIX 2026-07-10i] ONE validity time for the whole snap: the estimate
+  // the delta is measured against (current_pose = T_prior on the reject path
+  // that calls us) is a MEDIAN-point-time pose (t_prior_stamp_). Querying GT
+  // at the LiDAR HEADER stamp instead put ~half a sweep of REAL vehicle
+  // motion inside the correction delta (~3 m at 60 m/s with a 50 ms offset),
+  // biasing the live observer on every snap. Query GT at t_prior_stamp_ and
+  // retain that stamp for basePose/velocity backfills below.
+  const double snap_stamp =
+      (this->t_prior_stamp_ > 0.0) ? this->t_prior_stamp_ : this->scan_stamp.seconds();
+  bool got = this->getGtPoseAt(snap_stamp, gt);
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: lookup scan_stamp=%.3f got=%d buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
-              this->scan_stamp.seconds(), got, buf_size, buf_oldest, buf_newest, this->gt_odom_max_dt_);
+              "GT recovery: lookup snap_stamp=%.3f (median-time) got=%d buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
+              snap_stamp, got, buf_size, buf_oldest, buf_newest, this->gt_odom_max_dt_);
   if (!got) {
     RCLCPP_WARN(this->get_logger(),
                 "GT recovery: deferring snap — no GT sample within max_dt=%.3fs of scan stamp %.3f (streak=%d)",
@@ -5003,7 +5080,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
   } else {
     std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
     if (this->first_imu_received &&
-        std::abs(this->imu_meas.stamp - this->scan_stamp.seconds()) < 0.2) {
+        std::abs(this->imu_meas.stamp - snap_stamp) < 0.2) {
       // P3: imu_meas is bias-corrected at buffering time — use as-is.
       omega_base_body = this->imu_meas.ang_vel;
       omega_from_imu = true;
@@ -5018,7 +5095,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     lin_resolved = true;
   } else {
     Eigen::Vector3f v_fd_world;
-    if (this->getGtFiniteDiffVelWorld(this->scan_stamp.seconds(), v_fd_world)) {
+    if (this->getGtFiniteDiffVelWorld(snap_stamp, v_fd_world)) {
       v_base_body = q_new.conjugate() * v_fd_world;
       lin_resolved = true;
       lin_from_fd = true;
@@ -5116,8 +5193,10 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
     this->basePose.p = p_new;
     this->basePose.q = q_new;
-    // [REVIEW FIX 2026-07-08] The snap pose is the GT sample at the scan stamp.
-    this->base_pose_stamp_ = this->scan_stamp.seconds();
+    // [P1 FIX 2026-07-10i] The snap pose is the GT sample at snap_stamp
+    // (median point time) — matching the accept/reject stamps and the
+    // estimate the delta was formed against.
+    this->base_pose_stamp_ = snap_stamp;
     this->prev_vel = v_base_world;
   }
 
@@ -5132,7 +5211,8 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
 
   {
     geometry_msgs::msg::PoseStamped snap_msg;
-    snap_msg.header.stamp = this->scan_stamp;
+    snap_msg.header.stamp = rclcpp::Time(static_cast<int64_t>(snap_stamp * 1e9),
+                                         this->scan_stamp.get_clock_type());
     snap_msg.header.frame_id = this->map_frame;
     snap_msg.pose.position.x = p_new.x();
     snap_msg.pose.position.y = p_new.y();
@@ -5664,10 +5744,30 @@ gicp_localization::LocalizationNode::integrateImu(
     return wa;
   };
 
-  // Index of the last sample at/before start_time. The slice extends to a
-  // sample at/after end_time > start_time, so m + 1 is always a valid index.
+  // Index of the last sample at/before start_time.
+  // [SELF-AUDIT FIX 2026-07-10] The earlier claim "m + 1 is always valid"
+  // assumed start_time < end_time — FALSE on the deskew-off branch, where
+  // single_ts[0] is clamped to latest_imu: with a lagging/stalled IMU stream
+  // the seed time (previous median) can EXCEED every slice stamp, the loop
+  // drives m to size-1, and imu_slice[m + 1] read out of bounds. Guard both
+  // ways: reject when the seed is beyond the IMU horizon by more than a
+  // fraction of a scan period (too stale to place the seed honestly), else
+  // clamp m so the partial step extrapolates on the LAST real interval
+  // (idt > dt_int is fine — the formulas are polynomial in idt).
+  if (start_time - imu_slice.back().stamp > 0.2) {
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[IMU_INT] REJECT stale: seed %.6f is %.3fs beyond newest usable IMU %.6f\n",
+                   start_time, start_time - imu_slice.back().stamp, imu_slice.back().stamp);
+      std::fflush(stderr);
+    }
+    return empty;
+  }
   size_t m = 0;
   while (m + 1 < imu_slice.size() && imu_slice[m + 1].stamp <= start_time) m++;
+  if (m + 1 >= imu_slice.size()) {
+    m = imu_slice.size() - 2;  // size >= 2 guaranteed by the slice<2 reject above
+  }
 
   // Partial step: start_time -> imu_slice[m].stamp with interval (m, m+1)
   // dynamics (exact inverse of the forward interpolation formulas).

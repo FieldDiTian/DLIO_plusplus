@@ -545,6 +545,9 @@ int main(int argc, char** argv) {
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
           } else {
             spdlog::error("topic_type mismatch on aux topic {}: {} (expected PointCloud2)", topic_name, topic_type);
+            // [P2 FIX 2026-07-10j] Without this, the run quietly degraded to
+            // fewer LiDARs (require_all_aux=false) and exited 0.
+            hard_error = true;
           }
           is_aux = true;
           break;

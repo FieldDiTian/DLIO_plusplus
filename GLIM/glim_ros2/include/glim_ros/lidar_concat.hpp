@@ -50,10 +50,19 @@ inline double stamp_to_sec(const builtin_interfaces::msg::Time& stamp) {
 
 inline bool find_xyz_offsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
   x_off = y_off = z_off = -1;
+  // [P3 FIX 2026-07-10] Validate datatype/width, not just presence: a
+  // malformed-but-tight cloud can declare x/y/z as a non-FLOAT32 type or at
+  // an offset whose 4-byte read/write crosses the point boundary — the
+  // transform below would then corrupt adjacent point fields (or, on the
+  // last point, overrun the buffer). Reject the cloud instead.
+  const auto valid = [&](const sensor_msgs::msg::PointField& f) {
+    return f.datatype == sensor_msgs::msg::PointField::FLOAT32 && f.count == 1 &&
+           static_cast<size_t>(f.offset) + sizeof(float) <= msg.point_step;
+  };
   for (const auto& f : msg.fields) {
-    if (f.name == "x") x_off = f.offset;
-    else if (f.name == "y") y_off = f.offset;
-    else if (f.name == "z") z_off = f.offset;
+    if (f.name == "x") { if (!valid(f)) return false; x_off = f.offset; }
+    else if (f.name == "y") { if (!valid(f)) return false; y_off = f.offset; }
+    else if (f.name == "z") { if (!valid(f)) return false; z_off = f.offset; }
   }
   return x_off >= 0 && y_off >= 0 && z_off >= 0;
 }
@@ -264,6 +273,27 @@ inline void shift_cloud_timestamps(
     return;
   }
 
+  // [P3 FIX 2026-07-10] Per-width bounds for the generic (relative-time)
+  // branches — parity with the UINT8[8] path's guard above: a declared time
+  // field that does not fit its point must not be written.
+  {
+    size_t width = 0;
+    switch (time_datatype) {
+      case sensor_msgs::msg::PointField::UINT32:
+      case sensor_msgs::msg::PointField::FLOAT32: width = 4; break;
+      case sensor_msgs::msg::PointField::FLOAT64: width = 8; break;
+      default: return;  // unknown carrier: nothing safe to shift
+    }
+    if (point_step == 0 || static_cast<size_t>(time_off) + width > point_step) {
+      static bool warned_generic_bounds = false;
+      if (!warned_generic_bounds) {
+        spdlog::warn("shift_cloud_timestamps: time field (datatype={}) offset={} does not fit "
+                     "point_step={}; leaving unshifted", time_datatype, time_off, point_step);
+        warned_generic_bounds = true;
+      }
+      return;
+    }
+  }
   const size_t num_points = data.size() / point_step;
   for (size_t i = 0; i < num_points; i++) {
     uint8_t* time_ptr = &data[i * point_step + time_off];
@@ -606,6 +636,17 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   out.enabled = config_sensors.param<bool>("lidar_concat", "enabled", false);
   out.time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
   out.buffer_size = config_sensors.param<int>("lidar_concat", "buffer_size", 200);
+  // [P3 FIX 2026-07-10] Configuration validation, fail LOUD (same policy as
+  // aux_time_offsets): a negative/NaN threshold silently disables every aux
+  // match; a nonpositive buffer_size becomes a huge size_t downstream.
+  if (!std::isfinite(out.time_threshold) || out.time_threshold < 0.0) {
+    throw std::runtime_error("lidar_concat: time_threshold = " + std::to_string(out.time_threshold) +
+                             " is invalid (must be finite and >= 0)");
+  }
+  if (out.buffer_size <= 0) {
+    throw std::runtime_error("lidar_concat: buffer_size = " + std::to_string(out.buffer_size) +
+                             " is invalid (must be > 0)");
+  }
   out.require_all_aux = config_sensors.param<bool>("lidar_concat", "require_all_aux", false);
   out.abort_on_merge_failure = config_sensors.param<bool>("lidar_concat", "abort_on_merge_failure", true);
   out.max_consecutive_aux_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_aux_merge_failures", 10);

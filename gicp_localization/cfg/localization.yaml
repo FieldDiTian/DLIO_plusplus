@@ -9,6 +9,12 @@
 
     # UTM output: path to GLIM's T_world_utm.txt for the map being used.
     # Leave empty to disable UTM-frame publishing.
+    # [P3 FIX 2026-07-10] ENU-datum enforcement: set to the adapter's
+    # local_enu_origin string ('lat_deg,lon_deg,alt_m') to make loadMap()
+    # verify it against the map's .manifest.yaml — a datum mismatch is FATAL
+    # (map and adapter would disagree everywhere while looking plausible).
+    # Empty = warn-only informational check.
+    localization/expected_enu_origin: ""
     localization/utm_transform_path: ""
     localization/utm_frame: "utm"
 

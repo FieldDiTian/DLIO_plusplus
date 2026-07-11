@@ -14,6 +14,12 @@
     # Atlas local-ENU frame — leave this EMPTY for them, or the utm mirror
     # double-transforms. With an ENU map, map frame == ENU == GT frame, which is
     # what odom-init / GT snap / the cross-check assume.
+    # [P3 FIX 2026-07-10] ENU-datum enforcement: set to the adapter's
+    # local_enu_origin string ('lat_deg,lon_deg,alt_m') to make loadMap()
+    # verify it against the map's .manifest.yaml — a datum mismatch is FATAL
+    # (map and adapter would disagree everywhere while looking plausible).
+    # Empty = warn-only informational check.
+    localization/expected_enu_origin: ""
     localization/utm_transform_path: ""
     localization/utm_frame: "utm"
 

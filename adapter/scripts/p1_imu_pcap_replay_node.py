@@ -92,6 +92,22 @@ def network_payloads(path: Path) -> Iterator[Dict[str, object]]:
         if len(ip) < ihl:
             continue
 
+        # [P2 FIX 2026-07-10j] IPv4 fragmentation: nothing here reassembles.
+        # A non-first fragment has no UDP/TCP header (its bytes would be
+        # misparsed as one); a first fragment is a truncated datagram. Drop
+        # both — for the TCP path the seq-based reassembly then sees a gap
+        # and resyncs cleanly instead of ingesting corrupt bytes.
+        frag_field = struct.unpack_from("!H", ip, 6)[0]
+        if (frag_field & 0x2000) or (frag_field & 0x1FFF):
+            if not getattr(network_payloads, "_warned_fragmented", False):
+                network_payloads._warned_fragmented = True
+                print(
+                    "[p1_imu_pcap_replay] WARNING: fragmented IPv4 packet(s) in capture — "
+                    "dropped without reassembly (warned once)",
+                    flush=True,
+                )
+            continue
+
         total_len = struct.unpack_from("!H", ip, 2)[0]
         proto = ip[9]
         src_ip = ip_to_text(ip[12:16])
@@ -120,8 +136,13 @@ def network_payloads(path: Path) -> Iterator[Dict[str, object]]:
             data_offset = (transport[12] >> 4) * 4
             if len(transport) < data_offset:
                 continue
+            tcp_flags = transport[13]
             payload = transport[data_offset:]
-            if payload:
+            # [P3 FIX 2026-07-10] Surface SYN packets even when empty: the
+            # stream state uses them as the authoritative new-connection
+            # signal (sequence distance alone cannot distinguish a reconnect
+            # with a modestly lower ISN from a retransmission).
+            if payload or (tcp_flags & 0x02):
                 yield {
                     "packet_index": packet_index,
                     "pcap_time": pcap_time,
@@ -130,6 +151,7 @@ def network_payloads(path: Path) -> Iterator[Dict[str, object]]:
                     "dst": f"{dst_ip}:{dst_port}",
                     "payload": payload,
                     "tcp_seq": seq,
+                    "tcp_syn": bool(tcp_flags & 0x02),
                 }
 
 
@@ -190,9 +212,24 @@ class TcpStreamState:
         self.next_seq: Optional[int] = None
         self.gaps = 0
 
-    def feed(self, seq: Optional[int], payload: bytes) -> List[Dict[str, object]]:
+    def feed(self, seq: Optional[int], payload: bytes, syn: bool = False) -> List[Dict[str, object]]:
         if seq is None:
             return self.parser.feed(payload)
+
+        # [P3 FIX 2026-07-10] SYN is the AUTHORITATIVE new-connection signal:
+        # reset the parser and re-anchor sequencing regardless of where the
+        # new ISN lands (a reconnect with a modestly lower ISN was previously
+        # classified as a retransmission and its whole stream dropped). The
+        # 1 GiB distance heuristic below remains only as a fallback for
+        # captures that missed the handshake.
+        if syn and self.next_seq is not None:
+            self.gaps += 1
+            self.parser = FusionEngineParser()
+            self.next_seq = (seq + 1 + len(payload)) & 0xFFFFFFFF  # SYN consumes one seq
+            return self.parser.feed(payload) if payload else []
+        if syn:
+            self.next_seq = (seq + 1 + len(payload)) & 0xFFFFFFFF
+            return self.parser.feed(payload) if payload else []
 
         if self.next_seq is None:
             self.next_seq = seq + len(payload)
@@ -347,7 +384,8 @@ class P1ImuPcapReplay(Node):
                 state = streams.setdefault(key, TcpStreamState())
                 payload = packet["payload"]
                 assert isinstance(payload, (bytes, bytearray))
-                messages = state.feed(packet["tcp_seq"], bytes(payload))
+                messages = state.feed(packet["tcp_seq"], bytes(payload),
+                                      syn=bool(packet.get("tcp_syn", False)))
                 for message in messages:
                     msg_type = int(message["message_type"])
                     counts[msg_type] += 1

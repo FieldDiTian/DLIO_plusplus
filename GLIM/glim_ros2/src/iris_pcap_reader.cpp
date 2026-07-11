@@ -642,9 +642,13 @@ bool IrisPcapReader::feed_next_packet() {
       static uint64_t fragmented_count = 0;
       if (++fragmented_count == 1) {
         spdlog::warn("fragmented IPv4 Iris datagram encountered — fragments are NOT reassembled and "
-                     "their rays are lost; check capture MTU (warned once)");
+                     "the whole datagram is dropped; check capture MTU (warned once)");
       }
-      if (frag_offset != 0) continue;  // non-first fragment: no UDP header
+      // [P2 FIX 2026-07-10j] Drop the FIRST fragment as well: without
+      // reassembly it is a truncated datagram, and feeding it to scan
+      // assembly injected partial ray data (the earlier fix only skipped
+      // non-first fragments).
+      continue;
     }
     const uint8_t protocol = p[9];
     if (protocol != IPPROTO_UDP) continue;

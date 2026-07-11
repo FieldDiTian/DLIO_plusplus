@@ -176,8 +176,15 @@ def main() -> int:
         type=str,
         default="",
         help="ENU datum 'lat_deg,lon_deg,alt_m' used by the adapter/prep_bag for this dataset. "
-        "Recorded in the map manifest: a map and a live adapter using DIFFERENT origins are "
-        "numerically valid but mutually incompatible, and nothing else ties the datum to the map.",
+        "REQUIRED for --frame enu (recorded in the map manifest): a map and a live adapter "
+        "using DIFFERENT origins are numerically valid but mutually incompatible, and nothing "
+        "else ties the datum to the map.",
+    )
+    parser.add_argument(
+        "--allow-missing-origin",
+        action="store_true",
+        help="Escape hatch for legacy dumps whose origin is unknown: export without recording "
+        "a datum (the manifest will carry an explicit UNSPECIFIED warning).",
     )
     parser.add_argument(
         "--transform-file",
@@ -189,6 +196,14 @@ def main() -> int:
 
     if args.voxel_size < 0.0 or not math.isfinite(args.voxel_size):
         parser.error("--voxel-size must be finite and >= 0")
+    # [P3 FIX 2026-07-10] Provenance is ENFORCED, not just recorded: an ENU
+    # map without its datum cannot be validated against the live adapter.
+    if args.frame == "enu" and not args.enu_origin and not args.allow_missing_origin:
+        parser.error(
+            "--frame enu requires --enu-origin 'lat_deg,lon_deg,alt_m' (the adapter/prep_bag "
+            "datum for this dataset). Use --allow-missing-origin ONLY for legacy dumps whose "
+            "origin is unrecoverable."
+        )
     if args.stride < 1:
         parser.error("--stride must be >= 1")
 
@@ -250,7 +265,9 @@ def main() -> int:
             write_header(handle, total)
             with data_tmp.open("rb") as data_handle:
                 shutil.copyfileobj(data_handle, handle, length=8 * 1024 * 1024)
-        tmp.replace(args.output_pcd)
+        # [SELF-AUDIT FIX 2026-07-10] Manifest FIRST, then finalize the PCD:
+        # provenance is mandatory now, so a manifest-write failure must not
+        # leave a finished but unmanifested map behind.
         # [P2 FIX 2026-07-10b] Map manifest: record the frame and transform the
         # PCD was exported with, so the mapping->localization handoff is
         # auditable (reviewer requirement: the ENU conversion must be a
@@ -280,6 +297,7 @@ def main() -> int:
                 mh.write("applied_transform: none  # PCD is GLIM WORLD frame — NOT directly\n")
                 mh.write("#   compatible with Atlas ENU seeds/GT in gicp localization\n")
         print(f"[export_glim_dump_to_pcd] manifest: {manifest}")
+        tmp.replace(args.output_pcd)
         success = True
     finally:
         data_tmp.unlink(missing_ok=True)
