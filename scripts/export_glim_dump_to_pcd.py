@@ -15,6 +15,11 @@ its inverse, so the written PCD is in the Atlas local-ENU frame. When
 exporting an ENU map, leave GICP's ``localization/utm_transform_path`` EMPTY —
 the old world-frame workflow only worked to the extent T_world_utm happened
 to be near identity.
+
+For the INS-driven local-ENU mapping profile, GLIM world is already the
+adapter's local-ENU frame and no ``T_world_utm.txt`` exists. Use
+``--frame local-enu`` in that case: it performs no numeric transform but
+records the ENU datum and the correct map contract in the manifest.
 """
 
 from __future__ import annotations
@@ -164,19 +169,19 @@ def main() -> int:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument(
         "--frame",
-        choices=("enu", "world"),
+        choices=("enu", "local-enu", "world"),
         default="enu",
         help="Output frame. 'enu' (default) applies inverse T_world_utm from the dump so the "
-        "PCD matches the Atlas local-ENU poses GICP consumes directly; 'world' writes GLIM's "
-        "raw world frame (legacy behavior — GICP GT/seed poses will be frame-mismatched "
-        "unless T_world_utm happens to be identity).",
+        "PCD matches the Atlas local-ENU poses GICP consumes directly; 'local-enu' keeps an "
+        "INS-driven GLIM world unchanged because it is already adapter local-ENU; 'world' "
+        "writes an otherwise unspecified GLIM world frame (legacy behavior).",
     )
     parser.add_argument(
         "--enu-origin",
         type=str,
         default="",
         help="ENU datum 'lat_deg,lon_deg,alt_m' used by the adapter/prep_bag for this dataset. "
-        "REQUIRED for --frame enu (recorded in the map manifest): a map and a live adapter "
+        "REQUIRED for --frame enu/local-enu (recorded in the map manifest): a map and a live adapter "
         "using DIFFERENT origins are numerically valid but mutually incompatible, and nothing "
         "else ties the datum to the map.",
     )
@@ -198,9 +203,9 @@ def main() -> int:
         parser.error("--voxel-size must be finite and >= 0")
     # [P3 FIX 2026-07-10] Provenance is ENFORCED, not just recorded: an ENU
     # map without its datum cannot be validated against the live adapter.
-    if args.frame == "enu" and not args.enu_origin and not args.allow_missing_origin:
+    if args.frame in ("enu", "local-enu") and not args.enu_origin and not args.allow_missing_origin:
         parser.error(
-            "--frame enu requires --enu-origin 'lat_deg,lon_deg,alt_m' (the adapter/prep_bag "
+            f"--frame {args.frame} requires --enu-origin 'lat_deg,lon_deg,alt_m' (the adapter/prep_bag "
             "datum for this dataset). Use --allow-missing-origin ONLY for legacy dumps whose "
             "origin is unrecoverable."
         )
@@ -230,6 +235,13 @@ def main() -> int:
             f"[export_glim_dump_to_pcd] frame=enu: applying inverse T_world_utm from {tf_path} "
             f"(world-utm offset: t=[{T_world_utm[0,3]:.2f}, {T_world_utm[1,3]:.2f}, "
             f"{T_world_utm[2,3]:.2f}] m, yaw={yaw_deg:.2f} deg). Leave GICP's "
+            "localization/utm_transform_path EMPTY for this map.",
+            flush=True,
+        )
+    elif args.frame == "local-enu":
+        print(
+            "[export_glim_dump_to_pcd] frame=local-enu: keeping GLIM world unchanged because "
+            "the INS mapping profile already uses the adapter local-ENU frame. Leave GICP's "
             "localization/utm_transform_path EMPTY for this map.",
             flush=True,
         )
@@ -292,6 +304,9 @@ def main() -> int:
                 mh.write("T_world_utm:\n")
                 for row in T_world_utm:
                     mh.write("  - [" + ", ".join(f"{v:.10f}" for v in row) + "]\n")
+                mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
+            elif args.frame == "local-enu":
+                mh.write("applied_transform: none  # GLIM world already is adapter local-ENU\n")
                 mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
             else:
                 mh.write("applied_transform: none  # PCD is GLIM WORLD frame — NOT directly\n")
