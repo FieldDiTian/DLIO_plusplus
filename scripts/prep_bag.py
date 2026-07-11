@@ -560,7 +560,16 @@ def merge_raw_lidar_with_small_streams(
     final merge writes each small-stream message at its own header stamp.
     """
     print("[prep_bag] merging raw LiDAR messages with adapter small streams ...")
-    ensure_output_path(output_bag, True, "merged normalized output bag")
+
+    # ``work_dir`` is intentionally allowed to live inside ``output_bag`` so
+    # the prep logs travel with the normalized bag.  Do not remove
+    # ``output_bag`` here: doing so also removes ``small_bag`` before it can be
+    # read.  Write the rosbag into a sibling staging directory instead, then
+    # move only the completed bag files into the output directory.
+    staging_root = output_bag.with_name(f".{output_bag.name}.merge_staging")
+    staging_bag = staging_root / output_bag.name
+    ensure_output_path(staging_root, True, "normalized bag merge staging directory")
+    staging_root.mkdir(parents=True, exist_ok=False)
 
     raw_reader = open_bag_reader(raw_bag)
     small_reader = open_bag_reader(small_bag)
@@ -578,7 +587,7 @@ def merge_raw_lidar_with_small_streams(
 
     writer = rosbag2_py.SequentialWriter()
     writer.open(
-        rosbag2_py.StorageOptions(uri=str(output_bag), storage_id="mcap"),
+        rosbag2_py.StorageOptions(uri=str(staging_bag), storage_id="mcap"),
         rosbag2_py.ConverterOptions(
             input_serialization_format="cdr",
             output_serialization_format="cdr",
@@ -606,6 +615,14 @@ def merge_raw_lidar_with_small_streams(
             counts[topic] += 1
             small_next = read_next(small_reader, use_header_stamp_as_log_time=True)
     writer.close()
+
+    output_bag.mkdir(parents=True, exist_ok=True)
+    for child in staging_bag.iterdir():
+        target = output_bag / child.name
+        if target.exists():
+            die(f"normalized bag output file already exists: {target}")
+        child.replace(target)
+    shutil.rmtree(staging_root)
 
     for topic in topics:
         print(f"[prep_bag]   merged {topic}: {counts[topic]}")
