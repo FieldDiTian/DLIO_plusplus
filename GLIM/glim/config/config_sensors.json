@@ -12,11 +12,14 @@
     "enabled": true,
     "primary_frame": "luminar_front",
     "time_threshold": 0.1,
-    // Constant per-aux clock offsets (seconds, order = aux_topics) ADDED to
-    // aux header stamps for matching and to Luminar UINT8[8] absolute per-point
-    // timestamps for deskew. From diagnostics: mean=+X ms -> enter -X/1000.
-    // Empty keeps 0 for every aux.
-    "aux_time_offsets": [],
+    // Backward-compatible combined offsets. Header phase and absolute PTP
+    // point-clock correction are split below because changing the point clock
+    // must not select another 20 Hz buffered frame.
+    "aux_time_offsets": [0.0, 0.0],
+    "aux_match_time_offsets": [0.0, 0.0],
+    // aux order is left,right. Raw-bag audit on Run3 and Run5 found the
+    // selected left cloud aligned within 0.02 ms and right 100.04 ms behind.
+    "aux_point_time_offsets": [0.00002, 0.10004],
     "urdf_path": "av24.urdf",
     // Strict merge guard. Parity with GICP localization/lidar_concat/require_all_aux.
     // false = OPERATIONAL default: build/localize on whatever LiDARs merged this scan

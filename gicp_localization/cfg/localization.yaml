@@ -214,10 +214,15 @@
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
     # runs 19/20 measured 80-90 ms offsets.
-    # ROS 2 Jazzy cannot infer a parameter type from an empty YAML sequence.
-    # Keep the ucb-roar zero-offset behavior with an explicit double array;
-    # smoke diagnostics will determine whether measured corrections are needed.
+    # Backward-compatible combined offset. New runs use the split header-match
+    # and point-clock arrays below so correcting PTP does not select a different
+    # 20 Hz aux frame.
     localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
+    localization/lidar_concat/aux_match_time_offsets: [0.0, 0.0]
+    # aux order is right,left. Raw-bag audit on both Run3 and Run5 found the
+    # selected right cloud's UINT8[8] point clock 100.04 ms behind front; left
+    # is aligned within 0.02 ms.
+    localization/lidar_concat/aux_point_time_offsets: [0.10004, 0.00002]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
