@@ -50,6 +50,7 @@ def generate_launch_description():
     parent_frame = LaunchConfiguration('parent_frame', default='base_link')
     child_frame = LaunchConfiguration('child_frame', default='luminar_front')
     config_path = LaunchConfiguration('config_path', default='')
+    expected_enu_origin = LaunchConfiguration('expected_enu_origin', default='')
 
     declare_rviz_arg = DeclareLaunchArgument(
         'rviz', default_value=rviz, description='Launch RViz')
@@ -93,6 +94,10 @@ def generate_launch_description():
         'config_path', default_value='',
         description='Absolute path to the localization ROS-parameter YAML. '
                     'Empty uses the package cfg/localization.yaml.')
+    declare_expected_enu_origin_arg = DeclareLaunchArgument(
+        'expected_enu_origin', default_value='',
+        description='Expected local-ENU datum lat,lon,alt. When non-empty the '
+                    'map manifest must carry the same origin or map loading fails.')
 
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
 
@@ -158,6 +163,7 @@ def generate_launch_description():
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
             {'localization/lidar_concat/urdf_path': urdf_file},
+            {'localization/expected_enu_origin': expected_enu_origin},
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
@@ -220,6 +226,7 @@ def generate_launch_description():
         declare_child_frame_arg,
         declare_map_path_arg,
         declare_config_path_arg,
+        declare_expected_enu_origin_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
         OpaqueFunction(function=make_rviz_node),
