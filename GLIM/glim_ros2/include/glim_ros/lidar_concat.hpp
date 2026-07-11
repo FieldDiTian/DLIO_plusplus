@@ -31,11 +31,12 @@ struct AuxLidarSensor {
   Eigen::Isometry3d T_primary_sensor;
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> buffer;
   size_t buffer_size;
-  // Seconds ADDED to this aux LiDAR's header stamp and Luminar absolute
-  // per-point timestamps so matching/deskew use the primary/IMU timebase.
-  double time_offset = 0.0;
+  // Header phase controls buffered-frame selection; the absolute PTP point
+  // clock controls deskew. They are independent on the AV-24 bags.
+  double match_time_offset = 0.0;
+  double point_time_offset = 0.0;
   // P4#3 (GLIM parity with gicp_localization): signed corrected header-time
-  // offset stats vs the primary (aux + time_offset - primary), over MERGED
+  // offset stats vs the primary (aux + match_time_offset - primary), over MERGED
   // scans only. A stable nonzero mean after correction means the configured
   // per-aux clock offset is still wrong or missing.
   double dt_sum = 0.0;
@@ -497,7 +498,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 
   for (size_t aux_i = 0; aux_i < aux_sensors.size(); ++aux_i) {
     auto& aux = aux_sensors[aux_i];
-    auto match = find_nearest(aux.buffer, t_primary, time_threshold, aux.time_offset);
+    auto match = find_nearest(aux.buffer, t_primary, time_threshold, aux.match_time_offset);
     if (!match) {
       spdlog::debug("lidar_concat: no match for {} (t={:.3f})", aux.topic, t_primary);
       continue;
@@ -535,11 +536,11 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     uint8_t time_datatype;
     int time_count;
     const double raw_dt = stamp_to_sec(match->header.stamp) - t_primary;
-    const double dt = raw_dt + aux.time_offset;
+    const double dt = raw_dt + aux.match_time_offset;
     if (find_time_field(*match, time_off, time_datatype, time_count)) {
-      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt, aux.time_offset);
-      spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s (raw_dt={:.6f}s, clock_offset={:.6f}s)",
-                    aux.topic, dt, raw_dt, aux.time_offset);
+      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt, aux.point_time_offset);
+      spdlog::debug("lidar_concat: {} raw_dt={:.6f}s match_offset={:.6f}s point_offset={:.6f}s",
+                    aux.topic, raw_dt, aux.match_time_offset, aux.point_time_offset);
     }
 
     const size_t aux_pts = data.size() / point_step;
@@ -658,6 +659,10 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
 
   const auto aux_topics = config_sensors.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
   const auto aux_time_offsets = config_sensors.param<std::vector<double>>("lidar_concat", "aux_time_offsets", {});
+  auto aux_match_time_offsets = config_sensors.param<std::vector<double>>("lidar_concat", "aux_match_time_offsets", {});
+  auto aux_point_time_offsets = config_sensors.param<std::vector<double>>("lidar_concat", "aux_point_time_offsets", {});
+  if (aux_match_time_offsets.empty()) aux_match_time_offsets = aux_time_offsets;
+  if (aux_point_time_offsets.empty()) aux_point_time_offsets = aux_time_offsets;
   if (!aux_topics.empty()) {
     if (aux_time_offsets.size() < aux_topics.size()) {
       spdlog::warn(
@@ -670,6 +675,20 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
                    aux_time_offsets.size(), aux_topics.size());
     }
   }
+  const auto validate_offsets = [&aux_topics](const char* name, const std::vector<double>& values) {
+    if (values.size() != aux_topics.size()) {
+      spdlog::warn("lidar_concat: {} has {}/{} entries; missing entries default to 0.0",
+                   name, values.size(), aux_topics.size());
+    }
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (!std::isfinite(values[i]) || std::abs(values[i]) >= 1.0) {
+        throw std::runtime_error(std::string("lidar_concat: invalid ") + name + "[" +
+                                 std::to_string(i) + "]=" + std::to_string(values[i]));
+      }
+    }
+  };
+  validate_offsets("aux_match_time_offsets", aux_match_time_offsets);
+  validate_offsets("aux_point_time_offsets", aux_point_time_offsets);
 
   // A REQUIRED merge that is enabled with no aux topics is a config error. Hard-fail
   // only when the strict path is also set to abort; otherwise it is handled at
@@ -708,16 +727,18 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     AuxLidarSensor sensor;
     sensor.topic = topic;
     sensor.buffer_size = out.buffer_size;
-    sensor.time_offset = (i < aux_time_offsets.size()) ? aux_time_offsets[i] : 0.0;
+    sensor.match_time_offset = (i < aux_match_time_offsets.size()) ? aux_match_time_offsets[i] : 0.0;
+    sensor.point_time_offset = (i < aux_point_time_offsets.size()) ? aux_point_time_offsets[i] : 0.0;
     // [P3 FIX 2026-07-10] Configuration validation, fail LOUD: a NaN offset
     // made every match-window comparison false, silently disabling that aux
     // LiDAR for the whole run (the existing non-finite guard sits after a
     // successful match — unreachable for NaN). Offsets are clock corrections:
     // |off| >= 1 s is a config typo, not a measurement.
-    if (!std::isfinite(sensor.time_offset) || std::abs(sensor.time_offset) >= 1.0) {
+    if (!std::isfinite(sensor.match_time_offset) || std::abs(sensor.match_time_offset) >= 1.0 ||
+        !std::isfinite(sensor.point_time_offset) || std::abs(sensor.point_time_offset) >= 1.0) {
       throw std::runtime_error(
-        "lidar_concat: aux_time_offsets[" + std::to_string(i) + "] = " +
-        std::to_string(sensor.time_offset) + " is invalid (must be finite, |off| < 1 s)");
+        "lidar_concat: split time offset for aux[" + std::to_string(i) +
+        "] is invalid (must be finite, |off| < 1 s)");
     }
 
     if (use_urdf) {
@@ -752,7 +773,8 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
       sensor.T_primary_sensor = Eigen::Isometry3d(mat);
     }
 
-    spdlog::info("lidar_concat: auxiliary sensor {} enabled (time_offset={:+.6f}s)", sensor.topic, sensor.time_offset);
+    spdlog::info("lidar_concat: auxiliary sensor {} enabled (match_offset={:+.6f}s, point_offset={:+.6f}s)",
+                 sensor.topic, sensor.match_time_offset, sensor.point_time_offset);
     out.aux_sensors.push_back(std::move(sensor));
   }
   spdlog::info("lidar_concat: {} auxiliary sensors, threshold={:.3f}s", out.aux_sensors.size(), out.time_threshold);

@@ -873,13 +873,13 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
   // without any rebasing here.
   if (luminar_uint64) {
     (void)dt;
-    // P3 yaw-defect fix: absolute-epoch per-point times normally pass through
+    // Absolute-epoch per-point times normally pass through
     // unshifted (each point carries its own capture time). But a CONSTANT
     // clock offset between this aux LiDAR and the primary/IMU clock makes
     // those absolute times land on the wrong segment of the IMU motion during
     // deskew — warping the merged scan during turns and creating false yaw
     // pressure. When a measured offset is configured
-    // (lidar_concat/aux_time_offsets), correct the absolute times by it.
+    // (lidar_concat/aux_point_time_offsets), correct the absolute times by it.
     // [REVIEW FIX 2026-07-08 P3] Both accepted absolute-epoch carriers hold
     // the same raw uint64 ns bits (see luminarRawTimestampNsFromBytes):
     // UINT8[8] (deployed Iris) AND a mislabelled FLOAT64 field. The offset
@@ -1766,6 +1766,14 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // Order matches aux_topics; missing entries = 0.
   this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_time_offsets",
                                                std::vector<double>{});
+  // Header arrival/phase and the sensor's absolute PTP point clock are distinct
+  // on the AV-24 bags. Keeping them separate prevents a point-clock correction
+  // from changing which 20 Hz aux frame is selected. Empty arrays retain the
+  // legacy aux_time_offsets behavior for older configs.
+  this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_match_time_offsets",
+                                               std::vector<double>{});
+  this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_point_time_offsets",
+                                               std::vector<double>{});
   // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
   this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
   this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
@@ -1794,6 +1802,14 @@ void gicp_plusplus::LocalizationNode::getParams() {
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->get_parameter("localization/lidar_concat/aux_time_offsets", this->concat_aux_time_offsets_);
+  this->get_parameter("localization/lidar_concat/aux_match_time_offsets", this->concat_aux_match_time_offsets_);
+  this->get_parameter("localization/lidar_concat/aux_point_time_offsets", this->concat_aux_point_time_offsets_);
+  if (this->concat_aux_match_time_offsets_.empty()) {
+    this->concat_aux_match_time_offsets_ = this->concat_aux_time_offsets_;
+  }
+  if (this->concat_aux_point_time_offsets_.empty()) {
+    this->concat_aux_point_time_offsets_ = this->concat_aux_time_offsets_;
+  }
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
   this->get_parameter("localization/lidar_concat/primary_frame", this->concat_primary_frame_);
   this->get_parameter("localization/lidar_concat/urdf_path", this->concat_urdf_path_);
@@ -1853,6 +1869,20 @@ void gicp_plusplus::LocalizationNode::getParams() {
                     "lidar_concat: aux_time_offsets has %zu entries for %zu aux lidars; extra entries will be ignored",
                     this->concat_aux_time_offsets_.size(), this->aux_lidars_.size());
       }
+      const auto validate_offsets = [this](const char* name, const std::vector<double>& values) {
+        if (values.size() != this->aux_lidars_.size()) {
+          RCLCPP_WARN(this->get_logger(), "lidar_concat: %s has %zu entries for %zu aux lidars; missing entries use 0",
+                      name, values.size(), this->aux_lidars_.size());
+        }
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (!std::isfinite(values[i]) || std::abs(values[i]) >= 1.0) {
+            throw std::runtime_error(std::string("lidar_concat: invalid ") + name + "[" +
+                                     std::to_string(i) + "]=" + std::to_string(values[i]));
+          }
+        }
+      };
+      validate_offsets("aux_match_time_offsets", this->concat_aux_match_time_offsets_);
+      validate_offsets("aux_point_time_offsets", this->concat_aux_point_time_offsets_);
       for (const auto& a : this->aux_lidars_) {
         RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
                     a->topic.c_str(), a->frame.c_str());
@@ -3040,16 +3070,17 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     // Pick the aux scan whose header is closest in time to the primary header,
     // within the configured threshold.
     sensor_msgs::msg::PointCloud2::ConstSharedPtr match;
-    // P3 yaw-defect fix: correct a measured constant clock offset before any
-    // time comparison — matching, rebasing, and diagnostics all see the
-    // corrected aux timeline.
-    const double aux_clock_off = (aux_i < this->concat_aux_time_offsets_.size())
-                                     ? this->concat_aux_time_offsets_[aux_i] : 0.0;
+    // Header phase determines which buffered 20 Hz scan is selected. It must
+    // not be conflated with the absolute PTP correction applied to each point.
+    const double aux_match_off = (aux_i < this->concat_aux_match_time_offsets_.size())
+                                     ? this->concat_aux_match_time_offsets_[aux_i] : 0.0;
+    const double aux_point_off = (aux_i < this->concat_aux_point_time_offsets_.size())
+                                     ? this->concat_aux_point_time_offsets_[aux_i] : 0.0;
     double best_dt = std::numeric_limits<double>::max();
     {
       std::lock_guard<std::mutex> lk(aux.mtx);
       for (const auto& msg : aux.buffer) {
-        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() + aux_clock_off - t_primary);
+        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() + aux_match_off - t_primary);
         if (dt < best_dt) {
           best_dt = dt;
           match = msg;
@@ -3126,9 +3157,9 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     if (usable_time_field) {
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
-      const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
+      const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_match_off - t_primary;
       shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64,
-                           aux_clock_off);
+                           aux_point_off);
     } else if (this->deskew_) {
       // Without per-point timestamps the aux rays would deskew against the
       // primary scan's IMU integration with a stale (aux-header) reference,
@@ -3159,7 +3190,7 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     // clock offset against the P1 timebase, which a per-aux time-offset
     // correction upstream could absorb (and which inflates deskew error at
     // high yaw rates).
-    const double signed_dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
+    const double signed_dt = rclcpp::Time(match->header.stamp).seconds() + aux_match_off - t_primary;
     this->concat_last_aux_dt_[aux_i] = signed_dt;
     this->concat_last_aux_points_[aux_i] = static_cast<int>(aux_pts);
     aux.dt_sum += signed_dt;

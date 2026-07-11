@@ -267,7 +267,9 @@ private:
   int concat_last_merged_aux_ = -1;             // -1 = concat disabled / not run this frame
   std::vector<double> concat_last_aux_dt_;      // s, aux header - primary header; NaN = not merged
   std::vector<int> concat_last_aux_points_;     // appended points; 0 = not merged
-  std::vector<double> concat_aux_time_offsets_; // P3 fix: constant per-aux clock offset (s), order = aux_topics
+  std::vector<double> concat_aux_time_offsets_; // legacy combined offset; fallback for the split arrays below
+  std::vector<double> concat_aux_match_time_offsets_; // header-only correction used to select an aux scan
+  std::vector<double> concat_aux_point_time_offsets_; // absolute per-point clock correction used by deskew
   double last_scan_time_span_s_ = -1.0;         // merged-scan per-point time span (deskew path)
   bool last_deskew_applied_ = false;            // true only after per-point IMU compensation completes
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_merged_aux_count_pub;
