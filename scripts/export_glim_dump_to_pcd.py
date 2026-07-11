@@ -286,10 +286,14 @@ def main() -> int:
         # GUARANTEED pipeline step, not an operator convention).
         manifest = args.output_pcd.with_suffix(args.output_pcd.suffix + ".manifest.yaml")
         with manifest.open("w", encoding="utf-8") as mh:
+            output_frame = "enu" if args.frame in ("enu", "local-enu") else "world"
             mh.write("# Map provenance manifest (written by export_glim_dump_to_pcd.py)\n")
             mh.write(f"exported_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
             mh.write(f"source_dump: {args.dump_dir.resolve()}\n")
-            mh.write(f"frame: {args.frame}\n")
+            # ``frame`` is the output coordinate contract consumed by GICP.
+            # ``export_mode`` records how that ENU result was obtained.
+            mh.write(f"frame: {output_frame}\n")
+            mh.write(f"export_mode: {args.frame}\n")
             mh.write(f"points: {total}\n")
             mh.write(f"voxel_size: {args.voxel_size}\n")
             mh.write(f"stride: {args.stride}\n")
