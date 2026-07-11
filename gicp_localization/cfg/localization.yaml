@@ -160,6 +160,19 @@
     # true dead-reckoning behavior (production has no GT topic).
     localization/gt_recovery/min_consecutive_failures: 5
 
+    # Wrong-basin watchdog shared with small_gicp. Odom-init and explicit GT
+    # recovery events provide the position anchors; between anchors the track
+    # integrates only Atlas body velocity and orientation. It therefore catches
+    # a sequence of individually-small GICP corrections that drifts into a
+    # coherent wrong basin without using ordinary Atlas position as a gate.
+    gicp/velocityShadow/enable: true
+    gicp/velocityShadow/maxHorizontalDivergenceM: 4.0
+    gicp/velocityShadow/maxAgeS: 0.15
+    gicp/velocityShadow/maxIntegrationGapS: 0.50
+    gicp/velocityShadow/maxAnchorAgeS: 300.0
+    gicp/velocityShadow/historyDurationS: 2.0
+    gicp/velocityShadow/failClosedAfterAnchor: true
+
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
     # the real base_link -> luminar_front transform, so the node internally

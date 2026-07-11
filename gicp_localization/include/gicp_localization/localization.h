@@ -113,6 +113,16 @@ private:
   // T_base_gtbody_ extrinsic. Returns false when gt extrinsics are unavailable.
   bool composeGtTwistInBase(const GtSample& gt, Eigen::Vector3f& v_lin_body_out,
                             Eigen::Vector3f& v_ang_body_out) const;
+  // Independent wrong-basin watchdog. It uses Atlas orientation and body
+  // velocity, but never ordinary Atlas position after a known-pose anchor.
+  void updateVelocityShadowFromGt(const GtSample& gt);
+  void resetVelocityShadow(const Eigen::Vector3f& p_world,
+                           const Eigen::Vector3f& v_world,
+                           double stamp, const char* reason);
+  bool velocityShadowAt(double stamp, Eigen::Vector3f& p_world,
+                        double& age_s, double& anchor_age_s,
+                        uint64_t& reset_count,
+                        bool& fail_closed_if_unavailable) const;
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
   bool maybeSnapPoseToGT(const char* reason);
@@ -187,6 +197,28 @@ private:
   std::deque<GtSample> gt_odom_buffer_;
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
+
+  bool velocity_shadow_enabled_ = false;
+  double velocity_shadow_max_horizontal_divergence_m_ = 4.0;
+  double velocity_shadow_max_age_s_ = 0.15;
+  double velocity_shadow_max_integration_gap_s_ = 0.5;
+  double velocity_shadow_max_anchor_age_s_ = 300.0;
+  double velocity_shadow_history_duration_s_ = 2.0;
+  bool velocity_shadow_fail_closed_after_anchor_ = true;
+  struct VelocityShadowSample {
+    double stamp = -1.0;
+    Eigen::Vector3f p_world = Eigen::Vector3f::Zero();
+    Eigen::Vector3f v_world = Eigen::Vector3f::Zero();
+  };
+  mutable std::mutex velocity_shadow_mtx_;
+  std::atomic<bool> velocity_shadow_anchor_seen_{false};
+  bool velocity_shadow_initialized_ = false;
+  Eigen::Vector3f velocity_shadow_p_ = Eigen::Vector3f::Zero();
+  Eigen::Vector3f velocity_shadow_v_world_ = Eigen::Vector3f::Zero();
+  double velocity_shadow_stamp_ = -1.0;
+  double velocity_shadow_anchor_stamp_ = -1.0;
+  uint64_t velocity_shadow_reset_count_ = 0;
+  std::deque<VelocityShadowSample> velocity_shadow_history_;
 
   // RTK quality gate for the gt_odom buffer (P1-native). Drops samples whose
   // Atlas-reported pose covariance (pose.covariance[0,7,14] -- xx, yy, zz)
@@ -320,6 +352,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_veto_pub;           // 1.0 when the yaw-consistency veto zeroed the yaw correction
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_innovation_pub;      // raw GICP-vs-IMU yaw disagreement (deg, pre-veto)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_stiffness_pub;        // marginal yaw information of the scan (Schur, re-centered)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_velocity_shadow_err_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_velocity_shadow_age_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_velocity_shadow_anchor_age_pub;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_velocity_shadow_available_pub;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_snap_applied_pub;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
