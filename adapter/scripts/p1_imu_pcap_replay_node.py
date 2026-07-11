@@ -198,19 +198,34 @@ class TcpStreamState:
             self.next_seq = seq + len(payload)
             return self.parser.feed(payload)
 
-        if seq < self.next_seq:
-            overlap = self.next_seq - seq
-            if overlap >= len(payload):
-                return []
-            payload = payload[overlap:]
-            self.next_seq = self.next_seq + len(payload)
+        # [P3 FIX 2026-07-10] Wrap-aware, reconnect-tolerant sequencing.
+        # Plain comparisons broke on (a) 32-bit sequence wrap in multi-GB
+        # captures and (b) a reconnect reusing the same 4-tuple whose new ISN
+        # lands below the stale next_seq — every packet then looked like a
+        # full retransmission and the remainder of the stream was silently
+        # dropped. Interpret the difference as signed 32-bit: small negative =
+        # overlap/retransmit, large magnitude either way = new connection.
+        NEW_CONNECTION_WINDOW = 0x40000000  # 1 GiB of sequence space
+        diff = (seq - self.next_seq) & 0xFFFFFFFF
+        if diff >= 0x80000000:
+            behind = 0x100000000 - diff
+            if behind > NEW_CONNECTION_WINDOW:
+                # Reconnect with a lower ISN: resync rather than discard.
+                self.gaps += 1
+                self.parser = FusionEngineParser()
+                self.next_seq = (seq + len(payload)) & 0xFFFFFFFF
+                return self.parser.feed(payload)
+            if behind >= len(payload):
+                return []  # pure retransmission
+            payload = payload[behind:]
+            self.next_seq = (self.next_seq + len(payload)) & 0xFFFFFFFF
             return self.parser.feed(payload)
 
-        if seq > self.next_seq:
+        if diff > 0:
             self.gaps += 1
             self.parser = FusionEngineParser()
 
-        self.next_seq = seq + len(payload)
+        self.next_seq = (seq + len(payload)) & 0xFFFFFFFF
         return self.parser.feed(payload)
 
 

@@ -111,10 +111,14 @@ bool posePassesRtkGate(const fusion_engine_msgs::msg::Pose& msg,
                        double max_var_xy,
                        double max_var_z)
 {
+  // [P3 FIX 2026-07-10] Require finite NONNEGATIVE covariance: `<= max`
+  // alone let a negative sentinel (-1 = "unknown" in some publishers) pass
+  // the accuracy gate whenever solution_type said RTK_FIXED.
+  const auto ok = [](double v, double mx) { return std::isfinite(v) && v >= 0.0 && v <= mx; };
   return msg.solution_type == kRtkFixed &&
-         msg.position_covariance[0] <= max_var_xy &&
-         msg.position_covariance[4] <= max_var_xy &&
-         msg.position_covariance[8] <= max_var_z;
+         ok(msg.position_covariance[0], max_var_xy) &&
+         ok(msg.position_covariance[4], max_var_xy) &&
+         ok(msg.position_covariance[8], max_var_z);
 }
 
 // [P2 FIX 2026-07-09] bin_seconds <= 0 previously produced NaN/inf bins and
@@ -146,6 +150,7 @@ void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
       bins_.clear();
       first_p1_ = p1_time;
       forward_glitch_streak_ = 0;
+      applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
     } else if (rel > kMaxSessionSec) {
       // Single forward glitches are rejected; a persistent forward jump is a
       // real epoch change and resets the mapper.
@@ -153,6 +158,7 @@ void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
         bins_.clear();
         first_p1_ = p1_time;
         forward_glitch_streak_ = 0;
+        applied_offset_ = std::numeric_limits<double>::quiet_NaN();  // P3: re-anchor slew
       } else {
         return;
       }
@@ -183,7 +189,7 @@ bool P1ClockMapper::ready() const
   return std::any_of(bins_.begin(), bins_.end(), [](const Bin& b) { return b.count > 0; });
 }
 
-double P1ClockMapper::toRos(double p1_time) const
+double P1ClockMapper::toRos(double p1_time)
 {
   std::vector<std::pair<double, double>> envelope;
   envelope.reserve(bins_.size());
@@ -195,6 +201,7 @@ double P1ClockMapper::toRos(double p1_time) const
   if (envelope.empty()) {
     return p1_time;
   }
+  double target_offset;
   if (envelope.size() == 1 || offsetDrift(envelope) < 0.005) {
     std::vector<double> offsets;
     offsets.reserve(envelope.size());
@@ -203,21 +210,36 @@ double P1ClockMapper::toRos(double p1_time) const
     }
     const size_t mid = offsets.size() / 2;
     std::nth_element(offsets.begin(), offsets.begin() + static_cast<long>(mid), offsets.end());
-    return p1_time + offsets[mid];
-  }
-
-  if (p1_time <= envelope.front().first) {
-    return p1_time + envelope.front().second;
-  }
-  for (size_t i = 1; i < envelope.size(); ++i) {
-    if (p1_time <= envelope[i].first) {
-      const double t0 = envelope[i - 1].first;
-      const double t1 = envelope[i].first;
-      const double u = (p1_time - t0) / std::max(1e-9, t1 - t0);
-      return p1_time + envelope[i - 1].second * (1.0 - u) + envelope[i].second * u;
+    target_offset = offsets[mid];
+  } else if (p1_time <= envelope.front().first) {
+    target_offset = envelope.front().second;
+  } else {
+    target_offset = envelope.back().second;
+    for (size_t i = 1; i < envelope.size(); ++i) {
+      if (p1_time <= envelope[i].first) {
+        const double t0 = envelope[i - 1].first;
+        const double t1 = envelope[i].first;
+        const double u = (p1_time - t0) / std::max(1e-9, t1 - t0);
+        target_offset = envelope[i - 1].second * (1.0 - u) + envelope[i].second * u;
+        break;
+      }
     }
   }
-  return p1_time + envelope.back().second;
+
+  // [P3 FIX 2026-07-10] Slew instead of stepping: bounded offset motion of
+  // 0.5 ms per second of stream keeps consecutive output stamps' dt within
+  // ~0.5% of nominal even while bin refinement moves the raw estimate.
+  constexpr double kMaxSlewPerSec = 5e-4;
+  if (!std::isfinite(applied_offset_) || !std::isfinite(last_slew_p1_) ||
+      p1_time < last_slew_p1_ - 1.0) {
+    applied_offset_ = target_offset;  // first use or epoch reset: re-anchor
+  } else {
+    const double budget = kMaxSlewPerSec * std::max(0.0, p1_time - last_slew_p1_) + 1e-12;
+    const double delta = target_offset - applied_offset_;
+    applied_offset_ += std::clamp(delta, -budget, budget);
+  }
+  last_slew_p1_ = p1_time;
+  return p1_time + applied_offset_;
 }
 
 double P1ClockMapper::driftMs() const

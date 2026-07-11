@@ -590,7 +590,8 @@ private:
   bool   yaw_gate_enable_;               // turn-aware GICP-vs-IMU yaw consistency veto
   double yaw_gate_max_corr_deg_;         // SOFT veto: yaw corr above this AND ratio above fitnessRatio
   double yaw_gate_fitness_ratio_;        // soft-tier arming ratio (low-confidence match)
-  double yaw_gate_hard_max_corr_deg_;    // HARD veto: unconditional yaw-corr bound (<=0 off) — P1 yaw-safety
+  double yaw_gate_hard_max_corr_deg_;
+  double gicp_rp_hard_max_corr_deg_;      // P2 fix 2026-07-10h: rp innovation clamp (<=0 off)    // HARD veto: unconditional yaw-corr bound (<=0 off) — P1 yaw-safety
   double gicp_nonconv_ok_max_trans_m_;   // PR#6: max correction for the non-converged fitness fallback (<=0 off)
   double gicp_nonconv_ok_max_rot_deg_;   // PR#6: max rotation for the non-converged fitness fallback (<=0 off)
   int gicp_min_correspondences_;         // support gate: min inlier correspondences (<=0 off)

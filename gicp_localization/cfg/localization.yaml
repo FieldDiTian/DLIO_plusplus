@@ -165,9 +165,9 @@
     localization/initial_pose/x: 12.602963     # meters
     localization/initial_pose/y: -9.739742      # meters
     localization/initial_pose/z: -33.576455      # meters
-    localization/initial_pose/roll: -0.021723   # radians (-0.134 deg)
-    localization/initial_pose/pitch: 0.024880 # radians (-2.007 deg)
-    localization/initial_pose/yaw: 2.711203   # radians (-0.289 deg)
+    localization/initial_pose/roll: -0.021723   # radians (-1.245 deg) [P3 FIX 2026-07-10: comment corrected]
+    localization/initial_pose/pitch: 0.024880 # radians (+1.426 deg) [P3 FIX 2026-07-10: comment corrected]
+    localization/initial_pose/yaw: 2.711203   # radians (+155.340 deg) [P3 FIX 2026-07-10: comment corrected — was wildly wrong]
 
     # Preprocessing Parameters (override defaults for localization)
     # Crop box filter: keeps points within ±size meters of the sensor origin.
@@ -258,6 +258,11 @@
 
     # LiDAR sensor type for per-point timestamp handling during deskewing
     # Options: ouster, velodyne, hesai, livox, luminar
+    # [P3 FIX 2026-07-10] FLOAT32 per-point time caveat: the velodyne/hesai
+    # decode paths ASSUME FLOAT32 time fields are SECONDS (relative). That
+    # convention is sensor-dependent and undeclared in PointCloud2 — a driver
+    # emitting ms/us deskews with a 1e3/1e6 time-scale error. Verify units
+    # before enabling a new sensor type.
     localization/sensor_type: "luminar"
 
     # IMU and Deskewing Parameters
@@ -417,6 +422,11 @@
     localization/debug/enable_jump_log: false
     localization/debug/verbose_scan_log: true
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
+    # [P3 NOTE 2026-07-10] RE-BASELINE REQUIRED: gicp/hessianCondMax, the
+    # degeneracy relFloor*, fitness seedBaseline and the yawGate fitness
+    # ratios were calibrated under PRE-2026-07-08 semantics (augmented
+    # Hessian, collapsed per-point deskew). Re-measure from the first
+    # post-fix replay scorecard before trusting marginal cases.
     localization/debug/jump_trans_m: 30.0      # Base reject threshold if pose jumps > this (meters)
     localization/debug/jump_rot_deg: 30.0     # Base reject threshold if pose jumps > this (degrees)
     # Speed/scan_dt-aware jump-gate scaling (P2#2). The jump is GICP-vs-IMU-prior,
@@ -561,6 +571,15 @@
     #    map structure and slow gyro drift cannot accumulate in fixed axes.
     gicp/dof/mode: "4dof"
     gicp/dof/full6dofEveryN: 10
+    # [P2 FIX 2026-07-10h] Roll/pitch innovation clamp — the attitude analogue
+    # of yawGate/hardMaxCorrDeg. The full6dofEveryN re-anchor scans previously
+    # ran with NO attitude protection (both priors default 0; the generic
+    # rotation jump gate is ~30 deg + time scaling): bad roll/pitch from
+    # repeated map structure could pass while yaw had its 8 deg guard. The rp
+    # delta vs the IMU prior is CLAMPED (scaled, not zeroed) to this bound so
+    # the refresh still re-anchors by the small amounts it exists for. Gyro
+    # rp drift over one scan gap is <<1 deg; 3.0 gives wide margin. <=0 off.
+    gicp/rpGate/hardMaxCorrDeg: 3.0
     # 2) Soft attitude prior INSIDE the optimizer (the deep P1 cause: no IMU
     #    yaw term existed, so plausible correspondences on repeated curbs /
     #    barriers could pull yaw into a wrong basin unopposed). Info is rad^-2

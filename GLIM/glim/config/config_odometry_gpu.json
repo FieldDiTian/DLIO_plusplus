@@ -55,18 +55,20 @@
     // "init_T_world_imu": [0.0, 0.0, 0.0, -0.005250, 0.011631, 0.947658, 0.319032],
     // "init_v_world_imu": [-7.5108, 5.8182, -0.3548],
     // Optimization params
-    // smoother_lag bounds how far back iSAM2 can retroactively redistribute
-    // error when a new factor (e.g. a GNSS reacquisition prior after a tunnel)
-    // disagrees with the propagated trajectory. For the AV-24 RTK-tolerant
-    // mapping use case the value must be ≥ the longest expected GNSS-denied
-    // passage duration. Examples at typical mapping speeds:
-    //   * Putnam Park / flat track (rarely denied)          -> 2-5 s is fine
-    //   * Tunnel ≤200 m at 5 m/s mapping speed              -> needs ≥ 40 s
-    //   * Mountain switchback canyon ≤500 m at 5 m/s        -> needs ≥ 100 s
-    // 30.0 s here covers most short-to-moderate dropouts; bump higher if
-    // the route includes longer continuous denials.  Trade-off: larger
-    // smoother_lag = larger active iSAM2 variable set = more CPU per update.
-    "smoother_lag": 30.0,
+    // smoother_lag bounds how far back the LOCAL odometry fixed-lag smoother
+    // can retroactively redistribute error. [FIX 2026-07-10] The previous
+    // 30 s value was justified by GNSS retro-correction across dropouts —
+    // but GNSS priors are inserted into the GLOBAL submap graph
+    // (gnss_global module -> on_smoother_update of GlobalMapping), NOT into
+    // this local OdometryEstimationIMU smoother, which contains only
+    // IMU + scan-matching factors. The 30 s lag therefore paid a large
+    // active-variable iSAM2 cost per update without providing the documented
+    // benefit; GNSS-denied continuity is the global graph's job (see
+    // config_gnss_global.json max_interp_gap_sec and the submap anchors).
+    // 5.0 s matches the upstream GLIM default for local odometry and is
+    // ample for IMU-bias/velocity observability. NOTE: maps produced before
+    // 2026-07-10 were built with 30.0.
+    "smoother_lag": 5.0,
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,
     "isam2_relinearize_thresh": 0.1,

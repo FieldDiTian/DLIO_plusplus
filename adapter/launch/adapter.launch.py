@@ -35,18 +35,36 @@ def _launch_nodes(context, *args, **kwargs):
     elif not imu_input_topic:
         imu_input_topic = "/atlas/imu_calibrated"
 
-    adapter_params = {
-        "use_sim_time": _bool_text(_text(context, "use_sim_time")),
-        "pose_input_topic": _text(context, "pose_input_topic"),
-        "imu_input_topic": imu_input_topic,
-        "publish_gnss_pose": _bool_text(_text(context, "publish_gnss_pose")),
-        "summary_output_path": _text(context, "summary_output_path"),
-        "imu_stamp_mode": imu_stamp_mode,
-        "imu_p1_sidecar_path": _text(context, "imu_p1_sidecar_path"),
-        "imu_p1_sidecar_match_tolerance_sec": float(
-            _text(context, "imu_p1_sidecar_match_tolerance_sec")
-        ),
+    # [P3 FIX 2026-07-10] Only pass a launch value when it differs from the
+    # launch-argument default: this dict OVERRIDES params_file, so passing the
+    # defaults unconditionally silently shadowed YAML edits for these keys.
+    # (Setting a launch arg explicitly to its default value is still fine —
+    # the YAML then wins, which matches the operator's mental model.)
+    _launch_defaults = {
+        "use_sim_time": "true",
+        "pose_input_topic": "/atlas/pose_filtered",
+        "publish_gnss_pose": "true",
+        "summary_output_path": "",
+        "imu_p1_sidecar_path": "",
+        "imu_p1_sidecar_match_tolerance_sec": "0.02",
     }
+    def _maybe(params, key, value, cast=None):
+        if str(value) != _launch_defaults.get(key, object()):
+            params[key] = cast(value) if cast else value
+    adapter_params = {}
+    _maybe(adapter_params, "use_sim_time", _text(context, "use_sim_time"),
+           lambda v: _bool_text(v))
+    _maybe(adapter_params, "pose_input_topic", _text(context, "pose_input_topic"))
+    # imu_input_topic / imu_stamp_mode carry pcap-derived logic — always pass
+    # (they are computed, not raw defaults).
+    adapter_params["imu_input_topic"] = imu_input_topic
+    adapter_params["imu_stamp_mode"] = imu_stamp_mode
+    _maybe(adapter_params, "publish_gnss_pose", _text(context, "publish_gnss_pose"),
+           lambda v: _bool_text(v))
+    _maybe(adapter_params, "summary_output_path", _text(context, "summary_output_path"))
+    _maybe(adapter_params, "imu_p1_sidecar_path", _text(context, "imu_p1_sidecar_path"))
+    _maybe(adapter_params, "imu_p1_sidecar_match_tolerance_sec",
+           _text(context, "imu_p1_sidecar_match_tolerance_sec"), float)
     local_enu_origin = _text(context, "local_enu_origin")
     local_enu_origin_ttl_path = _text(context, "local_enu_origin_ttl_path")
     if local_enu_origin and local_enu_origin_ttl_path:

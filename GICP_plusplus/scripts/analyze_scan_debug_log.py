@@ -43,7 +43,7 @@ ROW = re.compile(
     r".*?gicp_ms=(?P<ms>[-\d.]+|n/a)"
     r".*?fitness=(?P<fit>[-\d.eE+]+|n/a)"
     r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a))?"
-    r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d),partial=(?P<pu>\d)\])?"
+    r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d)(?:,rp_clamp=(?P<rpc>\d))?,partial=(?P<pu>\d)\])?"
     r"(?:.*?yaw_innov=\[(?P<yi>-?[\d.]+|nan)deg,fin=(?P<yif>-?[\d.]+|nan)deg\])?"
     r"(?:.*?yaw_stiff=(?P<ys>-?[\d.]+|n/a))?"
     r"(?:.*?ins_dyaw=(?P<idy>-?(?:[\d.]+|nan(?:\(ind\))?))deg)?"

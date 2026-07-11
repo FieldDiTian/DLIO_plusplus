@@ -572,6 +572,27 @@ bool IrisPcapReader::feed_next_packet() {
 
     const uint64_t pkt_ts_ns = static_cast<uint64_t>(pkt_hdr->ts.tv_sec) * 1'000'000'000ULL +
                                static_cast<uint64_t>(pkt_hdr->ts.tv_usec) * 1000ULL;
+    // [P3 FIX 2026-07-10] Capture-integrity diagnostics (checksum validation
+    // is deliberately omitted — packets come from a trusted capture path and
+    // per-packet UDP checksumming would dominate decode cost):
+    // snaplen truncation silently loses the tail rays of EVERY packet.
+    if (pkt_hdr->caplen < pkt_hdr->len) {
+      static uint64_t truncated_count = 0;
+      if (++truncated_count == 1) {
+        spdlog::warn("pcap capture is snaplen-TRUNCATED (caplen {} < len {}): tail rays are lost on "
+                     "every truncated packet — re-capture with full snaplen (warned once)",
+                     pkt_hdr->caplen, pkt_hdr->len);
+      }
+    }
+    // [P3 FIX 2026-07-10] Prompt termination: capture timestamps are
+    // near-monotonic, so a packet >1 s past window_hi means the window is
+    // exhausted — previously the reader parsed headers of the ENTIRE
+    // remaining multi-GB file just to discard everything.
+    if (pkt_ts_ns > window_hi_ns_ && pkt_ts_ns - window_hi_ns_ > 1'000'000'000ULL) {
+      spdlog::info("pcap read >1 s past window_hi — treating as EOF (skipping the file tail)");
+      eof_ = true;
+      return false;
+    }
     if (pkt_ts_ns < window_lo_ns_ || pkt_ts_ns > window_hi_ns_) continue;
     const double t_epoch = static_cast<double>(pkt_ts_ns) / 1e9;
 
@@ -609,6 +630,22 @@ bool IrisPcapReader::feed_next_packet() {
     const uint8_t ihl = p[0] & 0x0F;
     const size_t ip_hdr_len = static_cast<size_t>(ihl) * 4;
     if (ip_hdr_len < 20 || ip_hdr_len > remaining) continue;
+    // [P3 FIX 2026-07-10] IPv4 fragmentation: a non-first fragment has no UDP
+    // header (its payload bytes were previously misread as one and almost
+    // always discarded by the port filter — silently); a first fragment
+    // parses as a complete-but-short payload, losing its tail rays. Neither
+    // is reassembled: skip non-first fragments outright and warn once.
+    const uint16_t frag_field = static_cast<uint16_t>((p[6] << 8) | p[7]);
+    const bool more_fragments = (frag_field & 0x2000) != 0;
+    const uint16_t frag_offset = frag_field & 0x1FFF;
+    if (frag_offset != 0 || more_fragments) {
+      static uint64_t fragmented_count = 0;
+      if (++fragmented_count == 1) {
+        spdlog::warn("fragmented IPv4 Iris datagram encountered — fragments are NOT reassembled and "
+                     "their rays are lost; check capture MTU (warned once)");
+      }
+      if (frag_offset != 0) continue;  // non-first fragment: no UDP header
+    }
     const uint8_t protocol = p[9];
     if (protocol != IPPROTO_UDP) continue;
     char src_ip_buf[INET_ADDRSTRLEN] = {0};

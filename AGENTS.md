@@ -131,9 +131,13 @@ body-axis-rotated but device-located — FusionEngine Spec §3.4.1 — is a sepa
 matter; `gnss_global` touches the position, not the IMU.)
 
 **Why it's actually fine on AV-24 today**:
-- `libgnss_global.so` is **commented out** in `config_ros.json`'s
-  `extension_modules` block. The only site that applies the subtract is
-  never loaded, so mapping does not double-compensate.
+- **[UPDATED 2026-07-10]** `libgnss_global.so` is now **ENABLED** (the P5
+  dual-antenna heading work loads it). The double-compensation stays avoided
+  for a different reason: `enable_lever_arm: false` in
+  `config_gnss_global.json` — the subtract site exists and is loaded but is
+  explicitly switched off because Atlas firmware already reports the INS
+  position with its own lever-arm handling. If anyone enables software
+  lever-arm compensation, THIS is the double-compensation hazard to re-check.
 - The INS-driven odometry frontend (`libodometry_estimation_ins.so`) computes
   its own `T_imu_ins` from URDF but resolves to identity in the current
   config: `urdf_imu_frame: "gps_antenna_top"` and `urdf_ins_frame: "gps_antenna_top"`.

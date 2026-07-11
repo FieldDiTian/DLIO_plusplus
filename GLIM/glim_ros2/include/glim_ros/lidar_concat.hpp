@@ -668,6 +668,16 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     sensor.topic = topic;
     sensor.buffer_size = out.buffer_size;
     sensor.time_offset = (i < aux_time_offsets.size()) ? aux_time_offsets[i] : 0.0;
+    // [P3 FIX 2026-07-10] Configuration validation, fail LOUD: a NaN offset
+    // made every match-window comparison false, silently disabling that aux
+    // LiDAR for the whole run (the existing non-finite guard sits after a
+    // successful match — unreachable for NaN). Offsets are clock corrections:
+    // |off| >= 1 s is a config typo, not a measurement.
+    if (!std::isfinite(sensor.time_offset) || std::abs(sensor.time_offset) >= 1.0) {
+      throw std::runtime_error(
+        "lidar_concat: aux_time_offsets[" + std::to_string(i) + "] = " +
+        std::to_string(sensor.time_offset) + " is invalid (must be finite, |off| < 1 s)");
+    }
 
     if (use_urdf) {
       const std::string& aux_frame = aux_frames[i];

@@ -221,9 +221,14 @@ If you ever switch sensors and the deskew looks wrong, run the one-shot diagnost
    ```bash
    ros2 run glim_ros glim_rosbag <normalized_bag> --ros-args -p dump_path:=/tmp/dump
    ```
-   Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` into `dump_path`. Fed ENU input, that exported SE(3) is world↔ENU (historical filename); the map itself is in local ENU.
-4. **Convert** submaps into a single PCD map by opening the dump in `glim_ros offline_viewer` and exporting (the GUI step is **intentional, not a gap** — see "Why the offline_viewer step is manual" below).
-5. **Localize** online against that PCD map with `gicp_localization`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. The map is already ENU; `utm_transform_path` is optional legacy.
+   Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` into `dump_path`. **Frame contract (fixed 2026-07-10):** the dump lives in GLIM's internal WORLD frame, related to Atlas local ENU by the exported `T_world_utm` — the dump is NOT itself ENU unless that transform happens to be identity.
+4. **QA** the dump in `glim_ros offline_viewer` (visual inspection, optional post-hoc optimization, manual loop closures — see "Why the offline_viewer step is manual" below). If you optimize, re-save the dump. Do **not** use the viewer's own point export as the localization map: it writes raw WORLD-frame points (`global_mapping.cpp` export path) without the ENU conversion.
+5. **Export** the localization map — this step is the REQUIRED handoff:
+   ```bash
+   python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /path/to/track_map.pcd --voxel-size 0.1
+   ```
+   The exporter defaults to `--frame enu`: it applies `inverse(T_world_utm)` so the PCD is genuinely in the Atlas local-ENU frame, fails closed when the transform is missing, and writes a `*.manifest.yaml` recording the frame and transform (check it before shipping a map).
+6. **Localize** online against that PCD with `gicp_localization`/`GICP_plusplus`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. Because the exported map is genuinely ENU, Atlas seeds/GT are frame-correct directly — and `localization/utm_transform_path` must stay **EMPTY** (it exists only for legacy world-frame maps and would double-transform an ENU map).
 
 ### Why the offline_viewer step is manual
 
@@ -233,7 +238,7 @@ A reviewer reasonably asks: why not auto-merge the per-submap directories into a
 - **Post-hoc global optimization** — the viewer prompts "Do optimization?" on load (see `offline_viewer.cpp:191`) and re-runs the iSAM2 backend over the full graph, which can improve the dump beyond what the online pass produced.
 - **Manual loop closure** — `manual_loop_close_modal` lets the operator add constraints when the automatic detector misses a loop (common on long highway runs with weak geometry).
 
-A blind `merge_glim_submaps.py` would skip all three and bake any unresolved drift into the PCD. Adding such a script as a dev-only "quick-look" mode is reasonable, but it must not become the default mapping→localization handoff.
+A blind merge would skip all three and bake unresolved drift into the PCD. The division of labor (2026-07-10): the **viewer is the QA/optimization stage** operating on the dump; `scripts/export_glim_dump_to_pcd.py` is the **only sanctioned PCD handoff**, because it is the step that applies the world→ENU conversion (`inverse(T_world_utm)`) and records the map manifest. The viewer's own export remains available for visualization but is world-frame and must not be fed to the localizer.
 
 ## Build
 

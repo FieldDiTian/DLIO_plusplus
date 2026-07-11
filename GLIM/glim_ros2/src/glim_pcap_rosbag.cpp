@@ -22,6 +22,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -89,6 +90,11 @@ struct Event {
 struct EventGreater {
   bool operator()(const Event& a, const Event& b) const {
     if (a.t_ns != b.t_ns) return a.t_ns > b.t_ns;
+    // [P3 FIX 2026-07-10] Implement the documented tie rule: BAG before PCAP
+    // on identical t_ns (IMU history feeds the estimator before a
+    // same-timestamp scan). The pull-order counter alone gave PCAP the win
+    // because the priming order pulls pcap first.
+    if (a.source != b.source) return a.source == Event::Source::PCAP_SCAN;
     return a.order > b.order;
   }
 };
@@ -117,6 +123,8 @@ int main(int argc, char** argv) {
   // Topic config
   glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "/imu");
+  // [P3 FIX 2026-07-10] parity with glim_rosbag's external-odometry fanout
+  const std::string external_odom_topic = config_ros.param<std::string>("glim_ros", "external_odom_topic", "");
   const std::string primary_points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
 
@@ -141,6 +149,28 @@ int main(int argc, char** argv) {
     spdlog::critical("config_pcap.json defines no lidars (missing file, empty arrays, or "
                      "length-mismatched lidar_ips/lidar_topics/lidar_frame_ids/lidar_dst_ports) — aborting");
     return 1;
+  }
+  // [P3 FIX 2026-07-10] Cross-validate the THREE hand-maintained topic-name
+  // sources (config_ros points_topic, config_pcap lidar_topics, config_sensors
+  // aux_topics): an assembled scan whose topic matches neither the primary
+  // nor an aux fell through the dispatch switch silently (scan loss with only
+  // pcap_primary=0 in the rate log as evidence).
+  {
+    bool primary_in_pcap = false;
+    for (const auto& l : pcap_cfg.lidars) {
+      if (l.topic == primary_points_topic) primary_in_pcap = true;
+      if (l.topic != primary_points_topic && !aux_topic_set.count(l.topic)) {
+        spdlog::critical("config_pcap lidar topic '{}' is neither the primary points_topic '{}' nor a "
+                         "configured aux topic — its scans would be dropped silently; aborting",
+                         l.topic, primary_points_topic);
+        return 1;
+      }
+    }
+    if (!primary_in_pcap) {
+      spdlog::critical("primary points_topic '{}' (config_ros) is not among config_pcap lidar_topics — "
+                       "zero primary scans would be produced; aborting", primary_points_topic);
+      return 1;
+    }
   }
 
   IrisPcapReader pcap;
@@ -403,6 +433,8 @@ int main(int argc, char** argv) {
   // Serializers
   rclcpp::Serialization<sensor_msgs::msg::Imu> imu_ser;
   rclcpp::Serialization<sensor_msgs::msg::PointCloud2> pc2_ser;
+  rclcpp::Serialization<nav_msgs::msg::Odometry> odom_ser;  // [P3 FIX 2026-07-10]
+  bool hard_error = false;  // [P3 FIX 2026-07-10] mid-run schema errors -> nonzero exit
 #ifdef BUILD_WITH_CV_BRIDGE
   rclcpp::Serialization<sensor_msgs::msg::Image> image_ser;
   rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_image_ser;
@@ -525,6 +557,25 @@ int main(int argc, char** argv) {
         imu_ser.deserialize_message(&serialized_msg, imu_msg.get());
         glim->imu_callback(imu_msg);
         cnt_imu++;
+      } else if (topic_name == imu_topic) {
+        // [P3 FIX 2026-07-10] Known topic, wrong type: this previously
+        // dropped the whole IMU stream with zero diagnostics.
+        spdlog::error("topic_type mismatch on IMU topic {}: {} (expected sensor_msgs/msg/Imu)",
+                      topic_name, topic_type);
+        hard_error = true;
+      } else if (!external_odom_topic.empty() && topic_name == external_odom_topic) {
+        // [P3 FIX 2026-07-10] External-odometry fanout (parity with
+        // glim_rosbag): required by the INS odometry frontend configs.
+        if (topic_type == "nav_msgs/msg/Odometry") {
+          auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
+          odom_ser.deserialize_message(&serialized_msg, odom_msg.get());
+          glim->external_odom_callback(odom_msg);
+          cnt_ext++;
+        } else {
+          spdlog::error("topic_type mismatch on external odom topic {}: {} (expected nav_msgs/msg/Odometry)",
+                        topic_name, topic_type);
+          hard_error = true;
+        }
       }
 #ifdef BUILD_WITH_CV_BRIDGE
       else if (topic_name == image_topic) {
@@ -689,32 +740,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Drain any remaining heap items (no more pulls).
-  while (!stop && rclcpp::ok() && !heap.empty()) {
-    Event ev = heap.top();
-    heap.pop();
-    if (ev.source == Event::Source::PCAP_SCAN) {
-      AssembledScan& s = ev.scan;
-      if (s.topic == primary_points_topic) {
-        sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
-        int epoch_anchor_count = -1;
-        if (concat_enabled && !aux_sensors.empty()) {
-          epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
-          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
-                                                concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
-                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure,
-                                                concat_config.frame_diag_log);
-        }
-        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
-        if (final_points) {
-          glim->points_callback(final_points, epoch_anchor_count);
-        }
-      }
-    } else {
-      bag_dispatch_fanout(ev);
-    }
-    glim->timer_callback();
-  }
+  // [P3 FIX 2026-07-10] The former post-loop heap drain was removed: it was
+  // provably dead (every loop exit — heap-empty break, stop, !rclcpp::ok —
+  // falsified its own guard), and its body lacked the aux-topic branch, so if
+  // a future change had made it reachable it would have silently discarded
+  // auxiliary scans. Dispatch logic lives in exactly one place (the main
+  // loop) by design now.
 
   // [P2 FIX 2026-07-09, moved 2026-07-09b] Zero dispatched primary scans =
   // the pcap did not overlap the bag (wrong-session file, clock skew
@@ -735,5 +766,12 @@ int main(int argc, char** argv) {
 
   glim->wait(auto_quit);
   glim->save(dump_path);
+  // [P3 FIX 2026-07-10] Mid-run schema/hard errors keep the partial dump (it
+  // may still be useful for debugging) but MUST exit nonzero so pipelines do
+  // not mistake it for a complete map.
+  if (hard_error) {
+    spdlog::error("run completed WITH hard errors (see log) — partial dump saved, exiting nonzero");
+    return 1;
+  }
   return 0;
 }

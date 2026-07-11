@@ -2,6 +2,7 @@
 #include <cmath>
 #include <limits>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <numeric>
 #include <fstream>
@@ -190,6 +191,11 @@ public:
   }
 
   virtual void at_exit(const std::string& dump_path) override {
+    // [P3 FIX 2026-07-10] Guarded: after a flush TIMEOUT GlimROS::save() can
+    // reach here while the backend thread is mid-write in the initialization
+    // block — a torn T_world_utm.txt (consumed by the map exporter) and a UB
+    // data race. Cold path on both sides; a plain mutex suffices.
+    std::lock_guard<std::mutex> lock(T_world_utm_mtx_);
     if (transformation_initialized) {
       save_transformation_to_file(dump_path);
     }
@@ -242,7 +248,20 @@ public:
     push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
   }
 
-  void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
+  // [P3 FIX 2026-07-10] Snapshot the submap ORIGIN TRANSLATION at insert
+  // time: on_insert_submap runs synchronously on the mapping thread, but the
+  // backend thread previously dereferenced the live submap->T_world_origin
+  // later, racing GlobalMapping's post-optimization rewrites (torn/mixed
+  // reads feeding the one-shot T_world_utm fit). Only the translation is
+  // consumed (Umeyama fit, baseline check, debug logs) and the baseline norm
+  // is rotation-invariant, so a Vector3d snapshot suffices.
+  struct QueuedSubmap {
+    SubMap::ConstPtr submap;
+    Eigen::Vector3d t_world_origin_snap;
+  };
+  void on_insert_submap(const SubMap::ConstPtr& submap) {
+    input_submap_queue.push_back({submap, submap->T_world_origin.translation()});
+  }
 
   void on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
     const auto factors = output_factors.get_all_and_clear();
@@ -255,7 +274,8 @@ public:
   void backend_task() {
     logger->info("starting GNSS global thread");
     std::deque<GNSSData, Eigen::aligned_allocator<GNSSData>> utm_queue;
-    std::deque<SubMap::ConstPtr> submap_queue;
+    std::deque<QueuedSubmap> submap_queue;
+    std::vector<Eigen::Vector3d> submap_t_snap;  // parallel to `submaps` (P3 fix)
 
     while (!kill_switch) {
       // Bound the loop rate so re-attempting association on every GNSS arrival
@@ -304,21 +324,22 @@ public:
       // at bag EOF -- its bracketing GNSS arrives with no accompanying submap.
       if (submap_queue.empty() || (gnss_data.empty() && new_submaps.empty())) {
         pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
-                              submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
+                              submap_queue.front().submap->frames.back()->stamp < utm_queue.back().stamp;
         processing_ = false;  // nothing to do this cycle
         continue;
       }
       // (processing_ already true — raised before the queue drain above)
 
       // Remove submaps that are created earlier than the oldest GNSS data
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front().stamp) {
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front().submap->frames.front()->stamp < utm_queue.front().stamp) {
         submap_queue.pop_front();
       }
 
       // Interpolate UTM coords and associate with submaps
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > utm_queue.front().stamp &&
-             submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp) {
-        const auto& submap = submap_queue.front();
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front().submap->frames.front()->stamp > utm_queue.front().stamp &&
+             submap_queue.front().submap->frames.back()->stamp < utm_queue.back().stamp) {
+        const auto& submap = submap_queue.front().submap;
+        const Eigen::Vector3d t_snap = submap_queue.front().t_world_origin_snap;
         const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
 
         const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const GNSSData& utm, const double t) { return utm.stamp < t; });
@@ -362,6 +383,7 @@ public:
         const GNSSData interpolated = interpolate_gnss_data(*left, *right, stamp);
 
         submaps.push_back(submap);
+        submap_t_snap.push_back(t_snap);
         submap_coords.push_back(interpolated);
 
         submap_queue.pop_front();
@@ -369,11 +391,12 @@ public:
       }
 
       // Initialize T_world_utm
-      if (!transformation_initialized && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
+      if (!transformation_initialized && !submaps.empty() &&
+          (submap_t_snap.back() - submap_t_snap.front()).norm() > min_baseline) {
         Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
-          mean_est += submaps[i]->T_world_origin.translation();
+          mean_est += submap_t_snap[i];
           mean_gnss += submap_coords[i].position;
         }
         mean_est /= submaps.size();
@@ -381,7 +404,7 @@ public:
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
-          const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
+          const Eigen::Vector3d centered_est = submap_t_snap[i] - mean_est;
           const Eigen::Vector3d centered_gnss = submap_coords[i].position - mean_gnss;
           cov += centered_gnss * centered_est.transpose();
         }
@@ -402,15 +425,21 @@ public:
         T_utm_world.linear().block<2, 2>(0, 0) = U * S * V.transpose();
         T_utm_world.translation() = mean_gnss - T_utm_world.linear() * mean_est;
 
-        T_world_utm = T_utm_world.inverse();
+        {
+          std::lock_guard<std::mutex> lock(T_world_utm_mtx_);
+          T_world_utm = T_utm_world.inverse();
+        }
 
         for (int i = 0; i < submaps.size(); i++) {
           const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].position;
-          logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
+          logger->debug("submap={} gnss={}", convert_to_string(submap_t_snap[i]), convert_to_string(gnss));
         }
 
         logger->info("T_world_utm={}", convert_to_string(T_world_utm));
-        transformation_initialized = true;
+        {
+          std::lock_guard<std::mutex> lock(T_world_utm_mtx_);
+          transformation_initialized = true;  // published under the same lock as the matrix
+        }
       }
 
       // Add GNSS prior factors for EVERY associated submap that doesn't have
@@ -425,7 +454,7 @@ public:
           const GNSSData& gnss = submap_coords[i];
           const auto& submap = submaps[i];
           const Eigen::Vector3d xyz = T_world_utm * gnss.position;
-          logger->debug("submap={} gnss={}", convert_to_string(submap->T_world_origin.translation().eval()), convert_to_string(xyz));
+          logger->debug("submap={} gnss={}", convert_to_string(submap_t_snap[i]), convert_to_string(xyz));
 
           // note: should use a more accurate information matrix
           const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
@@ -469,7 +498,7 @@ public:
       // genuinely un-factorable, so they are NOT counted -- save() must not block
       // waiting on them.
       pending_associable_ = !submap_queue.empty() && !utm_queue.empty() &&
-                            submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp;
+                            submap_queue.front().submap->frames.back()->stamp < utm_queue.back().stamp;
       submaps_waiting_ = !submap_queue.empty();
       processing_ = false;
     }
@@ -590,10 +619,13 @@ private:
   // needs_wait(): queued GNSS blocks save()/replay only while a submap is
   // actually waiting to be bracketed by it.
   std::atomic_bool submaps_waiting_{false};
+  // [P3 FIX 2026-07-10] guards T_world_utm/transformation_initialized between
+  // the backend writer and at_exit (main thread) — see at_exit.
+  std::mutex T_world_utm_mtx_;
   std::thread thread;
 
   ConcurrentVector<GNSSData, Eigen::aligned_allocator<GNSSData>> input_gnss_queue;
-  ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
+  ConcurrentVector<QueuedSubmap> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
 
   std::vector<SubMap::ConstPtr> submaps;

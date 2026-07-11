@@ -380,10 +380,18 @@ private:
     // than the documented "no angular twist" default of zero, which consumers
     // (gicp_localization snap) now detect and back-fill from their own IMU.
     // Both stamps are in the ROS-mapped time domain (odom.header.stamp was set
-    // via clock_mapper_.toRos above; latest_gyro_stamp_ is publishImu's mapped
+    // via clock_mapper_.toRos above; the gyro freshness check below is now
     // stamp), so the age comparison is domain-consistent.
-    const double gyro_age = stampToSec(odom.header.stamp) - latest_gyro_stamp_;
-    if (latest_gyro_stamp_ > 0.0 && std::abs(gyro_age) < kMaxGyroAgeSec) {
+    // [P3 FIX 2026-07-10] WALL-CLOCK freshness, cached at INGEST. The old
+    // publish-time stamp-domain age check was permanently dead in
+    // arrival_retime mode: the 128-sample queue delays publish by ~1.28 s at
+    // 100 Hz, always exceeding the 0.5 s window. Angular rate is a physical
+    // quantity — its freshness is how long ago it was MEASURED (wall time),
+    // independent of any stamp domain; this also removes the last stamp-
+    // domain mixing from the backfill.
+    const double gyro_age = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - latest_gyro_wall_).count();
+    if (has_gyro_ && gyro_age < kMaxGyroAgeSec) {
       odom.twist.twist.angular = latest_gyro_;
       // Conservative fixed rate variance (Atlas imu_calibrated gyro noise is
       // ~1e-2 rad/s class at 100 Hz bandwidth).
@@ -435,6 +443,11 @@ private:
     std::lock_guard<std::mutex> lock(core_mutex_);
     ++imu_in_count_;
     last_imu_wall_time_ = std::chrono::steady_clock::now();
+    // [P3 FIX 2026-07-10] Cache the gyro at INGEST (see poseCallback): the
+    // measurement is fresh NOW regardless of when the retime queue publishes.
+    latest_gyro_ = msg->angular_velocity;
+    latest_gyro_wall_ = last_imu_wall_time_;
+    has_gyro_ = true;
     const double stamp = stampToSec(msg->header.stamp);
     if (!imu_p1_sidecar_.empty()) {
       double sidecar_p1 = 0.0;
@@ -584,8 +597,7 @@ private:
     // location-independent on a rigid body, and IMUOutput is already rotated
     // into vehicle body axes == odom child_frame axes, so the gyro is exactly
     // the odometry twist.angular. Guarded by core_mutex_ (all callers hold it).
-    latest_gyro_ = msg.angular_velocity;
-    latest_gyro_stamp_ = stamp;
+    // (gyro cache moved to imuCallback ingest — see P3 FIX 2026-07-10)
     imu_pub_->publish(msg);
     ++imu_out_count_;
   }
@@ -682,7 +694,8 @@ private:
   // /gps_p1/filtered_odom twist.angular. Guarded by core_mutex_.
   static constexpr double kMaxGyroAgeSec = 0.5;
   geometry_msgs::msg::Vector3 latest_gyro_;
-  double latest_gyro_stamp_ = 0.0;
+  std::chrono::steady_clock::time_point latest_gyro_wall_{};  // P3: wall-clock freshness
+  bool has_gyro_ = false;
 
   mutable std::mutex core_mutex_;
 };

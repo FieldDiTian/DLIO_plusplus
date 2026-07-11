@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include <glim_ros/glim_ros.hpp>
 
 #define GLIM_ROS2
@@ -113,6 +114,23 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       const std::string config_sensors_path = glim::GlobalConfig::get_config_path("config_sensors");
       config_sensors.override_param<Eigen::Isometry3d>("sensors", "T_lidar_imu", T_lidar_imu);
       config_sensors.save(config_sensors_path);
+      // [P3 FIX 2026-07-10] The override only reaches the other modules VIA
+      // DISK (each constructs its own Config from this path). Config::save
+      // does not check the stream: on a read-only install prefix the write
+      // silently fails, the INFO above still claims the override, and the
+      // estimator runs with the stale checked-in extrinsic. Verify the
+      // round-trip and fail LOUDLY — the extrinsic is safety-relevant.
+      {
+        glim::Config verify(config_sensors_path);
+        const auto readback = verify.param<Eigen::Isometry3d>("sensors", "T_lidar_imu");
+        if (!readback || !readback->isApprox(T_lidar_imu, 1e-9)) {
+          logger->critical(
+            "URDF T_lidar_imu override did NOT persist to {} (read-only install prefix?) — "
+            "modules would silently use the stale checked-in extrinsic; aborting",
+            config_sensors_path);
+          throw std::runtime_error("config_sensors.json override write failed");
+        }
+      }
     } catch (const std::exception& e) {
       logger->error("Failed to compute T_lidar_imu from URDF: {}", e.what());
     }

@@ -96,6 +96,11 @@ private:
   struct termios original_termios_;
 };
 
+// [P3 FIX 2026-07-10] Mid-run hard errors (schema mismatches) previously
+// converted into a "successful" partial save with exit code 0 — a pipeline
+// could not distinguish "mapped 3 s then hit a schema error" from success.
+static bool g_bag_hard_error = false;
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: glim_rosbag input_rosbag_path" << std::endl;
@@ -359,7 +364,8 @@ int main(int argc, char** argv) {
         for (auto& aux : aux_sensors) {
           if (msg->topic_name == aux.topic) {
             if (topic_type != "sensor_msgs/msg/PointCloud2") {
-              spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
+              g_bag_hard_error = true;
+        spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
               return false;
             }
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
@@ -378,7 +384,8 @@ int main(int argc, char** argv) {
         // Already handled above; skip to next message
       } else if (msg->topic_name == imu_topic) {
         if (topic_type != "sensor_msgs/msg/Imu") {
-          spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/Imu (topic={})", topic_type, msg->topic_name);
+          g_bag_hard_error = true;
+        spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/Imu (topic={})", topic_type, msg->topic_name);
           return false;
         }
         auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
@@ -386,7 +393,8 @@ int main(int argc, char** argv) {
         glim->imu_callback(imu_msg);
       } else if (msg->topic_name == points_topic) {
         if (topic_type != "sensor_msgs/msg/PointCloud2") {
-          spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
+          g_bag_hard_error = true;
+        spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
           return false;
         }
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
@@ -424,7 +432,8 @@ int main(int argc, char** argv) {
         }
       } else if (!external_odom_topic.empty() && msg->topic_name == external_odom_topic) {
         if (topic_type != "nav_msgs/msg/Odometry") {
-          spdlog::error("topic_type mismatch: {} != nav_msgs/msg/Odometry (topic={})", topic_type, msg->topic_name);
+          g_bag_hard_error = true;
+        spdlog::error("topic_type mismatch: {} != nav_msgs/msg/Odometry (topic={})", topic_type, msg->topic_name);
           return false;
         }
         auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
@@ -451,7 +460,8 @@ int main(int argc, char** argv) {
             spdlog::warn("skipping malformed CompressedImage: {}", e.what());
           }
         } else {
-          spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/(Image|CompressedImage) (topic={})", topic_type, msg->topic_name);
+          g_bag_hard_error = true;
+        spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/(Image|CompressedImage) (topic={})", topic_type, msg->topic_name);
           return false;
         }
       }
@@ -508,5 +518,10 @@ int main(int argc, char** argv) {
   glim->wait(auto_quit);
   glim->save(dump_path);
 
+  // [P3 FIX 2026-07-10] partial dump is kept, but exit nonzero on hard errors.
+  if (g_bag_hard_error) {
+    spdlog::error("run completed WITH hard errors (see log) — partial dump saved, exiting nonzero");
+    return 1;
+  }
   return 0;
 }

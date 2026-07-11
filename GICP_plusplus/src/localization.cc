@@ -117,20 +117,25 @@ double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
 
   const auto abs_eigenvalues = solver.eigenvalues().cwiseAbs();
   const double max_eigenvalue = abs_eigenvalues.maxCoeff();
+  const double min_eigenvalue = abs_eigenvalues.minCoeff();
 
-  double min_nonzero_eigenvalue = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < abs_eigenvalues.size(); ++i) {
-    const double value = abs_eigenvalues[i];
-    if (value > 1e-12 && value < min_nonzero_eigenvalue) {
-      min_nonzero_eigenvalue = value;
-    }
-  }
-
-  if (!std::isfinite(max_eigenvalue) || !std::isfinite(min_nonzero_eigenvalue)) {
+  // [P2 FIX 2026-07-10f] Rank deficiency must fail CLOSED. The old code
+  // EXCLUDED eigenvalues <= 1e-12 from the min and took the ratio over the
+  // survivors: a spectrum like [0, 1e9, 1e9, 1e9, 1e9, 1e9] — one axis with
+  // literally no correspondence support — reported condition ~= 1, so the
+  // degeneracy projection and the binary Hessian gate stayed INACTIVE on the
+  // exact frames they exist to protect (GICP hessian magnitudes run ~1e9, so
+  // the 1e-12 floor only ever matched structural zeros). Any near-zero
+  // eigenvalue now yields +inf = worst possible conditioning, which both the
+  // partial-update trigger and the legacy binary gate treat as degenerate
+  // (they gate on `condition > threshold`; +inf trips every finite
+  // threshold, and the eigen-projection then keeps the IMU prior along the
+  // null directions).
+  if (!std::isfinite(max_eigenvalue) || max_eigenvalue <= 0.0 || min_eigenvalue <= 1e-12) {
     return std::numeric_limits<double>::infinity();
   }
 
-  return max_eigenvalue / min_nonzero_eigenvalue;
+  return max_eigenvalue / min_eigenvalue;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +161,7 @@ struct DegeneracyProjection {
   bool modified{false};       // projected pose differs from raw candidate
   bool fully_degenerate{false};  // all 6 axes degenerate -> caller should reject
   bool yaw_vetoed{false};     // yaw-consistency veto zeroed the yaw correction
+  bool rp_clamped{false};     // roll/pitch innovation clamp scaled the rp correction
   int degen_rot_axes{0};
   int degen_trans_axes{0};
   Eigen::Matrix4f projected_pose = Eigen::Matrix4f::Identity();
@@ -170,7 +176,8 @@ DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& h
                                             double rel_floor_6d,
                                             double rel_floor_rot,
                                             double rel_floor_trans,
-                                            double veto_yaw_above_deg /* <=0 disables */) {
+                                            double veto_yaw_above_deg /* <=0 disables */,
+                                            double clamp_rp_above_deg /* <=0 disables */) {
   DegeneracyProjection out;
   out.projected_pose = candidate;
   // A non-finite hessian only invalidates the EIGEN projection — the yaw veto
@@ -304,6 +311,27 @@ DegeneracyProjection projectDegenerateDelta(const Eigen::Matrix<double, 6, 6>& h
     out.yaw_vetoed = true;
   }
 
+  // [P2 FIX 2026-07-10h] Roll/pitch innovation clamp — the attitude analogue
+  // of the hard yaw veto. On the periodic full-6DoF re-anchor scans
+  // (gicp/dof/full6dofEveryN) BOTH attitude priors are typically zero and the
+  // generic rotation jump gate is ~30 deg + time scaling: erroneous roll/
+  // pitch from repeated map structure could pass unopposed even though yaw
+  // has its dedicated 8 deg guard. Gyro roll/pitch drift over one scan gap is
+  // <<1 deg, so a large rp innovation is as physically impossible as a large
+  // yaw one. CLAMP (scale down) rather than zero: the 6-DoF refresh exists
+  // precisely to let roll/pitch re-anchor by SMALL amounts. Inert on 4-DoF
+  // scans (exact mask keeps the rp delta at zero).
+  if (clamp_rp_above_deg > 0.0) {
+    const double rp_deg =
+        std::sqrt(omega_p.x() * omega_p.x() + omega_p.y() * omega_p.y()) * kRad2Deg;
+    if (rp_deg > clamp_rp_above_deg) {
+      const double scale = clamp_rp_above_deg / rp_deg;
+      omega_p.x() *= scale;
+      omega_p.y() *= scale;
+      out.rp_clamped = true;
+    }
+  }
+
   const double kEps = 1e-12;
   const bool changed = ((omega_p - omega).norm() > kEps) || ((t_hat_p - t_hat).norm() > kEps);
   out.valid = true;
@@ -395,6 +423,16 @@ bool auxSchemaMatchesPrimary(const sensor_msgs::msg::PointCloud2& aux,
 void transformCloudData(uint8_t* data, size_t num_points, uint32_t point_step,
                         int x_off, int y_off, int z_off,
                         const Eigen::Matrix4f& T) {
+  // [P3 FIX 2026-07-10] Bounds: a malformed schema can declare a field that
+  // does not fit its point (offset + width > point_step) — the writes below
+  // would then smear into the next point and, on the LAST point, past the
+  // buffer (heap corruption). Bail instead of corrupting.
+  if (x_off < 0 || y_off < 0 || z_off < 0 ||
+      static_cast<uint32_t>(x_off) + sizeof(float) > point_step ||
+      static_cast<uint32_t>(y_off) + sizeof(float) > point_step ||
+      static_cast<uint32_t>(z_off) + sizeof(float) > point_step) {
+    return;
+  }
   const Eigen::Matrix3f R = T.block<3, 3>(0, 0);
   const Eigen::Vector3f t = T.block<3, 1>(0, 3);
   for (size_t i = 0; i < num_points; ++i) {
@@ -824,6 +862,9 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
                           double dt, bool luminar_uint64, double abs_clock_shift_s = 0.0) {
   if (time_off < 0) return;
+  // [P3 FIX 2026-07-10] Bounds: the widest carrier written below is 8 bytes;
+  // a declared time field that does not fit its point would smear/overrun.
+  if (static_cast<uint32_t>(time_off) + sizeof(uint64_t) > point_step) return;
 
   // Absolute-epoch path (Luminar Iris UINT8[8]): leave the per-point values
   // untouched. Each point already carries its absolute capture time; the
@@ -1424,7 +1465,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/initial_pose/yaw", 0.0);
 
   // Ground-truth odom cross-check (optional). Uses topic remap "gt_odom".
-  this->declare_parameter<bool>("localization/gt_odom/enable", false);
+  this->declare_parameter<bool>("localization/gt_odom/enable", true);  // [P3 FIX 2026-07-10] yaml-aligned
   this->declare_parameter<int>("localization/gt_odom/buffer_size", 200);
   this->declare_parameter<double>("localization/gt_odom/max_dt", 0.1);
   bool gt_enable = false; int gt_buf = 200; double gt_max_dt = 0.1;
@@ -1434,6 +1475,13 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->gt_odom_enabled_ = gt_enable;
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
+  // [P3 FIX 2026-07-10] Negative durations invert every |dt| comparison —
+  // ALL GT lookups would fail silently (killing snap/calibration/cross-check).
+  if (!std::isfinite(this->gt_odom_max_dt_) || this->gt_odom_max_dt_ < 0.0) {
+    RCLCPP_WARN(this->get_logger(), "localization/gt_odom/max_dt=%.3f invalid; using 0.15",
+                this->gt_odom_max_dt_);
+    this->gt_odom_max_dt_ = 0.15;
+  }
 
   // RTK quality gate (P1-native): drop gt_odom samples whose Atlas-reported
   // position covariance exceeds the configured thresholds. Conservative
@@ -1491,7 +1539,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // Reject scans whose Hessian condition number proxy exceeds this threshold.
   // Straights typically run ~1e4; feature-poor corners spike to 1e8-1e9 and the
   // optimizer slides along the unconstrained axis. Set <=0 to disable the gate.
-  this->declare_parameter<double>("gicp/hessianCondMax", 1.0e6);
+  // [P3 FIX 2026-07-10] Declared defaults aligned with the shipped yaml (the
+  // calibrated values): a launch/namespace drift that missed the yaml key
+  // previously activated a 5000x more aggressive trigger silently.
+  this->declare_parameter<double>("gicp/hessianCondMax", 5.0e9);
   // Hessian rejection fires when condition number is high AND any of:
   //   - fitness exceeds the warn floor below
   //   - GICP applied a translation correction larger than transWarn
@@ -1541,6 +1592,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // ratio. The IMU prior's yaw cannot be this wrong over one scan gap on a
   // ground vehicle; any larger GICP yaw "correction" is a wrong basin with
   // plausible fitness (runs 19/20). <=0 disables the hard tier.
+  this->declare_parameter<double>("gicp/rpGate/hardMaxCorrDeg", 3.0);
   this->declare_parameter<double>("gicp/yawGate/hardMaxCorrDeg", 8.0);
   // PR#6: bounds on the non-converged low-fitness fallback (see
   // performLocalization). Defaults from the PR validation replay.
@@ -1597,6 +1649,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("gicp/yawGate/enable", this->yaw_gate_enable_);
   this->get_parameter("gicp/yawGate/maxCorrDeg", this->yaw_gate_max_corr_deg_);
   this->get_parameter("gicp/yawGate/fitnessRatio", this->yaw_gate_fitness_ratio_);
+  this->get_parameter("gicp/rpGate/hardMaxCorrDeg", this->gicp_rp_hard_max_corr_deg_);
   this->get_parameter("gicp/yawGate/hardMaxCorrDeg", this->yaw_gate_hard_max_corr_deg_);
   this->get_parameter("gicp/nonConvergedFitnessOkMaxTransM", this->gicp_nonconv_ok_max_trans_m_);
   this->get_parameter("gicp/nonConvergedFitnessOkMaxRotDeg", this->gicp_nonconv_ok_max_rot_deg_);
@@ -1728,6 +1781,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("localization/lidar_concat/aux_topics", aux_topics_param);
   this->get_parameter("localization/lidar_concat/aux_frames", aux_frames_param);
   this->get_parameter("localization/lidar_concat/time_threshold", this->concat_time_threshold_);
+  // [P3 FIX 2026-07-10] Negative threshold silently drops every aux merge.
+  if (!std::isfinite(this->concat_time_threshold_) || this->concat_time_threshold_ < 0.0) {
+    RCLCPP_WARN(this->get_logger(), "localization/lidar_concat/time_threshold=%.3f invalid; using 0.1",
+                this->concat_time_threshold_);
+    this->concat_time_threshold_ = 0.1;
+  }
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->get_parameter("localization/lidar_concat/aux_time_offsets", this->concat_aux_time_offsets_);
@@ -1940,8 +1999,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/debug/verbose_scan_log", false);
   this->declare_parameter<bool>("localization/debug/small_gicp_lm_debug", false);
   this->declare_parameter<bool>("localization/debug/nano_gicp_lm_debug", false);  // deprecated compatibility alias
-  this->declare_parameter<double>("localization/debug/jump_trans_m", 1.0);
-  this->declare_parameter<double>("localization/debug/jump_rot_deg", 10.0);
+  this->declare_parameter<double>("localization/debug/jump_trans_m", 30.0);  // [P3 FIX 2026-07-10] yaml-aligned (1.0 mass-rejected at speed)
+  this->declare_parameter<double>("localization/debug/jump_rot_deg", 30.0);  // [P3 FIX 2026-07-10] yaml-aligned
   this->declare_parameter<bool>("localization/verbose", true);
 
   this->get_parameter("localization/debug/enable_pub", this->debug_pub_enabled_);
@@ -2422,6 +2481,16 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
 
   if (num_points == 0) {
     RCLCPP_WARN(this->get_logger(), "Received empty point cloud (width=%d, height=%d)", pc->width, pc->height);
+    return;
+  }
+  // [P3 FIX 2026-07-10] Non-concat parity with the merge path's tight-cloud
+  // check: a truncated message (data.size() < width*height*point_step) would
+  // otherwise be read past data.end() by the field-extraction walk below.
+  if (pc->point_step == 0 ||
+      pc->data.size() < num_points * static_cast<size_t>(pc->point_step)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Dropping truncated PointCloud2 (data=%zu < %zu points x step %u)",
+                         pc->data.size(), num_points, pc->point_step);
     return;
   }
 
@@ -3128,8 +3197,12 @@ void gicp_plusplus::LocalizationNode::applyInsHeadingPriorToBasePose() {
   Eigen::Vector3f ins_p;
   Eigen::Quaternionf ins_q;
   if (!this->composeGtPoseInBase(ins, ins_p, ins_q)) {
-    ins_p = ins.p;
-    ins_q = ins.q;
+    // [P3 FIX 2026-07-10] SKIP the prior instead of falling back to the raw
+    // gt-body attitude: treating gt-body as base-frame steered a constant
+    // frame offset INTO the seed at up to 2 deg/scan whenever the extrinsic
+    // was uncached (TF missing in replay). Odom-init already defers on the
+    // same condition.
+    return;
   }
 
   // World-frame yaw difference: INS attitude vs the integration seed.
@@ -3690,8 +3763,10 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // Yaw-defect fix (P2a): the cached score reflects the LAST LINEARIZATION
     // pose; on non-converged scans that lags the applied pose by one LM step,
     // and the "effectively converged" acceptance below would judge a bad
-    // final candidate by a stale, flattering number. Recompute honestly at
-    // the final pose (one kd-tree pass) and gate on the worse of the two.
+    // final candidate by a stale, flattering number. [P3 FIX 2026-07-10]
+    // OBSOLETE since the backend's final raw re-linearization (2026-07-08):
+    // both getters now return the same final-pose value, so the max() is a
+    // no-op kept only to fill fitness_score_final for the debug fields.
     fitness_score_final = this->gicp.getFitnessScoreAtFinal();
     fitness_score = std::max(fitness_score, fitness_score_final);
   }
@@ -3804,7 +3879,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   // along untrusted directions.
   const bool eigen_projection_wanted =
       this->degen_partial_update_enable_ && candidate_pose_valid &&
-      this->gicp_hessian_cond_max_ > 0.0 && std::isfinite(hessian_condition) &&
+      // [P2 FIX 2026-07-10f] Guard on the HESSIAN being finite, not the
+      // condition: hessianConditionProxy now returns +inf for a finite but
+      // RANK-DEFICIENT hessian, and that is exactly when the eigen-projection
+      // must engage (it identifies the null axes and keeps the IMU prior
+      // along them). Non-finite hessians are force-rejected in the gate
+      // chain, so they never reach the applied pose either way.
+      this->gicp_hessian_cond_max_ > 0.0 && analysis_hessian.allFinite() &&
       hessian_condition > this->gicp_hessian_cond_max_;
   // NOTE: yawGate is deliberately INDEPENDENT of degeneracy/partialUpdate —
   // disabling partial updates (legacy binary hessian gate) must not silently
@@ -3837,21 +3918,27 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     yaw_veto_threshold_deg = this->yaw_gate_hard_max_corr_deg_;
   }
   const bool yaw_veto_wanted = yaw_soft_armed || yaw_hard_armed;
+  // [P2 FIX 2026-07-10h] rp clamp is UNCONDITIONAL (like the hard yaw veto):
+  // it must run on the full-6DoF re-anchor scans, which are exactly the ones
+  // where no other attitude protection exists.
+  const bool rp_clamp_wanted =
+      candidate_pose_valid && this->gicp_rp_hard_max_corr_deg_ > 0.0;
   DegeneracyProjection degen;
   degen.projected_pose = candidate_pose;
-  if (eigen_projection_wanted || yaw_veto_wanted) {
+  if (eigen_projection_wanted || yaw_veto_wanted || rp_clamp_wanted) {
     degen = projectDegenerateDelta(analysis_hessian, this->T_prior, candidate_pose,
                                    eigen_projection_wanted,
                                    this->degen_full6d_, this->degen_coupling_length_m_,
                                    this->degen_rel_floor_6d_,
                                    this->degen_rel_floor_rot_, this->degen_rel_floor_trans_,
-                                   yaw_veto_threshold_deg);
+                                   yaw_veto_threshold_deg,
+                                   rp_clamp_wanted ? this->gicp_rp_hard_max_corr_deg_ : 0.0);
   }
   // REVIEW FIX: require the projected pose to be finite before adopting it —
   // final_candidate reaches basePose/current_pose ahead of the downstream
   // gicp_valid finiteness guard, so a (pathological) NaN from the projection
   // would otherwise poison the next scan's prior.
-  const Eigen::Matrix4f final_candidate =
+  Eigen::Matrix4f final_candidate =
       (degen.valid && degen.modified && matrixFinite(degen.projected_pose))
           ? degen.projected_pose : candidate_pose;
 
@@ -3866,8 +3953,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   int support_corr = num_correspondences;
   double support_ratio = correspondence_ratio;
   bool fitness_reevaluated = false;
-  if (candidate_pose_valid && degen.valid && degen.modified &&
-      matrixFinite(final_candidate)) {
+  auto rescore_applied_pose = [&]() {
     const Eigen::Matrix4f T_eval = this->scan_in_world_frame_
         ? Eigen::Matrix4f(final_candidate * this->T_prior.inverse())
         : Eigen::Matrix4f(final_candidate * T_base_lidar);
@@ -3890,6 +3976,53 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       this->last_fitness_score_ = fitness_score;
       support_corr = 0;
       support_ratio = 0.0;
+    }
+  };
+  if (candidate_pose_valid && degen.valid && degen.modified &&
+      matrixFinite(final_candidate)) {
+    rescore_applied_pose();
+  }
+
+  // [P2 FIX 2026-07-10g] Revisit the SOFT yaw veto with the APPLIED-pose
+  // fitness ratio. Soft arming was decided from the RAW optimizer ratio
+  // BEFORE the projection; the rescore above can raise the ratio past
+  // yawGate/fitnessRatio — i.e. the pose actually being applied is now a
+  // low-confidence match — while its yaw correction sits between maxCorrDeg
+  // (soft, 1.5) and hardMaxCorrDeg (8), a band no other gate strips. Apply
+  // the same veto the projector would have: zero the world-tangent yaw
+  // component of the delta vs T_prior (keep the IMU yaw), leave translation
+  // untouched, then re-score once more so every downstream gate judges the
+  // pose that is actually applied. Hard arming needs no revisit (it is
+  // unconditional and already ran in the projector).
+  if (fitness_reevaluated && candidate_pose_valid && !yaw_soft_armed &&
+      this->yaw_gate_enable_ && this->yaw_gate_max_corr_deg_ > 0.0 &&
+      fitness_ratio > 0.0 && fitness_ratio > this->yaw_gate_fitness_ratio_ &&
+      matrixFinite(final_candidate)) {
+    const double yaw_innov_applied = yawInnovationDeg(this->T_prior, final_candidate);
+    if (std::abs(yaw_innov_applied) > this->yaw_gate_max_corr_deg_) {
+      const Eigen::Matrix3d R_prior_d = this->T_prior.block<3, 3>(0, 0).cast<double>();
+      const Eigen::Matrix3d R_fc = final_candidate.block<3, 3>(0, 0).cast<double>();
+      const Eigen::AngleAxisd aa(R_fc * R_prior_d.transpose());
+      Eigen::Vector3d omega_d = aa.angle() * aa.axis();
+      omega_d.z() = 0.0;
+      Eigen::Matrix3d R_delta = Eigen::Matrix3d::Identity();
+      const double ang = omega_d.norm();
+      if (ang > 1e-12) {
+        R_delta = Eigen::AngleAxisd(ang, omega_d / ang).toRotationMatrix();
+      }
+      final_candidate.block<3, 3>(0, 0) = (R_delta * R_prior_d).cast<float>();
+      degen.yaw_vetoed = true;
+      degen.modified = true;
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Soft yaw veto (post-rescore): applied-pose ratio %.2f > %.2f armed the "
+                           "gate; %.2f deg yaw correction stripped (IMU yaw kept)",
+                           fitness_ratio, this->yaw_gate_fitness_ratio_, yaw_innov_applied);
+      if (matrixFinite(final_candidate)) {
+        rescore_applied_pose();  // gates must judge the yaw-stripped pose
+      } else {
+        fitness_score = std::numeric_limits<double>::infinity();  // fail closed
+        this->last_fitness_score_ = fitness_score;
+      }
     }
   }
 
@@ -4017,7 +4150,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // RTK-FIXED-quality Atlas samples. Snap-recovery and IMU dead-reckoning
     // do NOT participate in this gate; they accept Atlas dead-reckoning
     // quality as the next-best truth.
-    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt) && this->gtSampleIsRtkFixed(gt)) {
+    // [P2 FIX 2026-07-10e] The candidate being scored is a MEDIAN-point-time
+    // pose (t_prior_stamp_); querying GT at the header stamp injected a
+    // yaw-rate/speed-proportional time-skew artifact (~1.5 deg / ~3 m at
+    // 30 deg/s / 60 m/s with a 50 ms half-sweep) into every gt_err statistic.
+    const double gt_query_stamp =
+        (this->t_prior_stamp_ > 0.0) ? this->t_prior_stamp_ : this->scan_stamp.seconds();
+    if (this->getGtPoseAt(gt_query_stamp, gt) && this->gtSampleIsRtkFixed(gt)) {
       // Evaluate the pose that would actually be APPLIED (post degeneracy
       // projection), so run-report gt_err statistics describe the output.
       const Eigen::Vector3f cand_p = final_candidate.block<3, 1>(0, 3);
@@ -4043,7 +4182,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       Eigen::Quaternionf dq = cand_q.normalized() * gt_q_in_base.normalized().conjugate();
       const double w = std::clamp(static_cast<double>(std::abs(dq.w())), 0.0, 1.0);
       gt_rot_err_deg = 2.0 * std::acos(w) * 180.0 / M_PI;
-      gt_dt = this->scan_stamp.seconds() - gt.stamp;
+      gt_dt = gt_query_stamp - gt.stamp;  // [P2 FIX 2026-07-10e] staleness vs the actual query time
     }
   }
 
@@ -4180,6 +4319,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " fit_ratio=" << scalarSummary(fitness_ratio, 3)
         << " degen=[r" << degen.degen_rot_axes << ",t" << degen.degen_trans_axes
         << ",yaw_veto=" << (degen.yaw_vetoed ? 1 : 0)
+        << ",rp_clamp=" << (degen.rp_clamped ? 1 : 0)
         << ",partial=" << ((degen.valid && degen.modified) ? 1 : 0) << "]"
         << " final_error=" << scalarSummary(final_error, 6)
         << " correspondences=" << num_correspondences << "/" << this->current_scan->points.size()
@@ -4279,7 +4419,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         gicp_rejected_jump = true;
       }
     } else if (this->gicp_hessian_cond_max_ > 0.0 &&
-               std::isfinite(hessian_condition) &&
+               analysis_hessian.allFinite() &&  // [P2 FIX 2026-07-10f] +inf condition = rank-deficient, must gate
                hessian_condition > this->gicp_hessian_cond_max_ &&
                ((this->gicp_hessian_fitness_warn_ > 0.0 &&
                  fitness_score > this->gicp_hessian_fitness_warn_) ||
@@ -4550,6 +4690,18 @@ void gicp_plusplus::LocalizationNode::publishPose() {
 
   std::lock_guard<std::mutex> lock(this->pose_mutex);
 
+  // [P2 FIX 2026-07-10e] Publish with the timestamp the pose is actually
+  // VALID at. current_pose is a median-point-time quantity on accept/reject
+  // frames and a scan-header-time quantity after a GT snap —
+  // base_pose_stamp_ tracks exactly that (median time on accept/reject,
+  // scan_stamp on snap). Stamping everything with the raw header time skewed
+  // TF/path/pose consumers by ~half a sweep (~50 ms: 1.5 deg at 30 deg/s,
+  // 3 m at 60 m/s for anyone interpolating against another sensor).
+  const rclcpp::Time pub_stamp = (this->base_pose_stamp_ > 0.0)
+      ? rclcpp::Time(static_cast<int64_t>(this->base_pose_stamp_ * 1e9),
+                     this->scan_stamp.get_clock_type())
+      : this->scan_stamp;
+
   // Extract position and orientation from localized pose
   Eigen::Vector3f position = this->current_pose.block<3, 1>(0, 3);
   Eigen::Matrix3f rotation = this->current_pose.block<3, 3>(0, 0);
@@ -4558,7 +4710,7 @@ void gicp_plusplus::LocalizationNode::publishPose() {
 
   // Publish PoseStamped
   geometry_msgs::msg::PoseStamped pose_msg;
-  pose_msg.header.stamp = this->scan_stamp;
+  pose_msg.header.stamp = pub_stamp;
   pose_msg.header.frame_id = this->map_frame;
   pose_msg.pose.position.x = position.x();
   pose_msg.pose.position.y = position.y();
@@ -4577,7 +4729,7 @@ void gicp_plusplus::LocalizationNode::publishPose() {
   if (this->path_buffer_.size() >= 10000) this->path_buffer_.pop_front();
   this->path_buffer_.push_back(pose_msg);
   if (this->path_pub && this->path_pub->get_subscription_count() > 0) {
-    this->path_msg.header.stamp = this->scan_stamp;
+    this->path_msg.header.stamp = pub_stamp;
     this->path_msg.header.frame_id = this->map_frame;
     this->path_msg.poses.assign(this->path_buffer_.begin(), this->path_buffer_.end());
     this->path_pub->publish(this->path_msg);
@@ -4591,7 +4743,7 @@ void gicp_plusplus::LocalizationNode::publishPose() {
     utm_q.normalize();
 
     geometry_msgs::msg::PoseStamped utm_pose_msg;
-    utm_pose_msg.header.stamp = this->scan_stamp;
+    utm_pose_msg.header.stamp = pub_stamp;
     utm_pose_msg.header.frame_id = this->utm_frame;
     utm_pose_msg.pose.position.x = utm_pos.x();
     utm_pose_msg.pose.position.y = utm_pos.y();
@@ -4605,7 +4757,7 @@ void gicp_plusplus::LocalizationNode::publishPose() {
     if (this->utm_path_buffer_.size() >= 10000) this->utm_path_buffer_.pop_front();
     this->utm_path_buffer_.push_back(utm_pose_msg);
     if (this->utm_path_pub && this->utm_path_pub->get_subscription_count() > 0) {
-      this->utm_path_msg_.header.stamp = this->scan_stamp;
+      this->utm_path_msg_.header.stamp = pub_stamp;
       this->utm_path_msg_.header.frame_id = this->utm_frame;
       this->utm_path_msg_.poses.assign(this->utm_path_buffer_.begin(), this->utm_path_buffer_.end());
       this->utm_path_pub->publish(this->utm_path_msg_);
@@ -4780,6 +4932,13 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
 }
 
 bool gicp_plusplus::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) const {
+  // [P3 FIX 2026-07-10] NAMING CAVEAT: despite the name, this is a
+  // COVARIANCE-QUALITY gate, not a solution-type check — the adapter does not
+  // forward solution_type per-sample. An RTK-FLOAT sample whose reported
+  // position variance happens to sit under the thresholds (~3.2 cm sigma xy
+  // at the shipped 1e-3) passes "as fixed" BY DESIGN: consumers gate on
+  // accuracy, not on the fix flag. Snap recovery intentionally bypasses this
+  // gate entirely.
   // When the gate is disabled, treat every sample as FIXED -- the operator
   // has explicitly opted into "trust whatever the upstream publishes".
   if (!this->rtk_gate_enabled_) return true;
@@ -5097,7 +5256,10 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
 
 bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
-  RCLCPP_INFO(this->get_logger(),
+  // [P3 FIX 2026-07-10] Demoted from unconditional INFO ("prove helper is
+  // being called" diagnostic) — it fired on EVERY non-accepted scan, ~10
+  // lines/s of noise interleaved with the SCAN DEBUG evidence during streaks.
+  RCLCPP_DEBUG(this->get_logger(),
               "GT recovery: maybeSnapPoseToGT entered (enabled=%d streak=%d/%d gt_received=%d cached=%d) reason='%s'",
               this->gt_recovery_enabled_,
               this->consecutive_failures_, this->gt_recovery_min_consecutive_failures_,
@@ -5225,9 +5387,26 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // deadlock the entire scan callback. geo.mtx, however, is taken in narrow scopes
   // by performLocalization, never held across this call site, so locking it here
   // is correct.
-  this->current_pose.setIdentity();
-  this->current_pose.block<3, 3>(0, 0) = q_new.toRotationMatrix();
-  this->current_pose.block<3, 1>(0, 3) = p_new;
+  // [P2 FIX 2026-07-10d] DELTA-FORM observer snap. The GT sample is at
+  // scan_stamp, but the observer has been IMU-propagated PAST it by
+  // callback/solver latency (deskew + align: 20-100+ ms). The old absolute
+  // overwrite REWOUND the live observer to the stale scan-time pose — metres
+  // backward at racing speed — and discarded every IMU measurement since the
+  // scan. Mirror updateState's delta form instead: measure the correction AT
+  // scan time against the scan chain's estimate (current_pose == T_prior on
+  // the reject path that calls us; the observer dead-reckons from the same
+  // anchor during a failure streak, so the deltas coincide), then apply that
+  // SE(3) delta to the CURRENT observer state — the scan-time error snaps
+  // away while the propagation since the scan is preserved.
+  const Eigen::Matrix4f T_est_scan = this->current_pose;
+  Eigen::Matrix4f T_gt_scan = Eigen::Matrix4f::Identity();
+  T_gt_scan.block<3, 3>(0, 0) = q_new.toRotationMatrix();
+  T_gt_scan.block<3, 1>(0, 3) = p_new;
+  const bool snap_delta_ok = matrixFinite(T_est_scan);
+  const Eigen::Matrix4f T_corr =
+      snap_delta_ok ? Eigen::Matrix4f(T_gt_scan * T_est_scan.inverse()) : T_gt_scan;
+
+  this->current_pose = T_gt_scan;  // scan-chain pose stays a scan-time quantity
   Eigen::Vector3f v_base_world;
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
@@ -5238,20 +5417,44 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
       // Last resort: preserve the IMU-propagated velocity through the snap.
       v_base_body = this->state.q.conjugate() * this->state.v.lin.w;
     }
+    // Scan-time world velocity: seeds the NEXT scan's integration (prev_vel,
+    // paired with base_pose_stamp_ = scan_stamp below).
     v_base_world = q_new * v_base_body;
-    const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
-    this->state.p = p_new;
-    this->state.q = q_new;
+
+    Eigen::Quaternionf q_state_new;
+    Eigen::Vector3f p_state_new;
+    if (snap_delta_ok) {
+      Eigen::Quaternionf q_corr(Eigen::Matrix3f(T_corr.block<3, 3>(0, 0)));
+      q_corr.normalize();
+      q_state_new = (q_corr * this->state.q).normalized();
+      p_state_new = T_corr.block<3, 3>(0, 0) * this->state.p + T_corr.block<3, 1>(0, 3);
+    } else {
+      // Degenerate pre-snap estimate: absolute overwrite (legacy behavior).
+      q_state_new = q_new;
+      p_state_new = p_new;
+    }
+    // Velocities: GT body rates re-expressed with the CORRECTED current
+    // attitude (body rates are ~constant over the latency window).
+    const Eigen::Vector3f v_world_now = q_state_new * v_base_body;
+    const Eigen::Vector3f omega_world_now = q_state_new * omega_base_body;
+    this->state.p = p_state_new;
+    this->state.q = q_state_new;
     this->state.v.lin.b = v_base_body;
-    this->state.v.lin.w = v_base_world;
+    this->state.v.lin.w = v_world_now;
     this->state.v.ang.b = omega_base_body;
-    this->state.v.ang.w = omega_base_world;
+    this->state.v.ang.w = omega_world_now;
     // state.b.gyro and state.b.accel intentionally preserved.
-    this->geo.prev_p = p_new;
-    this->geo.prev_q = q_new;
-    this->geo.prev_vel = v_base_world;
+    this->geo.prev_p = p_state_new;
+    this->geo.prev_q = q_state_new;
+    this->geo.prev_vel = v_world_now;
     ++this->geo.update_seq;  // discard any in-flight propagateState computations
   }
+  RCLCPP_INFO(this->get_logger(),
+              "GT recovery: delta-form snap — correction |t|=%.2f m |rot|=%.2f deg applied to the "
+              "LIVE observer state%s",
+              T_corr.block<3, 1>(0, 3).norm(),
+              rotationDistanceDeg(Eigen::Matrix4f::Identity(), T_corr),
+              snap_delta_ok ? "" : " (ABSOLUTE fallback: pre-snap estimate non-finite)");
   {
     // [P2 FIX 2026-07-09] Seed writes under the owner lock (pose -> seed:
     // maybeSnapPoseToGT runs inside performLocalization's pose_mutex scope).
@@ -5289,6 +5492,15 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   this->consecutive_failures_ = 0;
   // A GT snap restores a known-good pose, so restart the dead-reckon clock (P3).
   this->last_accepted_scan_stamp_ = this->scan_stamp.seconds();
+  // [P3 FIX 2026-07-10] Post-snap gate/covariance bookkeeping: without these,
+  // the next scan's dt-scaled jump/yaw budgets were computed against the
+  // PRE-streak accepted scan (scan_dt clamped to max -> loosest gates against
+  // a now GT-fresh prior), and the published covariance kept describing a
+  // fitness from before the streak.
+  this->last_gicp_pose_ = this->current_pose;    // = GT pose at scan_stamp
+  this->last_gicp_stamp_ = this->scan_stamp;     // tight dt budget vs fresh prior
+  this->last_gicp_valid_ = true;
+  this->last_accepted_fitness_score_ = -1.0;     // covariance -> base sigma floor
   return true;
 }
 
@@ -5775,53 +5987,76 @@ gicp_plusplus::LocalizationNode::integrateImu(
     return empty;
   }
 
-  // Time between first IMU sample and start_time
-  double idt = start_time - f1.stamp;
+  // [P2 FIX 2026-07-10c] Piecewise REVERSE integration of the seed from
+  // start_time back to the slice head, through the REAL IMU samples. The
+  // previous code extrapolated the FIRST interval's angular acceleration and
+  // jerk across the entire seed lead (up to kMaxSeedLeadSec after the
+  // overlapping-sweep fix): under changing dynamics the forward pass through
+  // the real samples then did not return to the supplied seed pose at
+  // start_time, with error growing with overlap duration. Each reverse step
+  // below is the algebraic inverse of the forward scheme in
+  // integrateImuInternal (same first-order quaternion update, same
+  // trapezoidal velocity and jerk-aware position updates), so the forward
+  // trajectory re-anchors at the seed to the scheme's own accuracy.
+  auto advance_q = [](const Eigen::Quaternionf& qq, const Eigen::Vector3f& w, float h) {
+    Eigen::Quaternionf r(
+      qq.w() - 0.5f*( qq.x()*w[0] + qq.y()*w[1] + qq.z()*w[2] ) * h,
+      qq.x() + 0.5f*( qq.w()*w[0] - qq.z()*w[1] + qq.y()*w[2] ) * h,
+      qq.y() + 0.5f*( qq.z()*w[0] + qq.w()*w[1] - qq.x()*w[2] ) * h,
+      qq.z() + 0.5f*( qq.x()*w[1] - qq.y()*w[0] + qq.w()*w[2] ) * h);
+    r.normalize();
+    return r;
+  };
+  auto world_accel = [this](const Eigen::Quaternionf& qq, const Eigen::Vector3f& acc) {
+    Eigen::Vector3f wa = qq._transformVector(acc);
+    wa[2] -= static_cast<float>(this->gravity_);
+    return wa;
+  };
 
-  // Angular acceleration between first two IMU samples
-  Eigen::Vector3f alpha_dt = f2.ang_vel - f1.ang_vel;
-  Eigen::Vector3f alpha = alpha_dt / dt;
+  // Index of the last sample at/before start_time. The slice extends to a
+  // sample at/after end_time > start_time, so m + 1 is always a valid index.
+  size_t m = 0;
+  while (m + 1 < imu_slice.size() && imu_slice[m + 1].stamp <= start_time) m++;
 
-  // Average angular velocity (reversed) between first IMU sample and start_time
-  Eigen::Vector3f omega_i = -(f1.ang_vel + 0.5*alpha*idt);
+  // Partial step: start_time -> imu_slice[m].stamp with interval (m, m+1)
+  // dynamics (exact inverse of the forward interpolation formulas).
+  {
+    const ImuMeas& lo = imu_slice[m];
+    const ImuMeas& hi = imu_slice[m + 1];
+    const double dt_int = hi.stamp - lo.stamp;
+    const double idt = start_time - lo.stamp;
+    if (dt_int >= 1e-6 && idt > 0.0) {
+      const float fdt = static_cast<float>(dt_int);
+      const float fidt = static_cast<float>(idt);
+      const Eigen::Vector3f alpha = (hi.ang_vel - lo.ang_vel) / fdt;
+      const Eigen::Vector3f omega_i = lo.ang_vel + 0.5f*alpha*fidt;
+      q_init = advance_q(q_init, omega_i, -fidt);  // attitude at lo
+      const Eigen::Vector3f a_lo = world_accel(q_init, lo.lin_accel);
+      const Eigen::Quaternionf q_hi =
+          advance_q(q_init, lo.ang_vel + 0.5f*(hi.ang_vel - lo.ang_vel), fdt);
+      const Eigen::Vector3f a_hi = world_accel(q_hi, hi.lin_accel);
+      const Eigen::Vector3f jj = (a_hi - a_lo) / fdt;
+      v_init -= a_lo*fidt + 0.5f*jj*fidt*fidt;
+      p_init -= v_init*fidt + 0.5f*a_lo*fidt*fidt + (1.0f/6.0f)*jj*fidt*fidt*fidt;
+    }
+  }
 
-  // Set q_init to orientation at first IMU sample
-  q_init = Eigen::Quaternionf (
-    q_init.w() - 0.5*( q_init.x()*omega_i[0] + q_init.y()*omega_i[1] + q_init.z()*omega_i[2] ) * idt,
-    q_init.x() + 0.5*( q_init.w()*omega_i[0] - q_init.z()*omega_i[1] + q_init.y()*omega_i[2] ) * idt,
-    q_init.y() + 0.5*( q_init.z()*omega_i[0] + q_init.w()*omega_i[1] - q_init.x()*omega_i[2] ) * idt,
-    q_init.z() + 0.5*( q_init.x()*omega_i[1] - q_init.y()*omega_i[0] + q_init.w()*omega_i[2] ) * idt
-  );
-  q_init.normalize();
-
-  // Average angular velocity between first two IMU samples
-  Eigen::Vector3f omega = f1.ang_vel + 0.5*alpha_dt;
-
-  // Orientation at second IMU sample
-  Eigen::Quaternionf q2 (
-    q_init.w() - 0.5*( q_init.x()*omega[0] + q_init.y()*omega[1] + q_init.z()*omega[2] ) * dt,
-    q_init.x() + 0.5*( q_init.w()*omega[0] - q_init.z()*omega[1] + q_init.y()*omega[2] ) * dt,
-    q_init.y() + 0.5*( q_init.z()*omega[0] + q_init.w()*omega[1] - q_init.x()*omega[2] ) * dt,
-    q_init.z() + 0.5*( q_init.x()*omega[1] - q_init.y()*omega[0] + q_init.w()*omega[2] ) * dt
-  );
-  q2.normalize();
-
-  // Acceleration at first IMU sample
-  Eigen::Vector3f a1 = q_init._transformVector(f1.lin_accel);
-  a1[2] -= this->gravity_;
-
-  // Acceleration at second IMU sample
-  Eigen::Vector3f a2 = q2._transformVector(f2.lin_accel);
-  a2[2] -= this->gravity_;
-
-  // Jerk between first two IMU samples
-  Eigen::Vector3f j = (a2 - a1) / dt;
-
-  // Set v_init to velocity at first IMU sample (go backwards from start_time)
-  v_init -= a1*idt + 0.5*j*idt*idt;
-
-  // Set p_init to position at first IMU sample (go backwards from start_time)
-  p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
+  // Full intervals: state at imu_slice[j] -> state at imu_slice[j-1], each
+  // inverted with ITS OWN interval's measurements (not an extrapolation).
+  for (size_t j = m; j >= 1; j--) {
+    const ImuMeas& lo = imu_slice[j - 1];
+    const ImuMeas& hi = imu_slice[j];
+    const float h = static_cast<float>(hi.stamp - lo.stamp);
+    if (h < 1e-6f) continue;
+    const Eigen::Vector3f omega_avg = lo.ang_vel + 0.5f*(hi.ang_vel - lo.ang_vel);
+    const Eigen::Vector3f a_hi = world_accel(q_init, hi.lin_accel);  // attitude still at hi
+    q_init = advance_q(q_init, omega_avg, -h);                       // attitude at lo
+    const Eigen::Vector3f a_lo = world_accel(q_init, lo.lin_accel);
+    // Forward: v_hi = v_lo + 0.5*(a_lo + a_hi)*h
+    //          p_hi = p_lo + v_lo*h + 0.5*a_lo*h^2 + (1/6)*(a_hi - a_lo)*h^2
+    v_init -= 0.5f*(a_lo + a_hi)*h;
+    p_init -= v_init*h + 0.5f*a_lo*h*h + (1.0f/6.0f)*(a_hi - a_lo)*h*h;
+  }
 
   return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_slice);
 }

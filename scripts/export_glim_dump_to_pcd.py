@@ -2,13 +2,25 @@
 """Export a GLIM dump directory to a binary PCD map.
 
 This is a fallback for checkouts where the expected ``glim_dump_to_pcd`` ROS
-executable is not installed. It reads GLIM submap compact point bins and writes
-points in the dump's world frame using each submap's ``T_world_origin``.
+executable is not installed. It reads GLIM submap compact point bins and
+composes each submap's ``T_world_origin``.
+
+[P2 FIX 2026-07-10] Frame correctness: GLIM's graph lives in its own WORLD
+frame, related to the Atlas local-ENU frame by the ``T_world_utm`` alignment
+the gnss_global module fits and saves into the dump. GICP localization
+consumes Atlas ENU poses (odom-init seed, GT snap, cross-check) DIRECTLY as
+map-frame poses, so the map it loads must be genuinely ENU. This exporter now
+defaults to ``--frame enu``: it loads ``<dump>/T_world_utm.txt`` and applies
+its inverse, so the written PCD is in the Atlas local-ENU frame. When
+exporting an ENU map, leave GICP's ``localization/utm_transform_path`` EMPTY —
+the old world-frame workflow only worked to the extent T_world_utm happened
+to be near identity.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import math
 import re
 import shutil
@@ -30,6 +42,27 @@ def parse_matrix(lines: list[str], key: str) -> np.ndarray:
                 rows.append(values)
             return np.asarray(rows, dtype=np.float64)
     raise ValueError(f"{key} not found")
+
+
+def load_world_utm(path: Path) -> np.ndarray:
+    """Parse T_world_utm.txt (gnss_global's dump format) and validate it."""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    mat = parse_matrix(lines, "T_world_utm")
+    if not np.all(np.isfinite(mat)):
+        raise ValueError(f"{path}: non-finite entries")
+    if not np.allclose(mat[3], [0.0, 0.0, 0.0, 1.0], atol=1e-9):
+        raise ValueError(f"{path}: bottom row is not [0 0 0 1]")
+    R = mat[:3, :3]
+    if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
+        raise ValueError(f"{path}: rotation block is not orthonormal")
+    return mat
+
+
+def invert_se3(mat: np.ndarray) -> np.ndarray:
+    out = np.eye(4)
+    out[:3, :3] = mat[:3, :3].T
+    out[:3, 3] = -mat[:3, :3].T @ mat[:3, 3]
+    return out
 
 
 def submap_dirs(dump_dir: Path) -> list[Path]:
@@ -63,11 +96,17 @@ def transformed_chunks(
     dirs: Iterable[Path],
     voxel_size: float,
     stride: int,
+    pre_transform: Optional[np.ndarray] = None,
 ) -> Iterable[np.ndarray]:
     seen: Optional[set[tuple[int, int, int]]] = set() if voxel_size > 0.0 else None
     for idx, path in enumerate(dirs, start=1):
         lines = (path / "data.txt").read_text(encoding="utf-8", errors="replace").splitlines()
         transform = parse_matrix(lines, "T_world_origin")
+        if pre_transform is not None:
+            # [P2 FIX 2026-07-10] Compose ONCE per submap: output frame =
+            # pre_transform (T_utm_world) applied on top of T_world_origin,
+            # i.e. points land in the Atlas local-ENU frame.
+            transform = pre_transform @ transform
         points, intensities = read_submap(path)
         if stride > 1:
             points = points[::stride]
@@ -123,6 +162,29 @@ def main() -> int:
     parser.add_argument("output_pcd", type=Path)
     parser.add_argument("--voxel-size", type=float, default=0.0)
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument(
+        "--frame",
+        choices=("enu", "world"),
+        default="enu",
+        help="Output frame. 'enu' (default) applies inverse T_world_utm from the dump so the "
+        "PCD matches the Atlas local-ENU poses GICP consumes directly; 'world' writes GLIM's "
+        "raw world frame (legacy behavior — GICP GT/seed poses will be frame-mismatched "
+        "unless T_world_utm happens to be identity).",
+    )
+    parser.add_argument(
+        "--enu-origin",
+        type=str,
+        default="",
+        help="ENU datum 'lat_deg,lon_deg,alt_m' used by the adapter/prep_bag for this dataset. "
+        "Recorded in the map manifest: a map and a live adapter using DIFFERENT origins are "
+        "numerically valid but mutually incompatible, and nothing else ties the datum to the map.",
+    )
+    parser.add_argument(
+        "--transform-file",
+        type=Path,
+        default=None,
+        help="Override path to T_world_utm.txt (default: <dump_dir>/T_world_utm.txt)",
+    )
     args = parser.parse_args()
 
     if args.voxel_size < 0.0 or not math.isfinite(args.voxel_size):
@@ -133,6 +195,35 @@ def main() -> int:
     dirs = submap_dirs(args.dump_dir)
     if not dirs:
         raise SystemExit(f"no GLIM submap dirs found under {args.dump_dir}")
+
+    pre_transform: Optional[np.ndarray] = None
+    if args.frame == "enu":
+        tf_path = args.transform_file or (args.dump_dir / "T_world_utm.txt")
+        if not tf_path.is_file():
+            # Fail CLOSED: a silently world-framed "ENU" map poisons every
+            # GT-anchored mechanism in GICP. A GNSS-less dump must be exported
+            # with an explicit --frame world.
+            raise SystemExit(
+                f"--frame enu but {tf_path} does not exist (was the GNSS module enabled for this "
+                "mapping run?). Re-run with --frame world ONLY if the map is genuinely meant to "
+                "stay in GLIM's world frame."
+            )
+        T_world_utm = load_world_utm(tf_path)
+        pre_transform = invert_se3(T_world_utm)
+        yaw_deg = math.degrees(math.atan2(T_world_utm[1, 0], T_world_utm[0, 0]))
+        print(
+            f"[export_glim_dump_to_pcd] frame=enu: applying inverse T_world_utm from {tf_path} "
+            f"(world-utm offset: t=[{T_world_utm[0,3]:.2f}, {T_world_utm[1,3]:.2f}, "
+            f"{T_world_utm[2,3]:.2f}] m, yaw={yaw_deg:.2f} deg). Leave GICP's "
+            "localization/utm_transform_path EMPTY for this map.",
+            flush=True,
+        )
+    else:
+        print(
+            "[export_glim_dump_to_pcd] frame=world (legacy): PCD stays in GLIM's world frame — "
+            "GICP's Atlas ENU seeds/GT will be frame-mismatched unless T_world_utm ~= identity.",
+            flush=True,
+        )
 
     args.output_pcd.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output_pcd.with_suffix(args.output_pcd.suffix + ".tmp")
@@ -148,7 +239,7 @@ def main() -> int:
     success = False
     try:
         with data_tmp.open("wb") as data_handle:
-            for chunk in transformed_chunks(dirs, args.voxel_size, args.stride):
+            for chunk in transformed_chunks(dirs, args.voxel_size, args.stride, pre_transform):
                 chunk.tofile(data_handle)
                 total += len(chunk)
 
@@ -160,6 +251,35 @@ def main() -> int:
             with data_tmp.open("rb") as data_handle:
                 shutil.copyfileobj(data_handle, handle, length=8 * 1024 * 1024)
         tmp.replace(args.output_pcd)
+        # [P2 FIX 2026-07-10b] Map manifest: record the frame and transform the
+        # PCD was exported with, so the mapping->localization handoff is
+        # auditable (reviewer requirement: the ENU conversion must be a
+        # GUARANTEED pipeline step, not an operator convention).
+        manifest = args.output_pcd.with_suffix(args.output_pcd.suffix + ".manifest.yaml")
+        with manifest.open("w", encoding="utf-8") as mh:
+            mh.write("# Map provenance manifest (written by export_glim_dump_to_pcd.py)\n")
+            mh.write(f"exported_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
+            mh.write(f"source_dump: {args.dump_dir.resolve()}\n")
+            mh.write(f"frame: {args.frame}\n")
+            mh.write(f"points: {total}\n")
+            mh.write(f"voxel_size: {args.voxel_size}\n")
+            mh.write(f"stride: {args.stride}\n")
+            if args.enu_origin:
+                mh.write(f"enu_origin: {args.enu_origin}\n")
+            else:
+                mh.write("enu_origin: UNSPECIFIED  # WARNING: record the adapter's\n")
+                mh.write("#   local_enu_origin for this dataset — a live adapter with a\n")
+                mh.write("#   different datum is silently incompatible with this map\n")
+            if pre_transform is not None:
+                mh.write("applied_transform: inverse(T_world_utm)  # PCD is Atlas local-ENU\n")
+                mh.write("T_world_utm:\n")
+                for row in T_world_utm:
+                    mh.write("  - [" + ", ".join(f"{v:.10f}" for v in row) + "]\n")
+                mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
+            else:
+                mh.write("applied_transform: none  # PCD is GLIM WORLD frame — NOT directly\n")
+                mh.write("#   compatible with Atlas ENU seeds/GT in gicp localization\n")
+        print(f"[export_glim_dump_to_pcd] manifest: {manifest}")
         success = True
     finally:
         data_tmp.unlink(missing_ok=True)

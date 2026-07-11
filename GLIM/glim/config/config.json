@@ -39,7 +39,6 @@
     "config_sub_mapping": "config_sub_mapping_dense_map.json",
     // "config_sub_mapping": "config_sub_mapping_passthrough.json",  // legacy sparse (odometry-only runs)
     "config_global_mapping": "config_global_mapping_gpu.json",
-    "config_gnss": "config_gnss_global.json",
     "config_pcap": "config_pcap.json"
   }
 }
