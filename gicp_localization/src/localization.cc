@@ -1336,6 +1336,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
     this->dbg_scan_time_span_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_time_span_s", 10);
+    this->dbg_deskew_applied_pub =
+        this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/deskew_applied", 10);
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
       this->dbg_aux_dt_pubs_.push_back(this->create_publisher<std_msgs::msg::Float64>(
           "gicp/localization/debug/aux" + std::to_string(i) + "_merge_dt_s", 10));
@@ -3151,6 +3153,10 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   // takes pose, so no cycle.
   std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
 
+  // Per-frame audit state. Only the complete per-point IMU compensation path
+  // sets this true; every fallback and initialization frame stays false.
+  this->last_deskew_applied_ = false;
+
   // [P1 FIX 2026-07-10] Default validity time for this scan's T_prior:
   // the header stamp; the main path overrides with the median point time.
   this->t_prior_stamp_ = this->scan_stamp.seconds();
@@ -3465,6 +3471,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     }
   }
 
+  this->last_deskew_applied_ = true;
   this->current_scan = deskewed_scan_;
   this->scan_in_world_frame_ = true;
   this->prev_scan_stamp = this->scan_stamp.seconds();
@@ -3975,6 +3982,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
     publish_float(this->dbg_merged_aux_count_pub,
                   static_cast<double>(this->concat_last_merged_aux_));
     publish_float(this->dbg_scan_time_span_pub, this->last_scan_time_span_s_);
+    std_msgs::msg::Bool deskew_applied_msg;
+    deskew_applied_msg.data = this->last_deskew_applied_;
+    this->dbg_deskew_applied_pub->publish(deskew_applied_msg);
     for (size_t i = 0; i < this->dbg_aux_dt_pubs_.size(); ++i) {
       const double dt_i = (i < this->concat_last_aux_dt_.size())
           ? this->concat_last_aux_dt_[i] : std::numeric_limits<double>::quiet_NaN();

@@ -256,8 +256,10 @@ private:
   std::vector<int> concat_last_aux_points_;     // appended points; 0 = not merged
   std::vector<double> concat_aux_time_offsets_; // P3 fix: constant per-aux clock offset (s), order = aux_topics
   double last_scan_time_span_s_ = -1.0;         // merged-scan per-point time span (deskew path)
+  bool last_deskew_applied_ = false;            // true only after per-point IMU compensation completes
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_merged_aux_count_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_time_span_pub;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_deskew_applied_pub;
   std::vector<rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr> dbg_aux_dt_pubs_;
   std::vector<rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr> dbg_aux_points_pubs_;
   // Resolve every aux's T_primary_aux without live TF; returns the count resolved.
