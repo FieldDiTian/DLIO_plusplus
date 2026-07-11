@@ -42,6 +42,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *************************************************************************/
 
+#include <cmath>   // std::isfinite (fitness fail-closed fix)
+#include <limits>
+
 #include "dlio/dlio.h"
 #include "nano_gicp/nano_gicp.h"
 
@@ -332,7 +335,12 @@ double NanoGICP<PointSource, PointTarget>::getFitnessScore(double max_range) {
     ++n;
   }
 
-  return n > 0 ? sum / static_cast<double>(n) : std::numeric_limits<double>::max();
+  // [REVIEW FIX 2026-07-08 P2] NaN error (degenerate covariances, NaN points)
+  // must fail CLOSED: a NaN fitness makes every `>` threshold comparison
+  // false downstream, silently accepting the scan. No matches -> +inf too.
+  const double mean = (n > 0) ? sum / static_cast<double>(n)
+                              : std::numeric_limits<double>::infinity();
+  return std::isfinite(mean) ? mean : std::numeric_limits<double>::infinity();
 }
 
 template <typename PointSource, typename PointTarget>
@@ -365,7 +373,11 @@ double NanoGICP<PointSource, PointTarget>::getFitnessScoreAtFinal(double max_ran
     sum += k_sq_dist[0];
     ++n;
   }
-  return n > 0 ? sum / static_cast<double>(n) : std::numeric_limits<double>::max();
+  // [REVIEW FIX 2026-07-08 P2] Same fail-CLOSED rule as getFitnessScore():
+  // a NaN mean (NaN points) or no matches must return +inf, never NaN.
+  const double mean = (n > 0) ? sum / static_cast<double>(n)
+                              : std::numeric_limits<double>::infinity();
+  return std::isfinite(mean) ? mean : std::numeric_limits<double>::infinity();
 }
 
 template <typename PointSource, typename PointTarget>

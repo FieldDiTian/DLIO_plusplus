@@ -1005,8 +1005,18 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->geo.prev_q = Eigen::Quaternionf::Identity();
   this->geo.prev_vel = Eigen::Vector3f::Zero();
 
-  // Initialize sensor type (default to OUSTER, can be configured)
-  this->sensor = dlio::SensorType::OUSTER;
+  // [P1 FIX 2026-07-10] The "default to OUSTER" assignment that used to sit
+  // here ran AFTER getParams() and unconditionally clobbered the configured
+  // localization/sensor_type — with sensor_type=luminar the node logged
+  // "Sensor type: luminar" and then silently ran as OUSTER: the Luminar
+  // UINT8[8] epoch-ns per-point decode never engaged, every sweep collapsed
+  // to a rigid transform (scan_time_span_s == 0.0 on all frames of the
+  // 2026-07-09 run3/run5 replays), and mergeAuxClouds treated absolute aux
+  // timestamps as relative. Present since the original 2026-03-21 import —
+  // ALL prior replays ran without effective per-point deskew. getParams()
+  // (called at the top of this constructor) sets `sensor` on every path,
+  // including an UNKNOWN fallback with a warning, so no default is needed
+  // here at all.
 
   // Initialize extrinsics to identity (should be configured from parameters)
   this->extrinsics.baselink2imu.t = Eigen::Vector3f::Zero();
@@ -3240,7 +3250,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
         if (latest_imu > 0.0 && single_ts[0] > latest_imu)
           single_ts[0] = latest_imu;
       }
-      auto frames = this->integrateImu(this->prev_scan_stamp, this->basePose.q,
+      // [P1 FIX 2026-07-10] same seed-time consistency as the main path.
+      const double seed_time_off =
+          (this->base_pose_stamp_ > 0.0) ? this->base_pose_stamp_ : this->prev_scan_stamp;
+      auto frames = this->integrateImu(seed_time_off, this->basePose.q,
                                         this->basePose.p, this->prev_vel, single_ts);
       if (frames.size() == 1 && matrixFinite(frames[0])) {
         this->T_prior = frames[0];
@@ -3460,8 +3473,19 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     }
   }
 
+  // [P1 FIX 2026-07-10] Integrate from the time basePose is actually VALID at
+  // — the previous scan's MEDIAN point time (base_pose_stamp_) — not the
+  // previous HEADER stamp. basePose is stored at median time (the accepted
+  // candidate / T_prior are median-time poses); starting the integration at
+  // the header re-integrated the ~half-sweep of rotation basePose already
+  // contains: a systematic yaw LEAD of yaw_rate * (median - header), ~1.5 deg
+  // at 30 deg/s with a 50 ms offset — exactly the soft yaw-veto threshold,
+  // biasing every turn frame toward the veto. Falls back to prev_scan_stamp
+  // when the stamp was never populated (pre-first-scan states).
+  const double seed_time =
+      (this->base_pose_stamp_ > 0.0) ? this->base_pose_stamp_ : this->prev_scan_stamp;
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-  frames = this->integrateImu(this->prev_scan_stamp, this->basePose.q, this->basePose.p,
+  frames = this->integrateImu(seed_time, this->basePose.q, this->basePose.p,
                               this->prev_vel, timestamps);
 
   // If there are no frames between the start and end of the sweep, use previous transform
@@ -3679,9 +3703,39 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       this->current_scan->points.empty()
           ? 0.0
           : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
-  const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
-  const double hessian_condition = hessianConditionProxy(final_hessian);
   const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
+  const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
+  // [P2 FIX 2026-07-10] Bring the Hessian into ONE tangent convention before
+  // ANY analysis. small_gicp's H lives in the right-multiplicative tangent of
+  // the optimizer's T at the SOURCE points: on the world path (T ~= I, points
+  // in world coordinates) that coincides with the world-origin left tangent
+  // the re-centering machinery (skew(p_prior) lever arm) and the calibrated
+  // hessianCondMax/relFloor thresholds assume. On the deskew-FALLBACK path
+  // the source cloud stays in LiDAR coordinates and T = map<-lidar: the raw H
+  // is sensor-centered, and re-centering it with the map-position lever arm
+  // as if it were world-origin produced meaningless eigen-axes — the
+  // degeneracy projection could suppress well-constrained axes and pass
+  // degenerate ones, exactly on the fragile frames (IMU gaps, unsupported
+  // timestamps). Transform: delta_left = Ad_T * delta_right  =>
+  // H_left = Ad_T^{-T} * H * Ad_T^{-1}, with [w;t] ordering and
+  // Ad_{T^-1} = [[R^T, 0], [-R^T*skew(t), R^T]]. Verified numerically against
+  // synthetic point-pair Hessians in both parameterizations (rel. err 3e-16).
+  Eigen::Matrix<double, 6, 6> analysis_hessian = final_hessian;
+  if (!this->scan_in_world_frame_ && final_hessian.allFinite() &&
+      matrixFinite(optimizer_solution)) {
+    const Eigen::Matrix3d R_sol = optimizer_solution.block<3, 3>(0, 0).cast<double>();
+    const Eigen::Vector3d t_sol = optimizer_solution.block<3, 1>(0, 3).cast<double>();
+    Eigen::Matrix3d t_hat;
+    t_hat << 0.0, -t_sol.z(), t_sol.y(),
+             t_sol.z(), 0.0, -t_sol.x(),
+             -t_sol.y(), t_sol.x(), 0.0;
+    Eigen::Matrix<double, 6, 6> Ad_inv = Eigen::Matrix<double, 6, 6>::Zero();
+    Ad_inv.block<3, 3>(0, 0) = R_sol.transpose();
+    Ad_inv.block<3, 3>(3, 0) = -R_sol.transpose() * t_hat;
+    Ad_inv.block<3, 3>(3, 3) = R_sol.transpose();
+    analysis_hessian = Ad_inv.transpose() * final_hessian * Ad_inv;
+  }
+  const double hessian_condition = hessianConditionProxy(analysis_hessian);
   const Eigen::Matrix4f candidate_pose = this->scan_in_world_frame_
       ? (optimizer_solution * this->T_prior)
       : (optimizer_solution * T_lidar_base);
@@ -3694,8 +3748,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   // constrains yaw here (wrong-basin risk); also the calibration reference
   // for gicp/prior/yawInfo (start at ~0.2x the run median).
   double yaw_marginal_stiffness = -1.0;
-  if (candidate_pose_valid && final_hessian.allFinite() && matrixFinite(this->T_prior)) {
-    const Eigen::Matrix<double, 6, 6> H_sym = 0.5 * (final_hessian + final_hessian.transpose());
+  if (candidate_pose_valid && analysis_hessian.allFinite() && matrixFinite(this->T_prior)) {
+    const Eigen::Matrix<double, 6, 6> H_sym = 0.5 * (analysis_hessian + analysis_hessian.transpose());
     const Eigen::Vector3d c = this->T_prior.block<3, 1>(0, 3).cast<double>();
     Eigen::Matrix3d skew_c;
     skew_c << 0.0, -c.z(), c.y(), c.z(), 0.0, -c.x(), -c.y(), c.x(), 0.0;
@@ -3786,7 +3840,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   DegeneracyProjection degen;
   degen.projected_pose = candidate_pose;
   if (eigen_projection_wanted || yaw_veto_wanted) {
-    degen = projectDegenerateDelta(final_hessian, this->T_prior, candidate_pose,
+    degen = projectDegenerateDelta(analysis_hessian, this->T_prior, candidate_pose,
                                    eigen_projection_wanted,
                                    this->degen_full6d_, this->degen_coupling_length_m_,
                                    this->degen_rel_floor_6d_,
@@ -4175,7 +4229,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_hessian = false;
   bool gicp_rejected_support = false;
   if (effectively_converged && candidate_pose_valid) {
-    if (!final_hessian.allFinite()) {
+    if (!analysis_hessian.allFinite()) {
       // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
       // returns +inf, but every Hessian gate below requires
       // std::isfinite(hessian_condition) — so these scans previously skipped
@@ -4602,7 +4656,15 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
   // publishes in pose.covariance[35] (Atlas rpy covariance, deg^2 -> rad^2).
   // Consumed by the INS heading prior's yaw-quality gate. Generic publishers
   // that leave the field at 0 are treated as "unpopulated" downstream.
-  s.cov_yaw = msg->pose.covariance[35];
+  // [P2 FIX 2026-07-10] NaN yaw covariance is KNOWN-BAD (invalid heading
+  // solution), not "unpopulated": the gate's `cov_yaw > 0` test is false for
+  // NaN, so it used to fail OPEN. Map NaN to +inf so the yaw-sigma gate
+  // rejects it (mirrors GLIM gnss_global's sanitize_yaw_var; the adapter now
+  // also sanitizes at the source, this is defense in depth for other GT
+  // publishers). 0/negative keep the documented "unpopulated passes" compat.
+  s.cov_yaw = std::isnan(msg->pose.covariance[35])
+      ? std::numeric_limits<double>::infinity()
+      : msg->pose.covariance[35];
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
@@ -5639,20 +5701,36 @@ gicp_plusplus::LocalizationNode::integrateImu(
 
   const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
 
-  if (sorted_timestamps.empty() || start_time > sorted_timestamps.front()) {
+  if (sorted_timestamps.empty()) {
     if (this->verbose_) {
-      std::fprintf(stderr,
-                   "[IMU_INT] REJECT guard: empty=%d start=%.6f front=%.6f (start>front=%d)\n",
-                   (int)sorted_timestamps.empty(), start_time,
-                   sorted_timestamps.empty() ? 0.0 : sorted_timestamps.front(),
-                   (int)(!sorted_timestamps.empty() && start_time > sorted_timestamps.front()));
+      std::fprintf(stderr, "[IMU_INT] REJECT guard: empty timestamps\n");
       std::fflush(stderr);
     }
     return empty;
   }
+  // [P1 FIX 2026-07-10] Overlapping merged sweeps are NORMAL: a leading aux
+  // LiDAR contributes points earlier than the seed time (with the seed now at
+  // the previous MEDIAN time, current-scan aux points routinely precede it at
+  // 20 Hz). The old `start_time > timestamps.front()` rejection threw away
+  // the ENTIRE frame's deskew + motion prediction exactly on those frames.
+  // Instead: extend the IMU slice down to the earliest point and let the
+  // existing seed back-projection (idt = start_time - f1.stamp) handle the
+  // offset. A gross inconsistency still fails closed via the bound below.
+  constexpr double kMaxSeedLeadSec = 0.5;
+  if (start_time - sorted_timestamps.front() > kMaxSeedLeadSec) {
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[IMU_INT] REJECT guard: seed leads earliest point by %.3fs (> %.1fs) — "
+                   "inconsistent merge\n",
+                   start_time - sorted_timestamps.front(), kMaxSeedLeadSec);
+      std::fflush(stderr);
+    }
+    return empty;
+  }
+  const double slice_start = std::min(start_time, sorted_timestamps.front());
 
   std::vector<ImuMeas> imu_slice;
-  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_slice) == false) {
+  if (this->imuMeasFromTimeRange(slice_start, sorted_timestamps.back(), imu_slice) == false) {
     double front_s = -1, back_s = -1;
     size_t sz = 0;
     {
@@ -5790,7 +5868,17 @@ gicp_plusplus::LocalizationNode::integrateImuInternal(
     // Average angular velocity
     Eigen::Vector3f omega = f0.ang_vel + 0.5*alpha_dt;
 
-    // Orientation
+    // [P1 FIX 2026-07-10] Save the orientation AT f0 before advancing: the
+    // interpolation loop below produces poses for timestamps inside [f0, f]
+    // with idt measured FROM f0, so it must start from q(f0). The original
+    // (upstream-DLIO-inherited) code advanced q to f first and then built
+    // q_i on the advanced value — every deskew pose was one full IMU
+    // interval ahead in orientation (~10 ms at 100 Hz ~= 0.3 deg at
+    // 30 deg/s), while its position interpolated consistently from f0.
+    const Eigen::Quaternionf q0 = q;
+
+    // Orientation (advance f0 -> f; used for the acceleration at f and as
+    // the next interval's base)
     q = Eigen::Quaternionf (
       q.w() - 0.5*( q.x()*omega[0] + q.y()*omega[1] + q.z()*omega[2] ) * dt,
       q.x() + 0.5*( q.w()*omega[0] - q.z()*omega[1] + q.y()*omega[2] ) * dt,
@@ -5816,12 +5904,12 @@ gicp_plusplus::LocalizationNode::integrateImuInternal(
       // Average angular velocity
       Eigen::Vector3f omega_i = f0.ang_vel + 0.5*alpha*idt;
 
-      // Orientation
+      // Orientation — from q0 (the orientation at f0), matching idt's origin.
       Eigen::Quaternionf q_i (
-        q.w() - 0.5*( q.x()*omega_i[0] + q.y()*omega_i[1] + q.z()*omega_i[2] ) * idt,
-        q.x() + 0.5*( q.w()*omega_i[0] - q.z()*omega_i[1] + q.y()*omega_i[2] ) * idt,
-        q.y() + 0.5*( q.z()*omega_i[0] + q.w()*omega_i[1] - q.x()*omega_i[2] ) * idt,
-        q.z() + 0.5*( q.x()*omega_i[1] - q.y()*omega_i[0] + q.w()*omega_i[2] ) * idt
+        q0.w() - 0.5*( q0.x()*omega_i[0] + q0.y()*omega_i[1] + q0.z()*omega_i[2] ) * idt,
+        q0.x() + 0.5*( q0.w()*omega_i[0] - q0.z()*omega_i[1] + q0.y()*omega_i[2] ) * idt,
+        q0.y() + 0.5*( q0.z()*omega_i[0] + q0.w()*omega_i[1] - q0.x()*omega_i[2] ) * idt,
+        q0.z() + 0.5*( q0.x()*omega_i[1] - q0.y()*omega_i[0] + q0.w()*omega_i[2] ) * idt
       );
       q_i.normalize();
 
@@ -5982,13 +6070,19 @@ void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
   odom_msg.pose.pose.orientation.y = new_q.y();
   odom_msg.pose.pose.orientation.z = new_q.z();
 
-  // Velocity from propagated state (in world frame)
-  odom_msg.twist.twist.linear.x = new_v_lin_w.x();
-  odom_msg.twist.twist.linear.y = new_v_lin_w.y();
-  odom_msg.twist.twist.linear.z = new_v_lin_w.z();
-  odom_msg.twist.twist.angular.x = new_v_ang_w.x();
-  odom_msg.twist.twist.angular.y = new_v_ang_w.y();
-  odom_msg.twist.twist.angular.z = new_v_ang_w.z();
+  // [P2 FIX 2026-07-10] REP-105 / nav_msgs convention: the twist is expressed
+  // in child_frame_id (= base_frame, the BODY frame), not the header frame.
+  // The old world-frame twist made linear velocity wrong for any nonzero yaw
+  // and the yaw-rate component wrong whenever the vehicle was pitched or
+  // banked. Linear: rotate the world velocity into the body; angular: the
+  // bias-corrected gyro is already the body rate.
+  const Eigen::Vector3f v_lin_body = new_q.conjugate() * new_v_lin_w;
+  odom_msg.twist.twist.linear.x = v_lin_body.x();
+  odom_msg.twist.twist.linear.y = v_lin_body.y();
+  odom_msg.twist.twist.linear.z = v_lin_body.z();
+  odom_msg.twist.twist.angular.x = new_v_ang_b.x();
+  odom_msg.twist.twist.angular.y = new_v_ang_b.y();
+  odom_msg.twist.twist.angular.z = new_v_ang_b.z();
 
   // Pose covariance: diagonal only.
   // When GICP is accepted use sqrt(fitness) as a positional sigma (metres).
@@ -6073,7 +6167,10 @@ void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
     Eigen::Quaternionf utm_q(T_utm_base.block<3, 3>(0, 0));
     utm_q.normalize();
     // Rotate velocity into UTM frame
-    Eigen::Vector3f utm_v_lin = this->T_utm_map_.block<3, 3>(0, 0) * new_v_lin_w;
+    // [P2 FIX 2026-07-10] Twist is in child_frame_id (= base_frame) per
+    // REP-105 — the body twist is IDENTICAL for the map- and utm-framed
+    // odometry messages; the old code rotated the (already wrong-frame)
+    // world velocity into UTM axes.
 
     nav_msgs::msg::Odometry utm_odom_msg;
     utm_odom_msg.header.stamp = current_time;
@@ -6086,12 +6183,12 @@ void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
     utm_odom_msg.pose.pose.orientation.x = utm_q.x();
     utm_odom_msg.pose.pose.orientation.y = utm_q.y();
     utm_odom_msg.pose.pose.orientation.z = utm_q.z();
-    utm_odom_msg.twist.twist.linear.x = utm_v_lin.x();
-    utm_odom_msg.twist.twist.linear.y = utm_v_lin.y();
-    utm_odom_msg.twist.twist.linear.z = utm_v_lin.z();
-    utm_odom_msg.twist.twist.angular.x = new_v_ang_w.x();
-    utm_odom_msg.twist.twist.angular.y = new_v_ang_w.y();
-    utm_odom_msg.twist.twist.angular.z = new_v_ang_w.z();
+    utm_odom_msg.twist.twist.linear.x = v_lin_body.x();
+    utm_odom_msg.twist.twist.linear.y = v_lin_body.y();
+    utm_odom_msg.twist.twist.linear.z = v_lin_body.z();
+    utm_odom_msg.twist.twist.angular.x = new_v_ang_b.x();
+    utm_odom_msg.twist.twist.angular.y = new_v_ang_b.y();
+    utm_odom_msg.twist.twist.angular.z = new_v_ang_b.z();
     this->utm_odom_pub->publish(utm_odom_msg);
   }
 

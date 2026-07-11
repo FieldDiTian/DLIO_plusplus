@@ -280,6 +280,9 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
 
     x0 = xi;
     lm_lambda_ = lm_lambda_ * std::max(1.0 / 3.0, 1 - std::pow(2 * rho - 1, 3));
+    // NOTE (2026-07-10 port): H_raw is the PRE-step linearization point (the
+    // x0 this step departed from, not the accepted xi) — a known staleness
+    // gap vs GICP_plusplus, which re-linearizes at the final pose.
     final_hessian_ = H_raw;  // raw LiDAR geometry (see comment above)
     final_error_ = yi;
     return true;

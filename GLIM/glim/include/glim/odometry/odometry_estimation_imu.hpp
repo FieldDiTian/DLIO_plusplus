@@ -100,6 +100,12 @@ protected:
 
   // Frames & keyframes
   int marginalized_cursor;
+  // [P2 FIX 2026-07-10] The bias every state is pinned to when fix_imu_bias
+  // is enabled: params->imu_bias by default, overwritten with the LOOSE
+  // initializer's estimate at initialization. A member (not
+  // frames.front()->imu_bias) because marginalization reset()s old frame
+  // entries, so frame 0 is null within seconds.
+  Eigen::Matrix<double, 6, 1> fixed_imu_bias_;
   gtsam_points::IndexedSlidingWindow<EstimationFrame::Ptr> frames;
 
   // Utility classes

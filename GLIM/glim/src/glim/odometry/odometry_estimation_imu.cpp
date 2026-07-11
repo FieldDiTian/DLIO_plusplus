@@ -73,6 +73,7 @@ OdometryEstimationIMUParams::~OdometryEstimationIMUParams() {}
 
 OdometryEstimationIMU::OdometryEstimationIMU(std::unique_ptr<OdometryEstimationIMUParams>&& params_) : params(std::move(params_)) {
   marginalized_cursor = 0;
+  fixed_imu_bias_ = params->imu_bias;  // [P2 FIX 2026-07-10] see header
   T_lidar_imu.setIdentity();
   T_imu_lidar.setIdentity();
 
@@ -169,6 +170,11 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
 
     new_frame->v_world_imu = init_state->v_world_imu;
     new_frame->imu_bias = init_state->imu_bias;
+    // [P2 FIX 2026-07-10] The fix_imu_bias prior must pin to THIS bias — the
+    // initial state's — for all subsequent states (see the prior factor
+    // below); pinning to the unconfigured (zero) params->imu_bias created a
+    // bias step between B(0) and B(1).
+    fixed_imu_bias_ = init_state->imu_bias;
     new_frame->raw_frame = raw_frame;
 
     // Transform points into IMU frame
@@ -260,7 +266,16 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
   new_factors.add(
     gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(last), B(current), gtsam::imuBias::ConstantBias(), gtsam::noiseModel::Isotropic::Sigma(6, params->imu_bias_noise)));
   if (params->fix_imu_bias) {
-    new_factors.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(B(current), gtsam::imuBias::ConstantBias(params->imu_bias), gtsam::noiseModel::Isotropic::Precision(6, 1e3)));
+    // [P2 FIX 2026-07-10] Pin to the INITIAL state's bias — frame 0 carries
+    // the LOOSE initializer's estimate under LOOSE mode and params->imu_bias
+    // under NAIVE — not to params->imu_bias directly. The active GPU config
+    // (LOOSE + fix_imu_bias=true, no sensors/imu_bias key) made the old prior
+    // pin every state AFTER the first to a ZERO bias while B(0) kept the
+    // initializer's estimate: a bias step between B(0) and B(1) at prior
+    // sigma ~0.03 that the IMU factors then absorbed as pose/velocity error.
+    // This implements the documented contract ("disable IMU bias estimation
+    // and use the initial IMU bias") for both initialization modes.
+    new_factors.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(B(current), gtsam::imuBias::ConstantBias(fixed_imu_bias_), gtsam::noiseModel::Isotropic::Precision(6, 1e3)));
   }
 
   // Create IMU factor

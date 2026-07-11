@@ -11,7 +11,11 @@
   // use_isam2_dogleg            : Use the dogleg optimizer as the backend of ISAM2 that is slow but more robust
   // isam2_relinearize_skip      :
   // isam2_relinearize_thresh    :
-  // fix_imu_bias                : If true, disable IMU bias estimation and use the initial IMU bias
+  // fix_imu_bias                : If true, disable IMU bias estimation and pin all states to the
+  //                                 INITIAL bias (LOOSE initializer's estimate, or sensors/imu_bias
+  //                                 under NAIVE). Fixed 2026-07-10: previously pinned to the
+  //                                 (unconfigured = zero) sensors/imu_bias, discarding the
+  //                                 LOOSE-estimated bias after the first state.
   //
   // --- Voxel params ---
   // voxel_resolution            : Base resolution for VGICP voxels

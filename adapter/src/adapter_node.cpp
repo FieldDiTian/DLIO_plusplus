@@ -348,14 +348,25 @@ private:
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
 
+    // [P2 FIX 2026-07-10] Fail closed on non-finite covariance. The pose
+    // VALUES are validated above, but a solution can be value-finite with a
+    // NaN covariance (degraded heading with an unsolved variance). Downstream
+    // gates split by comparison direction: position gates use `<= max`
+    // (NaN already fails closed), but GICP's INS yaw-quality gate keys on
+    // `cov_yaw > 0` — false for NaN — so a NaN yaw variance used to pass as
+    // "unpopulated" (fail-OPEN). Map non-finite variances to +inf = KNOWN-BAD,
+    // matching GLIM gnss_global's sanitize_yaw_var policy.
+    const auto fail_closed = [](double v) {
+      return std::isfinite(v) ? v : std::numeric_limits<double>::infinity();
+    };
     const auto& pc = msg->position_covariance;
     const auto& rc = msg->rpy_covariance;
-    odom.pose.covariance[0] = static_cast<double>(pc[0]);
-    odom.pose.covariance[7] = static_cast<double>(pc[4]);
-    odom.pose.covariance[14] = static_cast<double>(pc[8]);
-    odom.pose.covariance[21] = static_cast<double>(rc[0]) * kDegToRadSq;
-    odom.pose.covariance[28] = static_cast<double>(rc[4]) * kDegToRadSq;
-    odom.pose.covariance[35] = static_cast<double>(rc[8]) * kDegToRadSq;
+    odom.pose.covariance[0] = fail_closed(static_cast<double>(pc[0]));
+    odom.pose.covariance[7] = fail_closed(static_cast<double>(pc[4]));
+    odom.pose.covariance[14] = fail_closed(static_cast<double>(pc[8]));
+    odom.pose.covariance[21] = fail_closed(static_cast<double>(rc[0]) * kDegToRadSq);
+    odom.pose.covariance[28] = fail_closed(static_cast<double>(rc[4]) * kDegToRadSq);
+    odom.pose.covariance[35] = fail_closed(static_cast<double>(rc[8]) * kDegToRadSq);
 
     odom.twist.twist.linear.x = msg->velflu.x;
     odom.twist.twist.linear.y = msg->velflu.y;
