@@ -8,6 +8,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -319,6 +320,14 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
+  // Test-artifact trajectory evidence. trajectory_pose is the pose actually
+  // applied after accept/reject/snap handling; ins_pose is the time-matched
+  // Atlas reference in the same map/base frame. snap_correction stores two
+  // poses per event: [pre-snap estimate, INS target]. All three live under
+  // debug/* so the standard debug-only GICP recorder captures them.
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_trajectory_pose_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_ins_pose_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr dbg_snap_correction_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr gt_snap_pub;
 
   // TF

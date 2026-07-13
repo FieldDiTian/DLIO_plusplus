@@ -366,7 +366,11 @@ Per-scan scalar metrics on `gicp/localization/debug/*`:
 - `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled; measured against the pose actually applied)
 - `converged` (Bool)
 
-Plus pose / cloud topics: `initial_guess_pose`, `final_pose` (post-projection), `input_cloud_base`, `initial_guess_cloud`, `pose_markers`.
+Plus pose / cloud topics: `initial_guess_pose`, `final_pose` (post-projection),
+`trajectory_pose` (the pose actually applied after all accept/reject/snap
+handling), `ins_pose` (time-matched Atlas INS in the same frame),
+`snap_correction` (`PoseArray[pre-snap estimate, INS target]`),
+`input_cloud_base`, `initial_guess_cloud`, and `pose_markers`.
 
 `enable_pub` and `verbose_scan_log` are **on by default** so every replay
 produces this evidence; score a run's `localization.log` with
@@ -502,3 +506,35 @@ If `mean_err`, `p95_err`, `max_err` stay near zero, the topic path is consistent
 `scripts/profile_localization_resources.py` and `scripts/plot_localization_profile.py` capture and chart per-scan resource usage and the full debug-topic time series. Useful for tuning real-time performance.
 
 `scripts/plot_source_switches.py` plots when the node switches between GICP, dead-reckoning, and GT snap — handy when investigating snap behavior.
+
+### Per-lap GICP / INS trajectory images
+
+`scripts/generate_lap_trajectory_plots.py` post-processes a completed GICP
+debug bag and writes one top-down PNG for every completed lap. The test output
+directory is deliberately named `trajtory/` to preserve the GICP-result
+artifact contract.
+
+```bash
+python3 scripts/generate_lap_trajectory_plots.py \
+  --bag /path/to/gicp_test/debug_topics_bag \
+  --output-dir /path/to/gicp_test/trajtory
+```
+
+Each image uses the fixed visualization contract:
+
+- green: applied GICP localization trajectory (`debug/trajectory_pose`);
+- red: time-matched Atlas INS reference (`debug/ins_pose`);
+- yellow: the exact correction from the pre-snap estimate to the INS target
+  (`debug/snap_correction`).
+
+Every snap target is numbered on the track. The right-hand panel in the same
+image maps each number to its exact ROS time and correction length. Automatic
+lap boundaries come from repeated same-direction crossings of a line inferred
+from the INS trajectory; they are not an official transponder timing line.
+The generated `trajtory_manifest.json` records the inferred line, confidence,
+lap boundaries, every snap ROS timestamp, image hashes, and partial time before
+the first / after the last complete lap. Labelled `partial_*.png` images are
+added whenever those partial segments contain snap events (or at least five
+seconds of trajectory), so every recorded snap is present in exactly one
+image. A short smoke run without a complete lap still produces one clearly
+named `lap_001_partial.png`.

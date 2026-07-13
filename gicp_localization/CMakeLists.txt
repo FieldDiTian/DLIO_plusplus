@@ -81,6 +81,7 @@ install( TARGETS gicp_localization_node
 install( PROGRAMS
          scripts/profile_localization_resources.py
          scripts/plot_localization_profile.py
+         scripts/generate_lap_trajectory_plots.py
          DESTINATION lib/${PROJECT_NAME}
 )
 install( DIRECTORY cfg launch
@@ -113,3 +114,11 @@ if(HAS_CPUID)
 endif()
 
 target_compile_options(gicp_localization_node PRIVATE ${OpenMP_FLAGS})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(
+    test_generate_lap_trajectory_plots
+    test/test_generate_lap_trajectory_plots.py
+  )
+endif()

@@ -1318,6 +1318,12 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
     this->dbg_gt_rot_deg_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
+    this->dbg_trajectory_pose_pub =
+        this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/trajectory_pose", 10);
+    this->dbg_ins_pose_pub =
+        this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/ins_pose", 10);
+    this->dbg_snap_correction_pub =
+        this->create_publisher<geometry_msgs::msg::PoseArray>("gicp/localization/debug/snap_correction", 10);
     // P1 gating rework diagnostics
     this->dbg_fitness_ratio_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness_ratio", 10);
@@ -4467,6 +4473,33 @@ void gicp_localization::LocalizationNode::publishPose() {
   // With unreliable IMU, we publish only GICP results instead of propagated poses
   this->pose_pub->publish(pose_msg);
 
+  // Persist the trajectory evidence needed by the post-test per-lap plotter.
+  // Publish at GICP rate (one applied pose per processed scan), not IMU rate,
+  // so the debug bag stays compact and the localization and INS samples share
+  // an exact query timestamp. Unlike debug/final_pose, this is AFTER the full
+  // accept/reject/snap state machine and therefore represents the output that
+  // was actually applied.
+  if (this->debug_pub_enabled_) {
+    this->dbg_trajectory_pose_pub->publish(pose_msg);
+
+    GtSample gt;
+    Eigen::Vector3f ins_p;
+    Eigen::Quaternionf ins_q;
+    if (this->getGtPoseAt(pub_stamp.seconds(), gt) &&
+        this->composeGtPoseInBase(gt, ins_p, ins_q)) {
+      geometry_msgs::msg::PoseStamped ins_msg;
+      ins_msg.header = pose_msg.header;
+      ins_msg.pose.position.x = ins_p.x();
+      ins_msg.pose.position.y = ins_p.y();
+      ins_msg.pose.position.z = ins_p.z();
+      ins_msg.pose.orientation.w = ins_q.w();
+      ins_msg.pose.orientation.x = ins_q.x();
+      ins_msg.pose.orientation.y = ins_q.y();
+      ins_msg.pose.orientation.z = ins_q.z();
+      this->dbg_ins_pose_pub->publish(ins_msg);
+    }
+  }
+
   // Add to trajectory deque (O(1) pop_front when capping). Only build the Path
   // message + DDS-publish when a subscriber actually exists.
   if (this->path_buffer_.size() >= 10000) this->path_buffer_.pop_front();
@@ -5222,6 +5255,20 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     snap_msg.pose.orientation.y = q_new.y();
     snap_msg.pose.orientation.z = q_new.z();
     if (this->gt_snap_pub) this->gt_snap_pub->publish(snap_msg);
+
+    // Exact offline reconstruction of the yellow snap correction vector.
+    // PoseArray[0] is the scan-time estimate immediately before recovery;
+    // PoseArray[1] is the time-matched INS target that was applied. Keep this
+    // under debug/* so the standard GICP test recorder captures the event.
+    if (this->dbg_snap_correction_pub) {
+      geometry_msgs::msg::PoseArray correction_msg;
+      correction_msg.header = snap_msg.header;
+      const Eigen::Matrix4f& pre_snap = snap_delta_ok ? T_est_scan : T_gt_scan;
+      correction_msg.poses.push_back(
+          poseStampedFromMatrix(pre_snap, snap_msg.header.stamp, this->map_frame).pose);
+      correction_msg.poses.push_back(snap_msg.pose);
+      this->dbg_snap_correction_pub->publish(correction_msg);
+    }
   }
 
   this->consecutive_failures_ = 0;
