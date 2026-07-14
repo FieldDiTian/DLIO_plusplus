@@ -101,4 +101,13 @@ if(HAS_CPUID)
   add_compile_definitions(HAS_CPUID)
 endif()
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(
+    luminar_sweep_matching_test
+    test/luminar_sweep_matching_test.cpp
+  )
+  target_include_directories(luminar_sweep_matching_test PRIVATE include)
+endif()
+
 ament_package()

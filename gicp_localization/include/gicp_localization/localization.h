@@ -3,6 +3,7 @@
 
 // DLIO types (PointType is a global typedef, not in dlio namespace)
 #include "dlio/dlio.h"
+#include "gicp_localization/luminar_sweep_matching.hpp"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -33,6 +34,7 @@
 
 // STL
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -142,11 +144,14 @@ private:
   bool loadUTMTransform(const std::string& path);
 
   // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
-  // buffers, then `mergeAuxClouds` (called from the primary callback) finds
-  // the nearest aux scan per sensor, transforms its XYZ into the primary
-  // sensor frame, rebases per-point timestamps onto the primary clock, and
-  // appends the bytes to a copy of the primary PointCloud2.
+  // buffers. The primary callback waits for future, point-time-aligned Luminar
+  // sweeps; mergeAuxClouds then transforms aux XYZ into the primary sensor
+  // frame and appends the coherent absolute-timestamped points.
   void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void waitForFutureAuxSweeps(
+      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
+  bool auxBuffersReadyForPrimary(
+      const LuminarTimestampRangeNs& primary_range);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
@@ -214,18 +219,22 @@ private:
   std::string gt_body_frame_;          // captured from msg->child_frame_id
 
   // Multi-LiDAR concatenation
+  struct BufferedAuxCloud {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+    LuminarTimestampRangeNs luminar_range;
+  };
+
   struct AuxLidar {
     std::string topic;
     std::string frame;                          // header.frame_id of the aux sensor (URDF link)
     Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux
     bool extrinsic_cached;                       // true once T_primary_aux is resolved
     std::string extrinsic_source = "tf";        // "urdf" | "static" | "tf" (for logging)
-    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
+    std::deque<BufferedAuxCloud> buffer;
     std::mutex mtx;
-    // P4#3: signed header-time offset stats vs the primary (aux - primary),
-    // accumulated over MERGED scans only (scan-callback thread). A stable
-    // nonzero mean is the signature of a constant per-aux clock offset vs the
-    // P1 timebase — actionable via a per-aux time-offset correction upstream.
+    // Signed header phase vs the primary (aux - primary), accumulated over
+    // merged scans. This is useful acquisition-phase evidence but is not, by
+    // itself, a PTP/point-clock offset measurement.
     double dt_sum = 0.0;
     double dt_min = std::numeric_limits<double>::infinity();
     double dt_max = -std::numeric_limits<double>::infinity();
@@ -236,7 +245,11 @@ private:
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
   bool concat_enabled_;
   double concat_time_threshold_;
+  double concat_luminar_time_threshold_;
+  double concat_future_sweep_wait_s_;
   size_t concat_buffer_size_;
+  std::mutex concat_aux_wait_mtx_;
+  std::condition_variable concat_aux_cv_;
   // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
   // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,
   // then a static per-aux matrix from yaml, then live TF as a last resort.
@@ -255,7 +268,7 @@ private:
   int concat_last_merged_aux_ = -1;             // -1 = concat disabled / not run this frame
   std::vector<double> concat_last_aux_dt_;      // s, aux header - primary header; NaN = not merged
   std::vector<int> concat_last_aux_points_;     // appended points; 0 = not merged
-  std::vector<double> concat_aux_time_offsets_; // P3 fix: constant per-aux clock offset (s), order = aux_topics
+  std::vector<double> concat_aux_time_offsets_; // measured residual point-clock correction (s), aux-topic order
   double last_scan_time_span_s_ = -1.0;         // merged-scan per-point time span (deskew path)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_merged_aux_count_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_time_span_pub;

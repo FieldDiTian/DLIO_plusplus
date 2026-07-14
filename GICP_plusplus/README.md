@@ -31,7 +31,7 @@ how the map inputs and the seed are produced.
 
 - **small_gicp GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
-- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); time-aligns aux LiDARs to the primary, transforms them via offline-resolved extrinsics, and concatenates per-point timestamps onto the primary clock. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
+- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); selects aux sweeps by absolute per-point time, transforms them via offline-resolved extrinsics, and preserves their coherent PTP timebase. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
 - **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates; see `docs/action_plan_turn_error_20260704.md` for the evidence):
   - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
   - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
@@ -287,7 +287,10 @@ thresholds per map).
 localization/lidar_concat/enabled:        true
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
-localization/lidar_concat/time_threshold: 0.1     # drop aux scans further than this from primary
+localization/lidar_concat/time_threshold: 0.1     # generic-sensor header fallback
+localization/lidar_concat/luminar_time_threshold: 0.010  # max endpoint delta between absolute point-time ranges
+localization/lidar_concat/future_sweep_wait_timeout: 0.150  # bounded wait for a later-arriving aligned aux sweep
+localization/lidar_concat/aux_time_offsets: [0.0, 0.0]  # measured residual point-clock corrections only
 localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
 
 # Strict merge guard — IDENTICAL semantics + defaults to GLIM:
@@ -295,6 +298,14 @@ localization/lidar_concat/require_all_aux:                    false  # false = l
 localization/lidar_concat/abort_on_merge_failure:            true   # only relevant when require_all_aux=true: abort node past budget vs keep skipping non-fatally
 localization/lidar_concat/max_consecutive_aux_merge_failures: 10
 ```
+
+For Luminar, absolute per-point PTP timestamps are the sweep-matching authority.
+A front/aux header delta can be a stable acquisition phase even when the point
+clocks agree, so it must not be copied into `aux_time_offsets` by itself. The
+front callback waits on the independent aux callback group until a point-time
+aligned sweep arrives (or the bounded timeout expires), preventing the
+header-nearest previous right sweep from expanding a nominal ~50 ms cloud to
+~150 ms before deskew.
 
 **Offline extrinsic resolution (no live `/tf_static` needed).** Aux extrinsics
 are resolved offline, in priority order: URDF (`av24.urdf` via
@@ -502,7 +513,13 @@ Look in the log for one of:
 
 ### Scan dropouts during sharp turns
 
-If you see SCAN DEBUG gaps > 200 ms during turns, `lidar_concat/time_threshold` is dropping aux scans that fell out of sync. Try raising it from the default `0.1` toward `0.15`. The merged cloud will have slightly worse intra-frame alignment but that's almost always cheaper than a 600 ms scan-stream gap during cornering. (If `require_all_aux: true`, an out-of-sync aux instead SKIPS the whole scan rather than degrading it.)
+For Luminar, inspect `debug/merged_aux_count`, `debug/aux_*_points`, and
+`debug/scan_time_span_s` first. A ~150 ms span indicates a wrong sweep and must
+not be papered over by raising a header threshold; correct operation should use
+the point-time matcher and stay near the individual sweep span. If an aligned
+sweep genuinely arrives late, adjust `future_sweep_wait_timeout` only after
+checking callback/executor latency. (`time_threshold` applies to the generic
+non-Luminar header fallback.)
 
 ### GICP slides at corners
 

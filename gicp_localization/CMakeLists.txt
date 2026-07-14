@@ -116,7 +116,13 @@ endif()
 target_compile_options(gicp_localization_node PRIVATE ${OpenMP_FLAGS})
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
+  ament_add_gtest(
+    luminar_sweep_matching_test
+    test/luminar_sweep_matching_test.cpp
+  )
+  target_include_directories(luminar_sweep_matching_test PRIVATE include)
   ament_add_pytest_test(
     test_generate_lap_trajectory_plots
     test/test_generate_lap_trajectory_plots.py
