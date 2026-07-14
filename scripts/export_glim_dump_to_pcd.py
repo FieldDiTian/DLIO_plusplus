@@ -10,11 +10,12 @@ frame, related to the Atlas local-ENU frame by the ``T_world_utm`` alignment
 the gnss_global module fits and saves into the dump. GICP localization
 consumes Atlas ENU poses (odom-init seed, GT snap, cross-check) DIRECTLY as
 map-frame poses, so the map it loads must be genuinely ENU. This exporter now
-defaults to ``--frame enu``: it loads ``<dump>/T_world_utm.txt`` and applies
-its inverse, so the written PCD is in the Atlas local-ENU frame. When
-exporting an ENU map, leave GICP's ``localization/utm_transform_path`` EMPTY —
-the old world-frame workflow only worked to the extent T_world_utm happened
-to be near identity.
+uses ``--frame enu`` for legacy GNSS-aligned dumps: it loads
+``<dump>/T_world_utm.txt`` and applies its inverse.  The current Kevin-style
+pipeline instead uses ``--frame local-enu`` because GLIM's world is already
+the Atlas local-ENU frame; that mode records the datum but applies no second
+transform.  In either ENU mode, leave GICP's
+``localization/utm_transform_path`` EMPTY.
 """
 
 from __future__ import annotations
@@ -164,12 +165,11 @@ def main() -> int:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument(
         "--frame",
-        choices=("enu", "world"),
+        choices=("local-enu", "enu", "world"),
         default="enu",
-        help="Output frame. 'enu' (default) applies inverse T_world_utm from the dump so the "
-        "PCD matches the Atlas local-ENU poses GICP consumes directly; 'world' writes GLIM's "
-        "raw world frame (legacy behavior — GICP GT/seed poses will be frame-mismatched "
-        "unless T_world_utm happens to be identity).",
+        help="Output frame. 'local-enu' records that GLIM world is already Atlas local ENU and "
+        "applies no transform; 'enu' applies inverse T_world_utm for legacy aligned dumps; "
+        "'world' writes an unlabelled GLIM world frame.",
     )
     parser.add_argument(
         "--enu-origin",
@@ -198,9 +198,9 @@ def main() -> int:
         parser.error("--voxel-size must be finite and >= 0")
     # [P3 FIX 2026-07-10] Provenance is ENFORCED, not just recorded: an ENU
     # map without its datum cannot be validated against the live adapter.
-    if args.frame == "enu" and not args.enu_origin and not args.allow_missing_origin:
+    if args.frame in ("local-enu", "enu") and not args.enu_origin and not args.allow_missing_origin:
         parser.error(
-            "--frame enu requires --enu-origin 'lat_deg,lon_deg,alt_m' (the adapter/prep_bag "
+            "--frame local-enu/enu requires --enu-origin 'lat_deg,lon_deg,alt_m' (the adapter/prep_bag "
             "datum for this dataset). Use --allow-missing-origin ONLY for legacy dumps whose "
             "origin is unrecoverable."
         )
@@ -230,6 +230,13 @@ def main() -> int:
             f"[export_glim_dump_to_pcd] frame=enu: applying inverse T_world_utm from {tf_path} "
             f"(world-utm offset: t=[{T_world_utm[0,3]:.2f}, {T_world_utm[1,3]:.2f}, "
             f"{T_world_utm[2,3]:.2f}] m, yaw={yaw_deg:.2f} deg). Leave GICP's "
+            "localization/utm_transform_path EMPTY for this map.",
+            flush=True,
+        )
+    elif args.frame == "local-enu":
+        print(
+            "[export_glim_dump_to_pcd] frame=local-enu: GLIM world is already the Atlas "
+            "local-ENU frame; applying no T_world_utm transform. Leave GICP's "
             "localization/utm_transform_path EMPTY for this map.",
             flush=True,
         )
@@ -277,7 +284,14 @@ def main() -> int:
             mh.write("# Map provenance manifest (written by export_glim_dump_to_pcd.py)\n")
             mh.write(f"exported_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
             mh.write(f"source_dump: {args.dump_dir.resolve()}\n")
-            mh.write(f"frame: {args.frame}\n")
+            # Downstream localization consumes Atlas ENU and intentionally
+            # fail-closes on any other frame label.  ``local-enu`` is an
+            # export *mode* (GLIM world already equals Atlas ENU), not a
+            # different coordinate frame.
+            manifest_frame = "enu" if args.frame == "local-enu" else args.frame
+            mh.write(f"frame: {manifest_frame}\n")
+            if args.frame == "local-enu":
+                mh.write("export_mode: local-enu\n")
             mh.write(f"points: {total}\n")
             mh.write(f"voxel_size: {args.voxel_size}\n")
             mh.write(f"stride: {args.stride}\n")
@@ -292,6 +306,9 @@ def main() -> int:
                 mh.write("T_world_utm:\n")
                 for row in T_world_utm:
                     mh.write("  - [" + ", ".join(f"{v:.10f}" for v in row) + "]\n")
+                mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
+            elif args.frame == "local-enu":
+                mh.write("applied_transform: none  # GLIM world is already Atlas local-ENU\n")
                 mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
             else:
                 mh.write("applied_transform: none  # PCD is GLIM WORLD frame — NOT directly\n")

@@ -232,6 +232,53 @@ int main(int argc, char** argv) {
   // Keyboard handler for pause/resume
   KeyboardHandler keyboard;
 
+  // Offline future-aware join. The right Iris sweep whose absolute point range
+  // overlaps a front sweep can arrive later in bag order because its header has
+  // a different acquisition phase. Queue primaries until every aux either has
+  // a point-coherent match or its point-time watermark has advanced past the
+  // matching gate. This preserves primary order while allowing IMU messages to
+  // continue filling the estimator buffer during the short read-ahead.
+  std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> pending_primary_scans;
+  const auto drain_pending_primaries = [&](bool force) -> bool {
+    while (!pending_primary_scans.empty()) {
+      const auto& primary = pending_primary_scans.front();
+      if (!force && !glim_ros::aux_buffers_ready_for_primary(
+                      *primary, aux_sensors,
+                      concat_config.luminar_time_threshold)) {
+        break;
+      }
+
+      const int epoch_anchor_count =
+        static_cast<int>(primary->width * primary->height);
+      const auto final_points = glim_ros::merge_clouds(
+        primary, aux_sensors, concat_time_threshold,
+        concat_config.require_all_aux,
+        concat_config.max_consecutive_aux_merge_failures,
+        &concat_config.consecutive_merge_failures,
+        concat_config.abort_on_merge_failure,
+        concat_config.frame_diag_log,
+        concat_config.luminar_time_threshold);
+      const double primary_header_s =
+        glim_ros::stamp_to_sec(primary->header.stamp);
+      pending_primary_scans.pop_front();
+
+      size_t workload = 0;
+      if (final_points) {
+        workload = glim->points_callback(final_points, epoch_anchor_count);
+      }
+      if (primary_header_s > end_time) {
+        spdlog::info("end_time reached");
+        return false;
+      }
+      if (workload > 5) {
+        const size_t sleep_msec = (workload - 4) * 5;
+        spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+      }
+    }
+    return true;
+  };
+
   // Bag read function
   const auto read_bag = [&](const std::string& bag_filename) {
     spdlog::info("opening {}", bag_filename);
@@ -370,7 +417,7 @@ int main(int argc, char** argv) {
             }
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
-            aux.buffer.push_back(aux_msg);
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
             while (aux.buffer.size() > aux.buffer_size) {
               aux.buffer.pop_front();
             }
@@ -381,7 +428,9 @@ int main(int argc, char** argv) {
       }
 
       if (is_aux_sensor) {
-        // Already handled above; skip to next message
+        if (!drain_pending_primaries(false)) {
+          return false;
+        }
       } else if (msg->topic_name == imu_topic) {
         if (topic_type != "sensor_msgs/msg/Imu") {
           g_bag_hard_error = true;
@@ -400,35 +449,22 @@ int main(int argc, char** argv) {
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
 
-        // Merge auxiliary LiDAR clouds if concatenation is enabled
-        sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = points_msg;
-        int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
-          // Anchor the epoch rebase on the primary scan (its points lead the
-          // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
-          // scan started before the primary.
-          epoch_anchor_count = static_cast<int>(points_msg->width * points_msg->height);
-          final_points = glim_ros::merge_clouds(points_msg, aux_sensors, concat_time_threshold,
-                                                concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
-                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure,
-                                                concat_config.frame_diag_log);
-        }
-        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
-        size_t workload = 0;
-        if (final_points) {
-          workload = glim->points_callback(final_points, epoch_anchor_count);
-        }
-
-        if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
-          spdlog::info("end_time reached");
-          return false;
-        }
-
-        if (workload > 5) {
-          // Odometry estimation is behind
-          const size_t sleep_msec = (workload - 4) * 5;
-          spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
-          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+          pending_primary_scans.push_back(points_msg);
+          if (!drain_pending_primaries(false)) {
+            return false;
+          }
+        } else {
+          const size_t workload = glim->points_callback(points_msg);
+          if (glim_ros::stamp_to_sec(points_msg->header.stamp) > end_time) {
+            spdlog::info("end_time reached");
+            return false;
+          }
+          if (workload > 5) {
+            const size_t sleep_msec = (workload - 4) * 5;
+            spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+          }
         }
       } else if (!external_odom_topic.empty() && msg->topic_name == external_odom_topic) {
         if (topic_type != "nav_msgs/msg/Odometry") {
@@ -508,6 +544,15 @@ int main(int argc, char** argv) {
     if (!read_bag(bag_filename)) {
       auto_quit = true;
       break;
+    }
+  }
+
+  if (!pending_primary_scans.empty()) {
+    spdlog::info(
+      "lidar_concat: flushing {} queued primary scan(s) at end of input",
+      pending_primary_scans.size());
+    if (!drain_pending_primaries(true)) {
+      auto_quit = true;
     }
   }
 

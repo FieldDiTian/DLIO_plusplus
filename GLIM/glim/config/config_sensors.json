@@ -12,10 +12,17 @@
     "enabled": true,
     "primary_frame": "luminar_front",
     "time_threshold": 0.1,
-    // Constant per-aux clock offsets (seconds, order = aux_topics) ADDED to
-    // aux header stamps for matching and to Luminar UINT8[8] absolute per-point
-    // timestamps for deskew. From diagnostics: mean=+X ms -> enter -X/1000.
-    // Empty keeps 0 for every aux.
+    // Absolute UINT8[8] point-time endpoint gate. A header delta alone is
+    // acquisition phase and does not enter this test.
+    "luminar_time_threshold": 0.01,
+    // Header-only acquisition-phase offsets, used only by the generic fallback
+    // and point-time tie-break. They never modify per-point timestamps.
+    "aux_match_time_offsets": [0.0, 0.0],
+    // Measured residual PTP/point-clock corrections. These are added to the
+    // absolute aux point ranges and merged point timestamps. H1 measured zero.
+    "aux_point_time_offsets": [0.0, 0.0],
+    // Deprecated compatibility alias. Used only when aux_point_time_offsets is
+    // absent; keep empty in new run configs.
     "aux_time_offsets": [],
     "urdf_path": "av24.urdf",
     // Strict merge guard. Parity with GICP localization/lidar_concat/require_all_aux.

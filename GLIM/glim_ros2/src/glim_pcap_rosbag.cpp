@@ -541,7 +541,7 @@ int main(int argc, char** argv) {
           if (topic_type == "sensor_msgs/msg/PointCloud2") {
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             pc2_ser.deserialize_message(&serialized_msg, aux_msg.get());
-            aux.buffer.push_back(aux_msg);
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
           } else {
             spdlog::error("topic_type mismatch on aux topic {}: {} (expected PointCloud2)", topic_name, topic_type);
@@ -696,7 +696,8 @@ int main(int argc, char** argv) {
           final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
                                                 concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
                                                 &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure,
-                                                concat_config.frame_diag_log);
+                                                concat_config.frame_diag_log,
+                                                concat_config.luminar_time_threshold);
         }
         // nullptr = strict merge skipped this scan (require_all_aux); drop it.
         size_t workload = 0;
@@ -717,7 +718,7 @@ int main(int argc, char** argv) {
       } else if (aux_topic_set.count(s.topic)) {
         for (auto& aux : aux_sensors) {
           if (aux.topic == s.topic) {
-            aux.buffer.push_back(s.cloud);
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(s.cloud));
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
             break;
           }

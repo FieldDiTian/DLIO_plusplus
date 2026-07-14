@@ -121,4 +121,19 @@ if(BUILD_WITH_VIEWER)
   )
 endif()
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(lidar_concat_point_time_test
+    test/lidar_concat_point_time_test.cpp
+  )
+  target_include_directories(lidar_concat_point_time_test PRIVATE
+    include
+    ${LIBXML2_INCLUDE_DIRS}
+  )
+  target_link_libraries(lidar_concat_point_time_test
+    glim_ros
+    ${LIBXML2_LIBRARIES}
+  )
+endif()
+
 ament_auto_package()
