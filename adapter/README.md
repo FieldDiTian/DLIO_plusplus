@@ -97,3 +97,44 @@ ros2 launch adapter adapter.launch.py \
 The launch file overrides the YAML default origin when
 `local_enu_origin_ttl_path` is passed. The node fails at startup if both origin
 sources are set or both are empty.
+
+## Run summary and audit counters
+
+The adapter logs (and optionally writes via `summary_output_path`) a one-line
+summary designed so a run report can **prove** zero data loss instead of
+inferring it from matching in/out totals:
+
+```text
+pose_in=… gnss_out=… gnss_rtk_out=… odom_out=… rtk_out=… imu_in=… imu_out=…
+pose_dropped_invalid=… imu_sidecar_miss_drop=… imu_dropped_clock_not_ready=…
+p1_clock_ready=… p1_clock_drift_ms=…
+```
+
+- `pose_dropped_invalid` — NaN / invalid-solution FusionEngine poses rejected
+  before publication (cold-start samples land here).
+- `imu_sidecar_miss_drop` — IMU samples dropped because no sidecar P1 stamp
+  matched within tolerance (sidecar replay mode only).
+- `imu_dropped_clock_not_ready` — IMU samples dropped from the bounded
+  not-ready queue before the P1→ROS clock mapper initialized.
+- `p1_clock_ready` / `p1_clock_drift_ms` — end-to-end P1→ROS retiming
+  evidence: the mapper reached readiness, and the measured offset drift over
+  the run. Together with GLIM's `gnss_global summary` line (bracket widths,
+  gap/non-monotonic rejections, factor counts) these close the RTK timing
+  audit chain from PCAP to map factors.
+
+All three drop counters are expected to be **0** on a healthy run; the
+sidecar match/miss/skip triple is additionally printed in sidecar mode.
+
+## Startup validation (fail loud, not degraded)
+
+Bad parameter overrides refuse to start rather than silently degrading
+retiming: `nominal_imu_period_sec`, `imu_flush_timeout_sec`,
+`p1_like_threshold_sec`, and `imu_p1_sidecar_match_tolerance_sec` must be
+finite and positive (a zero flush timeout strands the arrival-retime queue; a
+nonpositive nominal period breaks synthesized spacing). The RTK gate
+covariance thresholds require finite, nonnegative values per sample — the
+same contract the downstream GICP gate and the legacy
+`rtk_fixed_odom_filter.py` now enforce. The PCAP replay node also rejects IMU
+samples whose `fraction_ns >= 1e9` (a corrupt fraction would otherwise raise
+on ROS timestamp assignment or alias into a wrong stamp), alongside the
+existing `0xFFFFFFFF` sentinel rejection.

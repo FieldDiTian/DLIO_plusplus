@@ -31,7 +31,7 @@ how the map inputs and the seed are produced.
 
 - **small_gicp GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
-- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); time-aligns aux LiDARs to the primary, transforms them via offline-resolved extrinsics, and concatenates per-point timestamps onto the primary clock. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
+- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged). Luminar sweeps are matched by **absolute per-point time** (endpoint-range error ≤ 10 ms; header time only as tie-break — headers carry 66–92 ms acquisition phase on AV-24 while point clocks agree to <1 ms), transformed via offline-resolved extrinsics, and byte-appended onto the primary. An **asynchronous front/aux synchronizer** (see below) decouples waiting for the point-aligned right sweep from the subscription callback, so aux timing can never cost front scans. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
 - **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates; see `docs/action_plan_turn_error_20260704.md` for the evidence):
   - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
   - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
@@ -111,6 +111,16 @@ This design deliberately bypasses race_common's downstream `cg`-frame intermedia
 
 GICP uses Atlas's per-sample pose covariance as a quality signal, but the **gate is consumer-specific**. Every `/gps_p1/filtered_odom` message is pushed into the GT buffer unfiltered; the FIXED-quality check is applied where each consumer reads.
 
+A sample qualifies only when every position variance is **finite, nonnegative,
+and within its threshold** (`rtk_gate.hpp`, unit-tested). A plain `<=` check
+formerly accepted the finite `-1` "covariance not populated" sentinel as
+RTK-quality; NaN and ±inf also fail closed now — parity with the adapter's
+`/gps_p1/filtered_odom_rtk_fixed` gate. For **interpolated** GT poses, the
+position variance combine is conservative in both directions: if *either*
+bracketing endpoint is non-finite or negative the component becomes +inf
+(fails the gate); otherwise the max. (Yaw variance keeps plain max by design —
+the yaw gate treats negative as "unpopulated, passes".)
+
 ```yaml
 localization/rtk_gate/enable:           true   # inspect msg->pose.covariance per consumer
 localization/rtk_gate/max_pose_var_xy:  0.25   # m^2 (~0.5 m horizontal std)
@@ -120,6 +130,7 @@ localization/rtk_gate/max_pose_var_z:   1.0    # m^2 (~1.0 m vertical std)
 | Consumer | Requires FIXED? | Why |
 |---|---|---|
 | **`tryRtkCalibrationStep`** — RTK-driven IMU bias calibration at startup | ✓ Yes | Needs cm-level truth to estimate gyro/accel bias residuals. If only degraded samples are available the init machine times out and falls back to stationary calibration. |
+| **INS heading prior** (`applyInsHeadingPriorToBasePose`, when `ins_prior/require_rtk` is set) | ✓ Yes | The prior rotates the GICP seed toward the INS heading; a degraded-heading sample would inject the very yaw error the prior exists to remove. |
 | **Scan cross-check** — diagnostic `gt_pos_err_m` published on every accepted scan | ✓ Yes | A diagnostic comparing GICP against a sub-cm reference is only meaningful when the reference IS sub-cm. |
 | **`maybeSnapPoseToGT`** — recovery after GICP loses LiDAR features | ✗ **No — accepts any sample** | When GICP can't match the LiDAR scan, the next-best truth is Atlas's pose at whatever quality it currently has — not our own software IMU dead-reckoning. See the next subsection. |
 | **`applyInitialPose` (use_odom_init)** | ✗ No | Falls back to whatever Atlas reports at startup; if RTK FIXED is required for init, set `localization/rtk_init/enable: true` (default) which gates through `tryRtkCalibrationStep`. |
@@ -283,18 +294,77 @@ thresholds per map).
 
 3x Luminar: `luminar_front` primary + `luminar_right`/`luminar_left` merged.
 
+**Matching is gated by absolute point time, never by header proximity.** Each
+Iris cloud carries `UINT8[8]` epoch-nanosecond point times; an aux sweep is
+coherent only when its endpoint-range error vs the primary
+(`max(|min−min|,|max−max|)`) is ≤ `luminar_point_time_threshold_s`. Header
+distance is only a tie-break. Header-nearest selection is exactly the
+wrong-sweep failure mode (a one-period-early sweep produced ~149 ms merged
+spans and corrupted deskew); it is retained solely for non-Luminar sensors.
+In Luminar mode a primary with no usable point-time range merges **front-only**
+(all aux omitted, `unsupported_point_time`) — header matching is not a safe
+substitute. Big-endian clouds are rejected before matching.
+
 ```yaml
 localization/lidar_concat/enabled:        true
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
-localization/lidar_concat/time_threshold: 0.1     # drop aux scans further than this from primary
+localization/lidar_concat/luminar_point_time_threshold_s: 0.010  # ABSOLUTE point-time acceptance gate (Luminar)
+localization/lidar_concat/time_threshold: 0.1     # non-Luminar fallback matching + tie-break ONLY
 localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
+localization/lidar_concat/aux_time_offsets: []    # measured residual point-clock corrections; keep zero —
+                                                  # header phase is NOT clock evidence. Validated at startup
+                                                  # (finite, |v| <= 0.5 s; refuses to start otherwise).
+
+# Async front/aux synchronizer (Luminar production path):
+localization/lidar_concat/future_aux_wait_timeout_s: 0.150   # arrival-time release deadline for a pending front
+localization/lidar_concat/primary_queue_size:        8      # HARD bound; overflow = counted overload drop of the OLDEST front
 
 # Strict merge guard — IDENTICAL semantics + defaults to GLIM:
 localization/lidar_concat/require_all_aux:                    false  # false = localize on whatever LiDARs merged; true = incomplete merge SKIPS the scan (degraded cloud never registered; IMU propagation continues)
 localization/lidar_concat/abort_on_merge_failure:            true   # only relevant when require_all_aux=true: abort node past budget vs keep skipping non-fatally
 localization/lidar_concat/max_consecutive_aux_merge_failures: 10
 ```
+
+### Async front/aux synchronizer
+
+The point-coherent right sweep arrives ~92 ms **after** the front cloud
+(acquisition phase), so waiting for it inside the subscription callback would
+exceed the 20 Hz front period and silently shed front clouds at the QoS layer
+(the Result-33 regression: 78 % of front sweeps lost). Instead:
+
+- The front callback only **validates and enqueues** (microseconds, never
+  blocks). Aux callbacks decode the point-time range once, buffer, and wake
+  the worker.
+- A dedicated **worker thread owns release order** and runs the unchanged
+  merge→deskew→GICP pipeline. A front is released when every aux is *matched*
+  (in-gate) or *final* (watermark: the aux stream's point time has passed the
+  front's window), or at its `future_aux_wait_timeout_s` deadline — merging
+  whatever matched. Fronts release in arrival (FIFO) order.
+- **Aux state can never drop a front.** The only front drops are: invalid
+  primary data (`front_invalid`), explicit shutdown accounting, and the
+  **compute-overload policy** — `primary_queue_size` is a hard bound and
+  overflow drops the OLDEST queued front with an ERROR log and the
+  `front_overload_dropped` counter (bounded latency/memory instead of a
+  backlog outliving the 2000-sample IMU history). Sustained overload means
+  the solver, not the queue, needs fixing (VGICP/decimation).
+- **Conservation invariant**, checked in the end-of-run summary:
+  `front_received == front_released + front_invalid + front_shutdown_unprocessed
+  + front_overload_dropped`. Violation logs an ERROR.
+- **Teardown drains, not abandons**: a pre-shutdown callback runs the drain
+  while the ROS context is still valid (Ctrl-C and the bag-EOS SIGTERM path),
+  so the run tail is processed in order. A pipeline exception on the worker
+  (e.g. strict-merge abort) becomes a controlled shutdown and a **nonzero
+  exit code** — never `std::terminate`.
+- Per-frame telemetry: `debug/front_release_reason`
+  (0=all_matched 1=watermark 2=timeout 4=shutdown_drain, −1=legacy path),
+  `debug/front_wait_ms`, `debug/primary_queue_depth`, alongside the existing
+  `merged_aux_count` / `aux<i>_merge_dt_s` / `scan_time_span_s` records.
+  Healthy replay: ~all `all_matched`, `front_wait_ms` ≈ 92 ms,
+  `front_overload_dropped=0`, merged span ≈ 49 ms (never ≥ 100 ms).
+
+Full design rationale and validation matrix:
+`docs/online_front_aux_merge_strategy.md`.
 
 **Offline extrinsic resolution (no live `/tf_static` needed).** Aux extrinsics
 are resolved offline, in priority order: URDF (`av24.urdf` via
@@ -316,9 +386,11 @@ watch `gicp_ms` p99 against the 100 ms scan period if you densify further).
 debug topics `merged_aux_count`, `aux<i>_merge_dt_s` (signed, NaN = not
 merged), `aux<i>_points`, `scan_time_span_s`, plus the same fields in the
 `SCAN DEBUG` line (`concat=[n/2,dt0=…,pts0=…,…,span=…]`). Per-aux signed
-header-offset stats are summarized every 512 merges with a warning when the
-mean exceeds 20 ms — the constant-clock-offset signature worth absorbing
-upstream.
+header-offset stats are summarized every 512 merges as **acquisition-phase
+observability only** — a stable nonzero mean (66–92 ms right on AV-24) is
+expected on PTP-synchronized Iris units whose absolute point clocks agree to
+<1 ms. It is NOT point-clock evidence; never copy it into
+`aux_time_offsets` (doing so shifts an aligned range out of the 10 ms gate).
 
 ### Ground-truth diagnostics + recovery
 

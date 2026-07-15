@@ -5529,19 +5529,25 @@ bool gicp_plusplus::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
   out.q = a->q.slerp(u, b->q).normalized();
   out.v_lin_body = (1.0f - u) * a->v_lin_body + u * b->v_lin_body;
   out.v_ang_body = (1.0f - u) * a->v_ang_body + u * b->v_ang_body;
-  // Covariance is not linearly interpolated: carry the conservative (larger)
-  // variance of the two bracketing samples so an interpolated pose can only
-  // pass the RTK gate when BOTH neighbours were RTK-FIXED. Without this the
-  // cov fields would keep their defaults and the gate could mis-classify the
-  // sample. (Endpoint/single-sample branches above copy a real sample whole,
-  // so their covariance is already valid.)
-  out.cov_pos_xx = std::max(a->cov_pos_xx, b->cov_pos_xx);
-  out.cov_pos_yy = std::max(a->cov_pos_yy, b->cov_pos_yy);
-  out.cov_pos_zz = std::max(a->cov_pos_zz, b->cov_pos_zz);
-  // Same conservative-max policy for yaw variance (mirrors GLIM gnss_global's
-  // interpolation): an interpolated sample only reports healthy heading when
-  // BOTH bracketing samples do. max() also does the right thing when one
-  // neighbour is unpopulated (-1): the populated (real) variance wins.
+  // Covariance is not linearly interpolated: combine the two bracketing
+  // samples conservatively so an interpolated pose can only pass the RTK
+  // gate when BOTH neighbours were RTK-FIXED.
+  // [P1 FIX 2026-07-14b] std::max() was NOT conservative here: max(valid,-1)
+  // == valid, and max(valid, NaN) returns the valid first argument — a pose
+  // interpolated against an unknown/invalid endpoint could pass
+  // rtkPositionCovarianceOk() and feed the INS heading prior, RTK bias
+  // calibration, and the GT cross-check. rtkCombineInterpolatedVariance()
+  // returns +inf (fails closed) when either endpoint is non-finite or
+  // negative. (Endpoint/single-sample branches above copy a real sample
+  // whole, so their covariance is gated as-is.)
+  out.cov_pos_xx = rtkCombineInterpolatedVariance(a->cov_pos_xx, b->cov_pos_xx);
+  out.cov_pos_yy = rtkCombineInterpolatedVariance(a->cov_pos_yy, b->cov_pos_yy);
+  out.cov_pos_zz = rtkCombineInterpolatedVariance(a->cov_pos_zz, b->cov_pos_zz);
+  // Yaw variance keeps the plain conservative-max COMPATIBILITY policy
+  // (deliberately different from position): the yaw-quality gate treats
+  // negative as "unpopulated, passes", so max(valid, -1) == valid is the
+  // intended behavior for heading — position quality is what qualifies a
+  // sample as RTK, yaw quality only gates the heading prior.
   out.cov_yaw = std::max(a->cov_yaw, b->cov_yaw);
   return true;
 }

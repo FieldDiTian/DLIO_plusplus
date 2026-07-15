@@ -42,8 +42,11 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
   - `max_consecutive_aux_merge_failures: 10`.
   - `time_threshold: 0.1` is the legacy/header window for non-Iris encodings.
   - `luminar_time_threshold: 0.01` gates the difference between decoded Iris point-time interval endpoints.
-  - `aux_match_time_offsets` affects only header matching/tie-breaking; `aux_point_time_offsets` is the only setting that changes authoritative absolute point clocks. `aux_time_offsets` remains a deprecated fallback for old configs.
+  - `aux_match_time_offsets` affects only header matching/tie-breaking; `aux_point_time_offsets` is the only setting that changes authoritative absolute point clocks. `aux_time_offsets` remains a deprecated fallback for old configs. **Header phase is not point-clock evidence**: PTP-synchronized Iris units hold a stable 66–92 ms acquisition phase while their absolute point clocks agree to <1 ms — never copy header deltas into the point offsets (the H1 geometric regression measured |offset| < 11 ms; keep `[0.0, 0.0]`).
+  - Big-endian PointCloud2 payloads are rejected before matching (the decoder is little-endian; a garbage-decoded range could pass the 10 ms gate by chance), and an aux whose clouds carry no decodable absolute point time cannot merge under a Luminar primary at all — header matching is not a usable fallback because the byte-append merge requires an identical schema (capped warning + `no_absolute_time` plan reason).
   - Startup guards also gate on `require_all_aux && abort_on_merge_failure`.
+- **Offline two-pass point-time join** (`two_pass_point_time_join`, default **true**; `glim_rosbag`): pass 1 indexes every LiDAR scan's absolute point-time range and bag location (filtered read, Ctrl-C-able), then plans each primary's right/left selection by **minimum endpoint-range error within `luminar_time_threshold`** — header time only as tie-break, each aux sweep reserved by **at most one** primary (`candidate_reserved` otherwise), plan identity = per-topic **bag-record ordinal** (robust to duplicate/zero header stamps, which are warned loudly). The streaming pass merges each primary exactly when its planned sweeps have arrived (~90 ms read-ahead, well inside IMU coverage); primaries with no in-gate candidate map **front-only immediately** with the miss reason recorded at plan time — **never deferred to EOF**. A pre-flight `two-pass join plan` log summarizes matched / no_candidate / exceeds_gate / candidate_reserved / no_absolute_time per aux before mapping starts. Automatically falls back to the bounded streaming wait (release on match/watermark or after `future_sweep_wait_timeout` = 0.15 s of bag time) under `start_offset`, on index failure, or when <90 % of primaries carry absolute point times. `glim_pcap_rosbag` uses the same bounded queued-primary release policy (its LiDAR originates from PCAP assembly, so no pass-1 bag index is possible).
+- **Never-drop-front accounting**: both offline readers log `lidar_concat primary accounting: received=… forwarded=… strict_skipped=… imu_skipped=… …` at end of input and mark the run as a **hard error (nonzero exit)** if the counts fail to reconcile — a front sweep can be skipped only by the explicit `require_all_aux` policy or GLIM ingestion validation, never silently.
 - **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
 - **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
 - **Per-frame merge diagnostics** (P4, 2026-07; `lidar_concat.frame_diag_log`, default **true**): one parseable `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… span=…s total_pts=…` INFO line per primary scan — the map-side merge evidence, mirroring GICP's per-frame debug topics (GLIM's offline tools have no node to publish from). The reported `dt<i>` values are raw header acquisition phase, not clock estimates. Point-time endpoint mismatches and rejected candidates are logged separately; only those decoded point times are authoritative for Iris.
@@ -311,6 +314,13 @@ python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag>
 qualified topic; it also enforces the RTK-anchor acceptance gate on the
 resulting map unless `--lidar-imu-only` is passed.)
 
+Note: with `two_pass_point_time_join` (default on), `glim_rosbag` first
+re-reads the bag's LiDAR topics once to index absolute point-time ranges and
+plan every front/aux merge deterministically — expect an extra disk-speed pass
+before mapping starts, a `two-pass join plan` summary up front, and a
+`lidar_concat primary accounting` line at the end whose counts must reconcile
+(hard error otherwise).
+
 **Offline — raw Luminar pcap (+ sibling mcap for IMU/GNSS):**
 ```bash
 ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path:=<output_directory>
@@ -324,6 +334,23 @@ This fork ships no live launch file and does not exercise this path; prefer reco
 a bag and mapping offline.
 
 ### Monitoring RTK and GNSS Alignment
+
+**Map acceptance — RTK anchoring is enforced, not assumed.** A clean
+`glim_rosbag` exit only proves local consistency: a map can be completely
+unanchored (zero GNSS factors, no `T_world_utm.txt`) and still exit 0. Two
+mechanisms close this:
+
+1. `gnss_global` emits a machine-parseable audit line at save time —
+   `gnss_global summary: transformation_initialized=… position_factors=…
+   orientation_factors=… yaw_gate_skips=… gap_unanchored=…
+   nonmonotonic_drops=… bracket_count=… bracket_max_s=… bracket_mean_s=…` —
+   covering factor counts, GNSS-to-submap bracket widths, and every rejection
+   class (dropout gaps, non-monotonic stamps).
+2. `scripts/prep_bag.py` applies a **default-on RTK-anchor acceptance gate**
+   after mapping: the run fails unless `T_world_utm.txt` exists and parses as
+   a finite 4×4 SE(3) AND the summary reports an initialized transform with
+   `position_factors > 0`. LiDAR/IMU-only mapping must opt out explicitly
+   with `--lidar-imu-only`.
 
 Pre-filter messages (live tracking of RTK quality):
 ```
