@@ -33,6 +33,10 @@ TimeKeeper::TimeKeeper() {
 
 TimeKeeper::~TimeKeeper() {}
 
+void TimeKeeper::set_point_time_offset(double offset) {
+  point_time_offset = offset;
+}
+
 bool TimeKeeper::validate_imu_stamp(const double imu_stamp) {
   const double imu_diff = imu_stamp - last_imu_stamp;
   if (last_imu_stamp < 0.0) {

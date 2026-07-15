@@ -134,6 +134,16 @@ if(BUILD_TESTING)
     glim_ros
     ${LIBXML2_LIBRARIES}
   )
+
+  ament_add_gtest(time_keeper_point_offset_test
+    test/time_keeper_point_offset_test.cpp
+  )
+  target_link_libraries(time_keeper_point_offset_test
+    glim::glim
+  )
+  target_compile_definitions(time_keeper_point_offset_test PRIVATE
+    GLIM_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../glim/config"
+  )
 endif()
 
 ament_auto_package()
