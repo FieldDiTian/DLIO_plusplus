@@ -4,6 +4,8 @@
 // DLIO types (PointType is a global typedef, not in dlio namespace)
 #include "dlio/dlio.h"
 #include "gicp_plusplus/small_gicp_backend.hpp"
+#include "gicp_plusplus/luminar_sweep_matching.hpp"
+#include "gicp_plusplus/rtk_gate.hpp"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -33,9 +35,12 @@
 
 // STL
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace gicp_plusplus {
@@ -153,12 +158,32 @@ private:
   void applyInitialPoseFromParams();
   bool loadUTMTransform(const std::string& path);
 
-  // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
-  // buffers, then `mergeAuxClouds` (called from the primary callback) finds
-  // the nearest aux scan per sensor, transforms its XYZ into the primary
-  // sensor frame, rebases per-point timestamps onto the primary clock, and
-  // appends the bytes to a copy of the primary PointCloud2.
+  // Multi-LiDAR concatenation. Aux callbacks decode the absolute point-time
+  // range once and buffer it; on the Luminar production path the front
+  // callback only validates and enqueues (it never blocks and is never
+  // dropped for aux reasons), and the synchronizer worker owns release order:
+  // a front cloud is released to the unchanged merge/deskew/GICP pipeline when
+  // every aux is matched (point-range endpoint error <= gate, header only as
+  // tie-break) or final (watermark: newest aux point time already past the
+  // gate), or when its arrival-time deadline expires (merge whatever matched).
   void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void enqueuePrimary(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc);
+  void syncWorkerLoop();
+
+public:
+  // Teardown hook: stops the synchronizer worker, which drains queued fronts
+  // in order WHILE the ROS context is still valid. Must be invoked from a
+  // pre-shutdown callback (see localization_node.cc) so the run tail is
+  // processed rather than counted as shutdown_unprocessed; also called by the
+  // destructor as a fallback. Idempotent, thread-safe, and a no-op when
+  // called from the worker thread itself (fatal-shutdown path).
+  void drainFrontSync();
+  bool syncFatal() const { return sync_fatal_.load(); }
+
+private:
+  // The pre-existing scan pipeline (merge -> deskew -> GICP); runs on the
+  // executor scan thread in legacy mode, on the sync worker otherwise.
+  void processScan(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
@@ -201,11 +226,14 @@ private:
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
 
-  // RTK quality gate for the gt_odom buffer (P1-native). Drops samples whose
-  // Atlas-reported pose covariance (pose.covariance[0,7,14] -- xx, yy, zz)
-  // exceeds the configured thresholds. The gate inspects the gt_odom message
-  // itself; no separate status topic is involved. Replaces the old
-  // BESTGNSSPOS-enum gate (removed when the NovAtel path was retired).
+  // RTK quality gate (P1-native), applied PER CONSUMER — not a buffer
+  // filter. Every gt_odom sample is buffered; gtSampleIsRtkFixed (finite,
+  // nonnegative covariance within pose.covariance[0,7,14] thresholds) gates
+  // only RTK bias calibration, the INS heading prior, and the GT diagnostic
+  // cross-check. Snap recovery and use_odom_init intentionally accept
+  // degraded samples. The gate inspects the gt_odom message itself; no
+  // separate status topic is involved. Replaces the old BESTGNSSPOS-enum
+  // gate (removed when the NovAtel path was retired).
   bool rtk_gate_enabled_;
   double rtk_gate_max_pose_var_xy_;  // m^2; reject if cov[0] or cov[7] > this
   double rtk_gate_max_pose_var_z_;   // m^2; reject if cov[14] > this
@@ -226,18 +254,23 @@ private:
   std::string gt_body_frame_;          // captured from msg->child_frame_id
 
   // Multi-LiDAR concatenation
+  struct BufferedAuxCloud {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+    LuminarTimestampRangeNs luminar_range;  // decoded ONCE in the aux callback
+  };
+
   struct AuxLidar {
     std::string topic;
     std::string frame;                          // header.frame_id of the aux sensor (URDF link)
     Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux
     bool extrinsic_cached;                       // true once T_primary_aux is resolved
     std::string extrinsic_source = "tf";        // "urdf" | "static" | "tf" (for logging)
-    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
+    std::deque<BufferedAuxCloud> buffer;
     std::mutex mtx;
-    // P4#3: signed header-time offset stats vs the primary (aux - primary),
-    // accumulated over MERGED scans only (scan-callback thread). A stable
-    // nonzero mean is the signature of a constant per-aux clock offset vs the
-    // P1 timebase — actionable via a per-aux time-offset correction upstream.
+    // Signed header phase vs the primary (aux - primary), accumulated over
+    // merged scans. This is useful acquisition-phase evidence but is not, by
+    // itself, a PTP/point-clock offset measurement — do not copy it into
+    // aux_time_offsets.
     double dt_sum = 0.0;
     double dt_min = std::numeric_limits<double>::infinity();
     double dt_max = -std::numeric_limits<double>::infinity();
@@ -248,7 +281,76 @@ private:
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
   bool concat_enabled_;
   double concat_time_threshold_;
+  // Luminar acceptance gate: absolute point-time endpoint-range error
+  // (max(|min-min|, |max-max|)). Header time is only a tie-break. The 0.1 s
+  // header threshold above remains solely for non-Luminar fallback matching.
+  double concat_luminar_point_threshold_ = 0.010;
+  // Arrival-time (steady-clock) release deadline for a pending front cloud.
+  // Protects live latency when an aux packet is lost or its callback stalls;
+  // it is NOT a point-clock correction and never alters timestamps.
+  double concat_future_aux_wait_s_ = 0.150;
+  // HARD bound on the pending-front queue (the compute-overload policy).
+  // A single worker runs one full GICP pipeline per front: if the solver is
+  // slower than the input rate, an unbounded queue would grow until queued
+  // scans outlive the 2000-sample IMU history and deskew degrades. On
+  // overflow the OLDEST queued front is dropped with loud, counted
+  // accounting (front_overload_dropped_) — the only place a front may be
+  // dropped, and never for aux reasons.
+  size_t concat_primary_queue_size_ = 8;
   size_t concat_buffer_size_;
+
+  // ---- Async front/aux synchronizer (Luminar production path) ----
+  // Contract: every valid front cloud is released exactly once, in order,
+  // with 0..N_aux auxiliaries. Aux state can only change the source set; it
+  // can never cause a front drop (front_dropped_due_to_aux == 0 by
+  // construction — there is no such code path).
+  struct PendingPrimaryCloud {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+    LuminarTimestampRangeNs range;  // decoded ONCE in the front callback
+    std::chrono::steady_clock::time_point enqueued;
+    std::chrono::steady_clock::time_point deadline;
+    uint64_t arrival_seq = 0;
+  };
+  enum FrontReleaseReason : int {
+    RELEASE_ALL_MATCHED = 0,
+    RELEASE_WATERMARK = 1,
+    RELEASE_TIMEOUT = 2,
+    // 3 (queue_pressure) is reserved and no longer emitted: overload now
+    // drops the OLDEST queued front with front_overload_dropped_ accounting
+    // instead of releasing it early.
+    RELEASE_QUEUE_PRESSURE = 3,
+    RELEASE_SHUTDOWN_DRAIN = 4,
+  };
+  bool sync_active_ = false;        // Luminar + concat: worker owns release order
+  std::deque<PendingPrimaryCloud> primary_queue_;  // guarded by sync_mtx_
+  std::mutex sync_mtx_;
+  std::condition_variable sync_cv_;
+  std::thread sync_worker_;
+  std::atomic<bool> sync_shutdown_{false};
+  uint64_t sync_seq_ = 0;                          // guarded by sync_mtx_
+  // Conservation counters (sync_mtx_). Invariant, checked in the summary:
+  //   front_received_ == front_released_ + front_invalid_
+  //                      + front_shutdown_unprocessed_ + front_overload_dropped_
+  uint64_t front_received_ = 0;
+  uint64_t front_released_ = 0;
+  uint64_t front_invalid_ = 0;
+  uint64_t front_shutdown_unprocessed_ = 0;
+  uint64_t front_overload_dropped_ = 0;  // compute-overload coalescing drops
+  uint64_t release_reason_counts_[5] = {0, 0, 0, 0, 0};
+  // Set when the scan pipeline throws on the worker thread (e.g. the strict
+  // require_all_aux abort): the worker stops processing, requests shutdown,
+  // and main() converts this into a nonzero exit code.
+  std::atomic<bool> sync_fatal_{false};
+  std::mutex drain_mtx_;  // makes drainFrontSync() idempotent/thread-safe
+  // Worker-thread telemetry for the frame being processed (written by the
+  // worker before processScan(), read by the per-frame debug publisher on the
+  // same thread — no lock needed).
+  int last_release_reason_ = -1;
+  double last_front_wait_ms_ = 0.0;
+  int last_queue_depth_ = 0;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_front_release_reason_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_front_wait_ms_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_primary_queue_depth_pub;
   // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
   // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,
   // then a static per-aux matrix from yaml, then live TF as a last resort.

@@ -199,6 +199,19 @@ public:
     if (transformation_initialized) {
       save_transformation_to_file(dump_path);
     }
+    // [P3 AUDIT 2026-07-14] Machine-parseable anchoring/timing summary. Run
+    // tooling (prep_bag --require-rtk-anchor) gates map acceptance on this
+    // line + T_world_utm.txt instead of trusting a clean exit code: a run can
+    // be locally consistent yet completely unanchored (zero factors) and
+    // previously still reported success.
+    logger->info(
+      "gnss_global summary: transformation_initialized={} position_factors={} "
+      "orientation_factors={} yaw_gate_skips={} gap_unanchored={} "
+      "nonmonotonic_drops={} bracket_count={} bracket_max_s={:.3f} bracket_mean_s={:.3f}",
+      transformation_initialized, position_factor_count, orientation_factor_count,
+      yaw_gate_skip_count, gap_unanchored_count, nonmonotonic_drop_count,
+      bracket_count, bracket_max_s,
+      bracket_count > 0 ? bracket_sum_s / static_cast<double>(bracket_count) : 0.0);
   }
 
   // Report pending work so GlimROS::save() drains us before the final global
@@ -303,8 +316,9 @@ public:
       // restarts re-emitting samples.
       for (const auto& g : gnss_data) {
         if (!utm_queue.empty() && g.stamp <= utm_queue.back().stamp) {
+          ++nonmonotonic_drop_count;
           if (!warned_nonmonotonic_gnss) {
-            logger->warn("dropping non-monotonic GNSS sample (stamp={:.6f} <= newest {:.6f}) — further drops silent", g.stamp, utm_queue.back().stamp);
+            logger->warn("dropping non-monotonic GNSS sample (stamp={:.6f} <= newest {:.6f}) — further drops silent (counted in the at_exit summary)", g.stamp, utm_queue.back().stamp);
             warned_nonmonotonic_gnss = true;
           }
           continue;
@@ -373,12 +387,18 @@ public:
         // un-anchored (LiDAR+IMU odometry + loop closures carry it), exactly
         // as the documented GNSS-denied contract promises.
         if (max_interp_gap_sec > 0.0 && (right->stamp - left->stamp) > max_interp_gap_sec) {
+          ++gap_unanchored_count;
           logger->warn(
             "GNSS association: bracket gap {:.2f}s > max_interp_gap_sec {:.2f}s (dropout) — submap at {:.3f} left un-anchored",
             right->stamp - left->stamp, max_interp_gap_sec, stamp);
           submap_queue.pop_front();
           continue;
         }
+
+        const double bracket_s = right->stamp - left->stamp;
+        bracket_max_s = std::max(bracket_max_s, bracket_s);
+        bracket_sum_s += bracket_s;
+        ++bracket_count;
 
         const GNSSData interpolated = interpolate_gnss_data(*left, *right, stamp);
 
@@ -460,6 +480,7 @@ public:
           const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
           output_factors.push_back(
             gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model)));
+          ++position_factor_count;
 
           // P5#1 yaw-quality gate: skip the heading prior when the publisher
           // reports a degraded yaw solution (dual-antenna heading can be bad
@@ -475,6 +496,7 @@ public:
             const auto rotation_model = gtsam::noiseModel::Diagonal::Precisions(orientation_prior_inf_scale);
             output_factors.push_back(
               gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseRotationPrior<gtsam::Pose3>(X(submap->id), gtsam::Rot3(R_world_gnss), rotation_model)));
+            ++orientation_factor_count;
           } else if (enable_orientation_prior && gnss.has_orientation && !yaw_quality_ok) {
             ++yaw_gate_skip_count;
             if (yaw_gate_skip_count == 1 || yaw_gate_skip_count % 50 == 0) {
@@ -645,6 +667,18 @@ private:
   size_t yaw_gate_skip_count = 0;              // heading priors skipped by the gate
   double min_baseline;
   double max_interp_gap_sec;  // P1 fix: max GNSS bracket width for association (<=0 disables)
+
+  // [P3 AUDIT 2026-07-14] End-to-end RTK timing/anchoring evidence, reported
+  // in the at_exit summary so run tooling (prep_bag --require-rtk-anchor) can
+  // enforce the anchoring contract instead of trusting a clean exit code.
+  // Written on the backend thread; read once at exit (cold).
+  uint64_t position_factor_count = 0;      // GNSS position priors emitted
+  uint64_t orientation_factor_count = 0;   // heading priors emitted
+  uint64_t gap_unanchored_count = 0;       // submaps skipped: bracket > max_interp_gap
+  uint64_t nonmonotonic_drop_count = 0;    // GNSS samples dropped: stamp regression
+  double bracket_max_s = 0.0;              // widest accepted GNSS bracket
+  double bracket_sum_s = 0.0;
+  uint64_t bracket_count = 0;
 
   Eigen::Vector3d t_imu_gnss;
   bool warned_missing_orientation_for_lever_arm;

@@ -34,17 +34,19 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 
 **Multi-LiDAR concatenation** — `glim_ros2/include/glim_ros/lidar_concat.hpp`, `glim_ros2/src/glim_ros/glim_ros.cpp`
 
-- Merge 3× Luminar Iris — `luminar_front` **primary** plus `luminar_left` / `luminar_right` aux — into the primary `luminar_front` frame. UINT8[8] absolute times are left unshifted; scan-relative encodings are shifted by inter-scan `dt`.
+- Merge 3× Luminar Iris — `luminar_front` **primary** plus `luminar_left` / `luminar_right` aux — into the primary `luminar_front` frame. For Iris `UINT8[8]`, selection is by the decoded absolute per-point interval, not by `header.stamp`: a header delta is acquisition phase and is only a tie-break hint. Offline `glim_rosbag` queues primary scans until every aux can match by point time or its watermark proves that no match can arrive, so a future-arriving sweep cannot be replaced by the previous header-nearest sweep. Absolute times are left unshifted unless an explicit residual clock correction is configured; scan-relative encodings are shifted by inter-scan `dt`.
 - **Aux extrinsics are resolved OFFLINE** (no live `/tf_static` needed), in priority order: (1) **URDF** — `av24.urdf`, path from `lidar_concat/urdf_path`, resolved CWD-independently by walking up from the config directory (`av24.urdf` is installed into `share/glim/config`); (2) a **static per-aux 4×4 matrix** in config. There is **no live-TF fallback** (corrected 2026-07-10 — an earlier claim of one did not match any executable path): an unresolvable aux is dropped at startup with an error log, or aborts under the strict merge guard.
 - **Strict merge guard** (config in `glim/config/config_sensors.json` under `lidar_concat`; **identical semantics and defaults to GICP**):
   - `require_all_aux` (default **false**) — false = build/localize on whatever LiDARs merged this scan; true = an incomplete merge **skips** the scan entirely rather than emitting a degraded cloud.
   - `abort_on_merge_failure` (default **true**, only relevant when `require_all_aux=true`) — abort the node once past the failure budget vs. keep skipping non-fatally.
   - `max_consecutive_aux_merge_failures: 10`.
-  - `time_threshold: 0.1` (raised from 0.01 to capture aux-to-primary jitter).
+  - `time_threshold: 0.1` is the legacy/header window for non-Iris encodings.
+  - `luminar_time_threshold: 0.01` gates the difference between decoded Iris point-time interval endpoints.
+  - `aux_match_time_offsets` affects only header matching/tie-breaking; `aux_point_time_offsets` is the only setting that changes authoritative absolute point clocks. `aux_time_offsets` remains a deprecated fallback for old configs.
   - Startup guards also gate on `require_all_aux && abort_on_merge_failure`.
 - **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
 - **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
-- **Per-frame merge diagnostics** (P4, 2026-07; `lidar_concat.frame_diag_log`, default **true**): one parseable `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… total_pts=…` INFO line per primary scan — the map-side merge evidence, mirroring GICP's per-frame debug topics (GLIM's offline tools have no node to publish from). Per-aux **signed header-offset stats** (mean/min/max vs primary) are summarized every 512 merges, warning when |mean| > 20 ms — the constant-clock-offset signature worth absorbing upstream.
+- **Per-frame merge diagnostics** (P4, 2026-07; `lidar_concat.frame_diag_log`, default **true**): one parseable `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… span=…s total_pts=…` INFO line per primary scan — the map-side merge evidence, mirroring GICP's per-frame debug topics (GLIM's offline tools have no node to publish from). The reported `dt<i>` values are raw header acquisition phase, not clock estimates. Point-time endpoint mismatches and rejected candidates are logged separately; only those decoded point times are authoritative for Iris.
 - Live wiring: the live node subscribes to the aux topics, buffers them, and merges on primary-cloud arrival (`points_callback_live`), matching the offline `glim_rosbag` / `glim_pcap_rosbag` merge path.
 
 **GNSS / RTK global anchoring** — `glim_ext/modules/mapping/gnss_global`, `config_gnss_global.json`, `config.json`
@@ -252,9 +254,9 @@ Map points appear in the viewer. The two-phase init conditions below apply to th
 >
 > **🅑 Phase 2 — RTK-FIXED required before any map data is integrated.**
 >
-> > **DO NOT BEGIN DRIVING UNTIL `rtk_fixed_odom_filter.py` HAS LOGGED `RTK transition: ... -> FIXED`, AND `gnss_global` HAS LOGGED ITS FIRST PRIOR-FACTOR INSERTION.**
+> > **DO NOT BEGIN DRIVING UNTIL `rtk_fixed_odom_filter.py` HAS LOGGED `RTK transition: ... -> FIXED`.** Then drive the first **≥ 5 m carefully** and verify `gnss_global` logs `T_world_utm=...` followed by prior-factor insertions.
 >
-> The pre-filter forwards Atlas samples to `libgnss_global.so` only while pose covariance indicates RTK-FIXED. The first forwarded sample becomes the first GNSS prior factor — anchoring the global iSAM2 graph to a cm-level absolute pose. **The map's first geo-referenced frame must come from a FIXED-quality Atlas pose, not a degraded RTK-FLOAT or GPS-only fallback.** Driving before this anchor lands means the early trajectory grows in a local odom frame and only retroactively aligns to global when RTK reacquires — iSAM2 will smooth it, but the map no longer starts from cm-level absolute coordinates.
+> The pre-filter forwards Atlas samples to `libgnss_global.so` only while pose covariance indicates RTK-FIXED. Note the actual initialization sequence: `gnss_global` **cannot** emit any prior factor while the vehicle is parked — it waits until the trajectory baseline exceeds `min_baseline: 5.0 m` (`config_gnss_global.json`) before fitting the one-shot world↔ENU transform, and only then emits GNSS factors. So "wait for the first prior factor before driving" is unsatisfiable; the correct contract is: (1) RTK-FIXED while parked, (2) drive the first ≥5 m gently (this segment seeds the alignment fit), (3) verify `T_world_utm` initialization and factor insertion in the log. The pre-baseline segment is **backfilled** with factors once the baseline is reached, so no early submap is left unanchored. **The map's first geo-referenced frames must come from FIXED-quality Atlas poses, not a degraded RTK-FLOAT or GPS-only fallback.** Driving before RTK-FIXED means the early trajectory grows in a local odom frame and only retroactively aligns to global when RTK reacquires — iSAM2 will smooth it, but the map no longer starts from cm-level absolute coordinates.
 >
 > Both phases typically complete during the same parked 30 s – 2 min Atlas RTK acquisition window. If Atlas never reaches FIXED while parked, fix the hardware/sky-view condition before driving — don't paper over it by starting GLIM and hoping RTK lands en route.
 >
@@ -296,12 +298,18 @@ the live node (`glim_rosnode`) exits by design when it is off — there is no
 ```bash
 ros2 run glim_ros glim_rosbag <rosbag_path> --ros-args -p dump_path:=<output_directory>
 ```
-`glim_rosbag` plays the bag and processes it in one step. If your bag carries the
-raw `/gps_p1/filtered_odom`, run the pre-filter in a separate terminal first so it
-publishes `/gps_p1/filtered_odom_rtk_fixed`:
+`glim_rosbag` plays the bag and processes it in one step — it reads bag messages
+and invokes GLIM callbacks **directly, without publishing them to ROS topics**.
+An externally-running `rtk_fixed_odom_filter.py` therefore receives **nothing**
+from this replay and cannot gate anything. If your bag carries only the raw
+`/gps_p1/filtered_odom`, you must pre-normalize it so it contains
+`/gps_p1/filtered_odom_rtk_fixed` before mapping — the intended route:
 ```bash
-python3 gicp_localization/scripts/rtk_fixed_odom_filter.py --ros-args -p use_sim_time:=true
+python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag>
 ```
+(`prep_bag.py` replays through the adapter's RTK covariance gate and records the
+qualified topic; it also enforces the RTK-anchor acceptance gate on the
+resulting map unless `--lidar-imu-only` is passed.)
 
 **Offline — raw Luminar pcap (+ sibling mcap for IMU/GNSS):**
 ```bash

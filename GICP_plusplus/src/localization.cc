@@ -698,6 +698,52 @@ inline bool luminarRawTimestampNsFromBytes(const uint8_t* tp, uint8_t datatype, 
   return false;
 }
 
+// Decode a cloud's absolute point-time range (min/max over all points) once.
+// This is the authoritative sweep identity for Luminar matching: header time
+// is acquisition phase and must not gate the merge. Fails closed (invalid
+// range) on any malformed point, short buffer, or unsupported time encoding.
+gicp_plusplus::LuminarTimestampRangeNs luminarTimestampRangeFromCloud(
+    const sensor_msgs::msg::PointCloud2& msg) {
+  gicp_plusplus::LuminarTimestampRangeNs range;
+
+  // The decode assumes little-endian payloads; a big-endian cloud would yield
+  // garbage ranges that could still pass the gate by chance. Fail closed.
+  if (msg.is_bigendian) {
+    return range;
+  }
+
+  int time_off = -1;
+  uint8_t time_datatype = 0;
+  int time_count = 0;
+  if (!findTimeField(msg, time_off, time_datatype, time_count) ||
+      time_off < 0 || msg.point_step == 0 ||
+      static_cast<uint32_t>(time_off) >= msg.point_step) {
+    return range;
+  }
+
+  const size_t point_count = static_cast<size_t>(msg.width) * msg.height;
+  const size_t required_bytes = point_count * static_cast<size_t>(msg.point_step);
+  if (point_count == 0 || msg.data.size() < required_bytes) {
+    return range;
+  }
+
+  const size_t bytes_avail = msg.point_step - static_cast<uint32_t>(time_off);
+  range.min_ns = std::numeric_limits<uint64_t>::max();
+  for (size_t i = 0; i < point_count; ++i) {
+    uint64_t timestamp_ns = 0;
+    if (!luminarRawTimestampNsFromBytes(
+            msg.data.data() + i * msg.point_step + time_off,
+            time_datatype, time_count, bytes_avail, timestamp_ns)) {
+      return gicp_plusplus::LuminarTimestampRangeNs{};
+    }
+    range.min_ns = std::min(range.min_ns, timestamp_ns);
+    range.max_ns = std::max(range.max_ns, timestamp_ns);
+    ++range.count;
+  }
+  range.valid = range.count > 0;
+  return range;
+}
+
 // Copy per-point time from PointCloud2 into the dlio::Point union for the configured sensor.
 // `point_step` bounds the field read so a malformed/short time field cannot read past the point.
 void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datatype, int time_count,
@@ -1239,18 +1285,22 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   if (this->gt_odom_enabled_) {
     if (this->rtk_gate_enabled_) {
       RCLCPP_INFO(this->get_logger(),
-                  "RTK quality gate ENABLED (P1-native): drop gt_odom when "
-                  "pose covariance exceeds max_pose_var_xy=%.3f m^2 or "
-                  "max_pose_var_z=%.3f m^2.",
+                  "RTK quality gate ENABLED (P1-native, per-consumer): all "
+                  "gt_odom samples are buffered; bias calibration, the INS "
+                  "heading prior, and the GT cross-check use only samples "
+                  "with finite, nonnegative pose covariance within "
+                  "max_pose_var_xy=%.3f m^2 / max_pose_var_z=%.3f m^2. Snap "
+                  "recovery and odom-init accept degraded samples by design.",
                   this->rtk_gate_max_pose_var_xy_,
                   this->rtk_gate_max_pose_var_z_);
     } else {
       RCLCPP_WARN(this->get_logger(),
-                  "RTK quality gate DISABLED. gt_odom samples will be "
-                  "accepted regardless of Atlas-reported pose covariance "
-                  "-- snap and init may seed state from degraded GNSS. "
-                  "Enable localization/rtk_gate/enable to reject samples "
-                  "with poor covariance.");
+                  "RTK quality gate DISABLED: bias calibration, the INS "
+                  "heading prior, and the GT cross-check will consume "
+                  "gt_odom samples regardless of Atlas-reported covariance. "
+                  "(Buffering, snap recovery, and odom-init are unaffected "
+                  "either way.) Enable localization/rtk_gate/enable to "
+                  "restrict those consumers to RTK-quality samples.");
     }
   }
 
@@ -1346,6 +1396,16 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
       this->dbg_aux_points_pubs_.push_back(this->create_publisher<std_msgs::msg::Float64>(
           "gicp/localization/debug/aux" + std::to_string(i) + "_points", 10));
     }
+    // Front sync telemetry (one sample per released front): release reason
+    // (0=all_matched 1=watermark 2=timeout 3=reserved 4=shutdown_drain,
+    // -1=legacy sync path), wait latency in the pending queue, and queue depth
+    // after release — the observability contract of the merge-strategy plan.
+    this->dbg_front_release_reason_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/front_release_reason", 10);
+    this->dbg_front_wait_ms_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/front_wait_ms", 10);
+    this->dbg_primary_queue_depth_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/primary_queue_depth", 10);
   }
 
   if (this->visualize_map_) {
@@ -1367,9 +1427,89 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
   this->applyInitialPoseFromParams();
+
+  // Async front/aux synchronizer (Luminar production path). The front callback
+  // only validates + enqueues; this worker owns release order and runs the
+  // scan pipeline, so waiting for a future point-aligned aux sweep never
+  // blocks the subscription callback (and therefore never turns into QoS
+  // front-cloud drops). Non-Luminar sensors keep the legacy synchronous path.
+  // Started LAST, after every throwing constructor step: if the constructor
+  // throws after a thread starts, the destructor never runs and the thread
+  // would touch destroyed members. Callbacks cannot fire before spin, so no
+  // front cloud can arrive between subscription creation and this point.
+  if (this->concat_enabled_ && !this->aux_lidars_.empty() &&
+      this->sensor == dlio::SensorType::LUMINAR) {
+    this->sync_active_ = true;
+    this->sync_worker_ =
+        std::thread(&gicp_plusplus::LocalizationNode::syncWorkerLoop, this);
+    RCLCPP_INFO(this->get_logger(),
+                "front sync: async point-time synchronizer active "
+                "(point gate %.3fs, deadline %.3fs, primary queue %zu)",
+                this->concat_luminar_point_threshold_,
+                this->concat_future_aux_wait_s_,
+                this->concat_primary_queue_size_);
+  }
 }
 
-gicp_plusplus::LocalizationNode::~LocalizationNode() {}
+gicp_plusplus::LocalizationNode::~LocalizationNode() {
+  // Fallback only: the pre-shutdown callback in localization_node.cc calls
+  // drainFrontSync() while the context is still valid, so queued fronts are
+  // PROCESSED. Reaching this with a live worker means the run tail can only
+  // be accounted (rclcpp::ok() is already false here on the normal path).
+  this->drainFrontSync();
+}
+
+void gicp_plusplus::LocalizationNode::drainFrontSync() {
+  // Never join from the worker thread itself: the fatal path calls
+  // rclcpp::shutdown() ON the worker, which invokes the pre-shutdown callback
+  // synchronously — a self-join would throw. Main/destructor drains later.
+  if (this->sync_worker_.get_id() == std::this_thread::get_id()) {
+    return;
+  }
+  std::lock_guard<std::mutex> dlk(this->drain_mtx_);  // idempotent/thread-safe
+  if (!this->sync_worker_.joinable()) {
+    return;
+  }
+  // Set shutdown UNDER sync_mtx_: the worker holds sync_mtx_ continuously
+  // from its predicate check to entering the wait, so a store+notify under
+  // the same mutex can never land in that gap and be lost (the former
+  // lock-free store could, deadlocking this join forever).
+  {
+    std::lock_guard<std::mutex> lk(this->sync_mtx_);
+    this->sync_shutdown_.store(true);
+  }
+  this->sync_cv_.notify_all();
+  this->sync_worker_.join();  // worker drains remaining fronts in order
+
+  // End-of-run conservation summary. The invariant has no aux term because
+  // no code path drops a front for aux reasons (front_dropped_due_to_aux is
+  // structurally zero); overload_dropped is the only drop and it is counted.
+  const uint64_t accounted = this->front_released_ + this->front_invalid_ +
+                             this->front_shutdown_unprocessed_ +
+                             this->front_overload_dropped_;
+  RCLCPP_INFO(
+      this->get_logger(),
+      "front sync summary: received=%lu released=%lu invalid=%lu "
+      "shutdown_unprocessed=%lu overload_dropped=%lu | releases: "
+      "all_matched=%lu watermark=%lu timeout=%lu shutdown_drain=%lu%s",
+      static_cast<unsigned long>(this->front_received_),
+      static_cast<unsigned long>(this->front_released_),
+      static_cast<unsigned long>(this->front_invalid_),
+      static_cast<unsigned long>(this->front_shutdown_unprocessed_),
+      static_cast<unsigned long>(this->front_overload_dropped_),
+      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_ALL_MATCHED]),
+      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_WATERMARK]),
+      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_TIMEOUT]),
+      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_SHUTDOWN_DRAIN]),
+      this->sync_fatal_.load() ? " | FATAL pipeline error occurred" : "");
+  if (this->front_received_ != accounted) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "front sync: conservation VIOLATED (received=%lu != accounted=%lu) — "
+                 "a front cloud was lost on an unaccounted path",
+                 static_cast<unsigned long>(this->front_received_),
+                 static_cast<unsigned long>(accounted));
+  }
+}
 
 bool gicp_plusplus::LocalizationNode::loadUTMTransform(const std::string& path) {
   std::ifstream f(path);
@@ -1755,15 +1895,26 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // the matching scan and the frame silently degrades to fewer LiDARs (run-12
   // throttled logs: only ~35% of sampled scans merged 2/2). 200 = ~20 s.
   this->declare_parameter<int>("localization/lidar_concat/buffer_size", 200);
-  // Yaw-defect fix (P3): constant per-aux clock offset (seconds, ADDED to the
-  // aux header stamp AND to Luminar absolute per-point times) — absorbs a
-  // constant offset between an aux LiDAR's clock and the primary/IMU clock
-  // that would otherwise warp the merged scan during turns and create false
-  // yaw pressure. Read the value straight off the per-aux offset diagnostic
-  // ("header offset vs primary ... mean=..."); runs 19/20 showed 80-90 ms.
-  // Order matches aux_topics; missing entries = 0.
+  // Measured residual per-aux point-clock correction (seconds, ADDED to both
+  // header and absolute point times). A header phase delta alone is NOT
+  // evidence of clock error when every Iris is PTP-synchronized (runs 19/20's
+  // "80-90 ms" were header-delta extrema; the geometric point-time regression
+  // measured |offset| < 11 ms). Keep zero until a geometric point-time
+  // measurement establishes a different value. Order matches aux_topics;
+  // missing entries = 0.
   this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_time_offsets",
                                                std::vector<double>{});
+  // Luminar acceptance gate: absolute point-time endpoint-range error
+  // max(|min-min|,|max-max|) <= this. Header time is only a tie-break; the
+  // 0.1 s header threshold stays solely for non-Luminar fallback matching.
+  this->declare_parameter<double>("localization/lidar_concat/luminar_point_time_threshold_s", 0.010);
+  // Arrival-time (steady clock) deadline for a pending front cloud in the
+  // async synchronizer. Bounds live latency when an aux is lost/stalled; it is
+  // not a point-clock correction and never alters timestamps.
+  this->declare_parameter<double>("localization/lidar_concat/future_aux_wait_timeout_s", 0.150);
+  // Pending-front queue depth that triggers a queue-pressure release of the
+  // OLDEST front (with whatever matched). A capacity bound, never a drop.
+  this->declare_parameter<int>("localization/lidar_concat/primary_queue_size", 8);
   // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
   this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
   this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
@@ -1792,6 +1943,45 @@ void gicp_plusplus::LocalizationNode::getParams() {
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->get_parameter("localization/lidar_concat/aux_time_offsets", this->concat_aux_time_offsets_);
+  // Fail LOUD on invalid offsets (GLIM config-loader policy): a NaN/inf or
+  // extreme value would flow into point-range matching and the int64 ns
+  // conversion in shiftCloudTimestamps (UB / corrupted absolute timestamps).
+  // Real residual point-clock offsets are < 11 ms; 0.5 s is a generous bound
+  // that still catches header-phase values pasted in by mistake being
+  // combined with unit errors (e.g. ms entered as s stays within the bound,
+  // but garbage like 1e9 or NaN cannot start the node).
+  for (size_t i = 0; i < this->concat_aux_time_offsets_.size(); ++i) {
+    const double v = this->concat_aux_time_offsets_[i];
+    if (!std::isfinite(v) || std::abs(v) > 0.5) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "localization/lidar_concat/aux_time_offsets[%zu] = %g is invalid "
+                   "(must be finite and |v| <= 0.5 s); refusing to start",
+                   i, v);
+      throw std::runtime_error("lidar_concat: invalid aux_time_offsets entry");
+    }
+  }
+  this->get_parameter("localization/lidar_concat/luminar_point_time_threshold_s",
+                      this->concat_luminar_point_threshold_);
+  this->get_parameter("localization/lidar_concat/future_aux_wait_timeout_s",
+                      this->concat_future_aux_wait_s_);
+  int primary_queue_size_int = 8;
+  this->get_parameter("localization/lidar_concat/primary_queue_size", primary_queue_size_int);
+  if (!std::isfinite(this->concat_luminar_point_threshold_) ||
+      this->concat_luminar_point_threshold_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "localization/lidar_concat/luminar_point_time_threshold_s=%.3f invalid; using 0.010",
+                this->concat_luminar_point_threshold_);
+    this->concat_luminar_point_threshold_ = 0.010;
+  }
+  if (!std::isfinite(this->concat_future_aux_wait_s_) ||
+      this->concat_future_aux_wait_s_ < 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "localization/lidar_concat/future_aux_wait_timeout_s=%.3f invalid; using 0.150",
+                this->concat_future_aux_wait_s_);
+    this->concat_future_aux_wait_s_ = 0.150;
+  }
+  this->concat_primary_queue_size_ =
+      static_cast<size_t>(std::max(1, primary_queue_size_int));
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
   this->get_parameter("localization/lidar_concat/primary_frame", this->concat_primary_frame_);
   this->get_parameter("localization/lidar_concat/urdf_path", this->concat_urdf_path_);
@@ -2469,11 +2659,229 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
     return;
   }
 
-  // Multi-LiDAR concatenation: merge nearest aux scans into the primary cloud
-  // before any other processing. Downstream steps (TF cache, manual field
-  // extraction, Luminar timestamp read, Y-flip, deskew, GICP) all run on the
-  // merged cloud unchanged — primary frame_id, point_step, and field layout
-  // are preserved.
+  if (this->sync_active_) {
+    // Luminar production path: validate + enqueue only. The synchronizer
+    // worker owns release order and runs the pipeline; this callback must
+    // never block on aux state (a 100-150 ms wait exceeds the 20 Hz front
+    // period and turns into QoS front drops — the Result-33 regression).
+    this->enqueuePrimary(pc_in);
+    return;
+  }
+
+  // Legacy synchronous path (concat disabled or non-Luminar sensor).
+  this->processScan(pc_in);
+}
+
+// Front-cloud admission: the ONLY reasons a front cloud is not enqueued are
+// independently reported front failures (null/empty/malformed primary data).
+// Aux state and queue pressure can never cause a front drop.
+void gicp_plusplus::LocalizationNode::enqueuePrimary(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc) {
+  if (!pc || pc->width * pc->height == 0 || pc->data.empty()) {
+    std::lock_guard<std::mutex> lk(this->sync_mtx_);
+    ++this->front_received_;
+    ++this->front_invalid_;
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "front sync: rejecting empty/malformed primary cloud "
+                         "(front_invalid=%lu)",
+                         static_cast<unsigned long>(this->front_invalid_));
+    return;
+  }
+
+  PendingPrimaryCloud pending;
+  pending.msg = pc;
+  // Decode ONCE. An invalid range (unsupported time field) means point-time
+  // matching is impossible: release immediately and let mergeAuxClouds record
+  // the per-aux outcome — the front cloud itself is still processed.
+  pending.range = luminarTimestampRangeFromCloud(*pc);
+  const auto now = std::chrono::steady_clock::now();
+  pending.enqueued = now;
+  pending.deadline =
+      pending.range.valid
+          ? now + std::chrono::duration<int64_t, std::nano>(
+                      static_cast<int64_t>(this->concat_future_aux_wait_s_ * 1e9))
+          : now;
+
+  {
+    std::lock_guard<std::mutex> lk(this->sync_mtx_);
+    ++this->front_received_;
+    // Compute-overload policy — the queue IS a hard bound. One worker runs
+    // one full GICP pipeline per front; when the solver is slower than the
+    // input rate an unbounded backlog would grow until queued scans outlive
+    // the 2000-sample IMU history and deskew degrades. Coalesce by dropping
+    // the OLDEST queued front (its IMU window is the one at risk), loudly and
+    // counted: this is the ONLY code path that may drop a front, it is never
+    // taken for aux reasons, and it enters the conservation invariant.
+    while (this->primary_queue_.size() >= this->concat_primary_queue_size_) {
+      this->primary_queue_.pop_front();
+      ++this->front_overload_dropped_;
+      RCLCPP_ERROR_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "front sync: COMPUTE OVERLOAD — GICP pipeline is slower than the "
+          "front input rate; dropped the oldest queued front "
+          "(front_overload_dropped=%lu, queue bound %zu). Reduce solver cost "
+          "(VGICP/decimation) or raise primary_queue_size.",
+          static_cast<unsigned long>(this->front_overload_dropped_),
+          this->concat_primary_queue_size_);
+    }
+    pending.arrival_seq = this->sync_seq_++;
+    this->primary_queue_.push_back(std::move(pending));
+  }
+  this->sync_cv_.notify_all();
+}
+
+// Synchronizer worker: single owner of front release order. For the oldest
+// pending front, each aux is independently `matched` (point-range endpoint
+// error <= gate; header distance only as tie-break), `final` (watermark — its
+// newest valid point time is already past front.min + gate, so an aligned
+// sweep can no longer arrive — or it exposes no absolute point time), or
+// `pending`. Release on: all matched/final, deadline expiry, queue pressure,
+// or shutdown drain. Fronts are always released in arrival order.
+void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
+  std::unique_lock<std::mutex> lk(this->sync_mtx_);
+  while (!this->sync_shutdown_.load()) {
+    if (this->primary_queue_.empty()) {
+      // Predicate wait: shutdown and enqueue both mutate state under
+      // sync_mtx_, so this cannot miss either transition.
+      this->sync_cv_.wait(lk, [this] {
+        return this->sync_shutdown_.load() || !this->primary_queue_.empty();
+      });
+      continue;
+    }
+
+    auto& front = this->primary_queue_.front();
+    bool all_matched = true;
+    bool ready = true;
+    if (front.range.valid) {
+      // Lock order: sync_mtx_ -> aux.mtx (aux callbacks never hold both).
+      for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+        auto& aux = *this->aux_lidars_[i];
+        const double clock_off = (i < this->concat_aux_time_offsets_.size())
+                                     ? this->concat_aux_time_offsets_[i] : 0.0;
+        bool matched = false;
+        LuminarTimestampRangeNs newest;
+        {
+          std::lock_guard<std::mutex> alk(aux.mtx);
+          for (const auto& buffered : aux.buffer) {
+            if (!buffered.luminar_range.valid) continue;
+            const auto shifted = shiftedRange(buffered.luminar_range, clock_off);
+            if (endpointDeltaSeconds(front.range, shifted) <=
+                this->concat_luminar_point_threshold_) {
+              matched = true;
+              break;
+            }
+            if (!newest.valid || shifted.min_ns > newest.min_ns) {
+              newest = shifted;
+            }
+          }
+        }
+        if (matched) continue;
+        all_matched = false;
+        // Watermark: aux stream has already advanced past this front's window.
+        if (!luminarWatermarkPassed(front.range, newest,
+                                    this->concat_luminar_point_threshold_)) {
+          ready = false;
+          break;
+        }
+      }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool timed_out = now >= front.deadline;
+    if (!ready && !timed_out) {
+      this->sync_cv_.wait_until(lk, front.deadline);
+      continue;  // re-evaluate: aux arrival, deadline, or shutdown
+    }
+
+    // Decide the release reason before popping.
+    int reason;
+    if (ready && all_matched) {
+      reason = RELEASE_ALL_MATCHED;
+    } else if (ready) {
+      reason = RELEASE_WATERMARK;
+    } else {
+      reason = RELEASE_TIMEOUT;
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "front sync: %.0f ms deadline expired waiting for aux; releasing "
+          "front (stamp=%.6f) with currently matched auxiliaries",
+          1e3 * this->concat_future_aux_wait_s_,
+          rclcpp::Time(front.msg->header.stamp).seconds());
+    }
+
+    PendingPrimaryCloud released = std::move(this->primary_queue_.front());
+    this->primary_queue_.pop_front();
+    ++this->front_released_;
+    ++this->release_reason_counts_[reason];
+    this->last_release_reason_ = reason;
+    this->last_queue_depth_ = static_cast<int>(this->primary_queue_.size());
+    this->last_front_wait_ms_ =
+        1e-6 * std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   now - released.enqueued).count();
+
+    lk.unlock();
+    // mergeAuxClouds re-selects from the aux buffers under the same point-time
+    // criteria the readiness test used (buffers hold ~20 s; the sweep cannot
+    // have been evicted), then the unchanged deskew/GICP pipeline runs.
+    // The pipeline can throw (strict require_all_aux abort past budget): an
+    // uncaught exception on this dedicated thread would reach std::terminate
+    // and bypass all accounting — convert it into a controlled shutdown that
+    // main() turns into a nonzero exit code.
+    try {
+      this->processScan(released.msg);
+    } catch (const std::exception& e) {
+      this->sync_fatal_.store(true);
+      RCLCPP_FATAL(this->get_logger(),
+                   "front sync: scan pipeline threw on the worker thread: %s — "
+                   "initiating controlled shutdown; remaining queued fronts are "
+                   "accounted, not processed",
+                   e.what());
+      rclcpp::shutdown();  // no-op if the strict-merge handler already called it
+    }
+    lk.lock();
+    if (this->sync_fatal_.load()) {
+      break;  // fall through to drain accounting
+    }
+  }
+
+  // Shutdown drain: release remaining fronts in order with available matches;
+  // never wait for missing auxiliaries. If ROS is already down or the
+  // pipeline is fatally broken, processing is impossible — account for them
+  // instead of dropping silently.
+  while (!this->primary_queue_.empty()) {
+    if (rclcpp::ok() && !this->sync_fatal_.load()) {
+      PendingPrimaryCloud released = std::move(this->primary_queue_.front());
+      this->primary_queue_.pop_front();
+      ++this->front_released_;
+      ++this->release_reason_counts_[RELEASE_SHUTDOWN_DRAIN];
+      this->last_release_reason_ = RELEASE_SHUTDOWN_DRAIN;
+      this->last_queue_depth_ = static_cast<int>(this->primary_queue_.size());
+      lk.unlock();
+      try {
+        this->processScan(released.msg);
+      } catch (const std::exception& e) {
+        this->sync_fatal_.store(true);
+        RCLCPP_FATAL(this->get_logger(),
+                     "front sync: scan pipeline threw during shutdown drain: %s — "
+                     "remaining fronts are accounted, not processed",
+                     e.what());
+      }
+      lk.lock();
+    } else {
+      ++this->front_shutdown_unprocessed_;
+      this->primary_queue_.pop_front();
+    }
+  }
+}
+
+void gicp_plusplus::LocalizationNode::processScan(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
+
+  // Multi-LiDAR concatenation: merge point-time-aligned aux scans into the
+  // primary cloud before any other processing. Downstream steps (TF cache,
+  // manual field extraction, Luminar timestamp read, Y-flip, deskew, GICP) all
+  // run on the merged cloud unchanged — primary frame_id, point_step, and
+  // field layout are preserved.
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc =
       this->concat_enabled_ ? this->mergeAuxClouds(pc_in) : pc_in;
 
@@ -2764,11 +3172,28 @@ void gicp_plusplus::LocalizationNode::callbackAuxPointCloud(
   if (aux_index < 0 || static_cast<size_t>(aux_index) >= this->aux_lidars_.size()) {
     return;
   }
+  BufferedAuxCloud buffered;
+  buffered.msg = std::move(msg);
+  if (this->sensor == dlio::SensorType::LUMINAR) {
+    // Decode once here (Reentrant aux group, cheap ~ms scan) so matching and
+    // the synchronizer readiness test never re-read cloud bytes.
+    buffered.luminar_range = luminarTimestampRangeFromCloud(*buffered.msg);
+  }
   auto& aux = *this->aux_lidars_[aux_index];
-  std::lock_guard<std::mutex> lk(aux.mtx);
-  aux.buffer.push_back(std::move(msg));
-  while (aux.buffer.size() > this->concat_buffer_size_) {
-    aux.buffer.pop_front();
+  {
+    std::lock_guard<std::mutex> lk(aux.mtx);
+    aux.buffer.push_back(std::move(buffered));
+    while (aux.buffer.size() > this->concat_buffer_size_) {
+      aux.buffer.pop_front();
+    }
+  }
+  // Wake the synchronizer under its mutex: notifying without it can lose the
+  // wakeup that lands between the worker's readiness check and its wait.
+  // Lock order note: aux.mtx was RELEASED above; sync_mtx_ and aux.mtx are
+  // never held together here (the worker nests sync_mtx_ -> aux.mtx).
+  if (this->sync_active_) {
+    std::lock_guard<std::mutex> wake_lk(this->sync_mtx_);
+    this->sync_cv_.notify_all();
   }
 }
 
@@ -2933,36 +3358,16 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
   // carries smaller absolute epoch timestamps; anchoring at the global min would
   // map that aux point to the primary header stamp and deskew the entire merged
   // sweep late (a real motion-prior/deskew bias at AV speeds).
+  LuminarTimestampRangeNs primary_luminar_range;
   if (this->sensor == dlio::SensorType::LUMINAR) {
-    int p_t_off;
-    uint8_t p_t_dt;
-    int p_t_cnt;
-    const size_t n_primary = static_cast<size_t>(primary->width) * primary->height;
-    // Guard the raw 8-byte reads below: the time field must fit within point_step,
-    // AND the byte buffer must actually hold all n_primary points. This capture runs
-    // BEFORE the tight-cloud guard further down, so a truncated/malformed primary
-    // (data.size() < n_primary*point_step) would otherwise read past data.end().
-    if (findTimeField(*primary, p_t_off, p_t_dt, p_t_cnt) && p_t_off >= 0 &&
-        primary->point_step > 0 && static_cast<uint32_t>(p_t_off) < primary->point_step &&
-        primary->data.size() >= n_primary * static_cast<size_t>(primary->point_step)) {
-      const size_t bytes_avail = primary->point_step - static_cast<uint32_t>(p_t_off);
-      uint64_t pmin = std::numeric_limits<uint64_t>::max();
-      bool any = false;
-      for (size_t i = 0; i < n_primary; i++) {
-        // Decode via the shared helper so the anchor matches the per-point reader
-        // (copyPointTimeFromCloud) on the accepted absolute encodings (UINT8[8] /
-        // FLOAT64). bytes_avail guards the 8-byte read against a short field.
-        uint64_t ts = 0;
-        if (luminarRawTimestampNsFromBytes(primary->data.data() + i * primary->point_step + p_t_off, p_t_dt, p_t_cnt,
-                                           bytes_avail, ts)) {
-          pmin = std::min(pmin, ts);
-          any = true;
-        }
-      }
-      if (any) {
-        this->luminar_primary_min_ts_ns_ = pmin;
-        this->luminar_primary_min_ts_valid_ = true;
-      }
+    // Decode via the shared helper so the anchor matches the per-point reader
+    // (copyPointTimeFromCloud) on the accepted absolute encodings (UINT8[8] /
+    // FLOAT64); it internally guards short/truncated buffers, and this capture
+    // runs BEFORE the tight-cloud guard further down.
+    primary_luminar_range = luminarTimestampRangeFromCloud(*primary);
+    if (primary_luminar_range.valid) {
+      this->luminar_primary_min_ts_ns_ = primary_luminar_range.min_ns;
+      this->luminar_primary_min_ts_valid_ = true;
     }
   }
 
@@ -3009,6 +3414,22 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
   for (size_t aux_i = 0; aux_i < this->aux_lidars_.size(); ++aux_i) {
     auto& aux = *this->aux_lidars_[aux_i];
 
+    // Luminar safety rule: an invalid primary point-time range (unsupported or
+    // malformed time encoding) makes point-coherent matching impossible, and
+    // header-nearest selection is NOT a safe substitute — it is exactly the
+    // wrong-sweep / 149 ms-span failure mode. Release the front alone and
+    // explicitly omit every aux; the header fallback below exists only for
+    // non-Luminar sensors.
+    if (this->sensor == dlio::SensorType::LUMINAR && !primary_luminar_range.valid) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "lidar_concat: primary cloud has no usable absolute point-time range "
+          "(unsupported_point_time); omitting '%s' and merging front-only — "
+          "header-nearest matching is not a safe Luminar fallback",
+          aux.topic.c_str());
+      continue;
+    }
+
     // Cache T_primary_aux from TF on first use. Skip this aux until TF is available.
     if (!aux.extrinsic_cached) {
       try {
@@ -3035,26 +3456,72 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
       }
     }
 
-    // Pick the aux scan whose header is closest in time to the primary header,
-    // within the configured threshold.
+    // Match Luminar sweeps by absolute per-point time. Header proximity alone
+    // is unsafe on AV-24: an old right sweep can have the nearest header while
+    // its rays are one acquisition period early (the 149 ms merged-span bug).
+    // Generic sensors retain the header-time fallback because they do not
+    // expose an absolute per-point time carrier.
     sensor_msgs::msg::PointCloud2::ConstSharedPtr match;
-    // P3 yaw-defect fix: correct a measured constant clock offset before any
-    // time comparison — matching, rebasing, and diagnostics all see the
-    // corrected aux timeline.
+    // Measured residual point-clock correction (NOT header phase) applied
+    // before any time comparison.
     const double aux_clock_off = (aux_i < this->concat_aux_time_offsets_.size())
                                      ? this->concat_aux_time_offsets_[aux_i] : 0.0;
+    const bool use_luminar_time =
+        this->sensor == dlio::SensorType::LUMINAR &&
+        primary_luminar_range.valid;
     double best_dt = std::numeric_limits<double>::max();
+    double best_luminar_time_delta = std::numeric_limits<double>::max();
     {
       std::lock_guard<std::mutex> lk(aux.mtx);
-      for (const auto& msg : aux.buffer) {
-        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() + aux_clock_off - t_primary);
-        if (dt < best_dt) {
-          best_dt = dt;
-          match = msg;
+      if (use_luminar_time) {
+        std::vector<LuminarSweepCandidate> candidates;
+        candidates.reserve(aux.buffer.size());
+        for (size_t i = 0; i < aux.buffer.size(); ++i) {
+          const auto& buffered = aux.buffer[i];
+          if (!buffered.luminar_range.valid) {
+            continue;
+          }
+          const double header_abs_dt = std::abs(
+              rclcpp::Time(buffered.msg->header.stamp).seconds() +
+              aux_clock_off - t_primary);
+          candidates.push_back(LuminarSweepCandidate{
+              i, shiftedRange(buffered.luminar_range, aux_clock_off),
+              header_abs_dt});
+        }
+        const auto selection =
+            selectClosestLuminarSweep(primary_luminar_range, candidates);
+        if (selection) {
+          match = aux.buffer[selection->index].msg;
+          best_luminar_time_delta = selection->range_delta_s;
+          best_dt = selection->header_abs_delta_s;
+        }
+      } else {
+        for (const auto& buffered : aux.buffer) {
+          const double dt = std::abs(
+              rclcpp::Time(buffered.msg->header.stamp).seconds() +
+              aux_clock_off - t_primary);
+          if (dt < best_dt) {
+            best_dt = dt;
+            match = buffered.msg;
+          }
         }
       }
     }
-    if (!match || best_dt > this->concat_time_threshold_) {
+    if (use_luminar_time &&
+        (!match || best_luminar_time_delta >
+                       this->concat_luminar_point_threshold_)) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "lidar_concat: no timestamp-aligned Luminar match for '%s' within "
+          "%.3fs of the primary point-time range (best_range_delta=%.3fs, "
+          "best_header_delta=%.3fs); dropping aux rather than appending the "
+          "wrong sweep",
+          aux.topic.c_str(), this->concat_luminar_point_threshold_,
+          match ? best_luminar_time_delta : -1.0, match ? best_dt : -1.0);
+      continue;
+    }
+    if (!use_luminar_time &&
+        (!match || best_dt > this->concat_time_threshold_)) {
       RCLCPP_DEBUG(this->get_logger(),
                    "lidar_concat: no match for '%s' within %.3fs of primary t=%.3f (best_dt=%.3fs)",
                    aux.topic.c_str(), this->concat_time_threshold_, t_primary,
@@ -3122,8 +3589,9 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
          time_dt_type == sensor_msgs::msg::PointField::FLOAT64 ||
          (time_dt_type == sensor_msgs::msg::PointField::UINT8 && time_count == 8));
     if (usable_time_field) {
-      // dt = aux header - primary header. Adding dt rebases aux per-point times
-      // onto the primary clock so deskewing sees one coherent sweep.
+      // Generic relative-time carriers are rebased by header dt. Luminar's
+      // absolute carrier ignores dt and applies only the measured residual
+      // clock offset — header acquisition phase never touches point times.
       const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
       shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64,
                            aux_clock_off);
@@ -3151,12 +3619,11 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     total_points += aux_pts;
     ++merged_aux_count;
 
-    // P4#3: per-frame + running merge-timing diagnostics. signed_dt is the
-    // aux-vs-primary HEADER offset (not the |dt| used for matching): a stable
-    // nonzero mean across the run is the signature of a constant per-aux
-    // clock offset against the P1 timebase, which a per-aux time-offset
-    // correction upstream could absorb (and which inflates deskew error at
-    // high yaw rates).
+    // Per-frame + running HEADER-phase diagnostics. signed_dt is deliberately
+    // NOT a point-clock estimate: PTP-synchronized Iris units retain a stable
+    // acquisition phase (66-92 ms right on AV-24) while their absolute
+    // per-point clocks agree to <1 ms. Observability only — copying it into
+    // aux_time_offsets would shift an aligned range out of the 10 ms gate.
     const double signed_dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
     this->concat_last_aux_dt_[aux_i] = signed_dt;
     this->concat_last_aux_points_[aux_i] = static_cast<int>(aux_pts);
@@ -3165,14 +3632,13 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     aux.dt_max = std::max(aux.dt_max, signed_dt);
     if (++aux.dt_count % 512 == 0) {  // ~every 50 s at 10 Hz
       RCLCPP_INFO(this->get_logger(),
-                  "lidar_concat: '%s' header offset vs primary over %lu merges: "
-                  "mean=%+.1f ms, min=%+.1f ms, max=%+.1f ms%s",
+                  "lidar_concat: '%s' header phase vs primary over %lu merges: "
+                  "mean=%+.1f ms, min=%+.1f ms, max=%+.1f ms — acquisition phase, "
+                  "observability only; NOT point-clock evidence, do not copy into "
+                  "aux_time_offsets",
                   aux.topic.c_str(), static_cast<unsigned long>(aux.dt_count),
                   1e3 * aux.dt_sum / static_cast<double>(aux.dt_count),
-                  1e3 * aux.dt_min, 1e3 * aux.dt_max,
-                  std::abs(aux.dt_sum / static_cast<double>(aux.dt_count)) > 0.02
-                      ? " — mean >20 ms: likely constant clock offset, consider a per-aux time correction"
-                      : "");
+                  1e3 * aux.dt_min, 1e3 * aux.dt_max);
     }
   }
 
@@ -4296,6 +4762,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     publish_float(this->dbg_merged_aux_count_pub,
                   static_cast<double>(this->concat_last_merged_aux_));
     publish_float(this->dbg_scan_time_span_pub, this->last_scan_time_span_s_);
+    // Front sync telemetry: written by the sync worker before processScan()
+    // and published here on the same thread (-1/0/0 on the legacy path).
+    publish_float(this->dbg_front_release_reason_pub,
+                  static_cast<double>(this->last_release_reason_));
+    publish_float(this->dbg_front_wait_ms_pub, this->last_front_wait_ms_);
+    publish_float(this->dbg_primary_queue_depth_pub,
+                  static_cast<double>(this->last_queue_depth_));
     for (size_t i = 0; i < this->dbg_aux_dt_pubs_.size(); ++i) {
       const double dt_i = (i < this->concat_last_aux_dt_.size())
           ? this->concat_last_aux_dt_[i] : std::numeric_limits<double>::quiet_NaN();
@@ -5010,9 +5483,14 @@ bool gicp_plusplus::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) cons
   // When the gate is disabled, treat every sample as FIXED -- the operator
   // has explicitly opted into "trust whatever the upstream publishes".
   if (!this->rtk_gate_enabled_) return true;
-  return (s.cov_pos_xx <= this->rtk_gate_max_pose_var_xy_) &&
-         (s.cov_pos_yy <= this->rtk_gate_max_pose_var_xy_) &&
-         (s.cov_pos_zz <= this->rtk_gate_max_pose_var_z_);
+  // [P1 FIX 2026-07-14] finite + nonnegative + thresholded (rtk_gate.hpp):
+  // the former plain `<=` accepted a finite negative sentinel (-1 =
+  // "covariance not populated") as RTK-quality, so unknown-quality samples
+  // could drive the INS heading prior, bias calibration, and the GT
+  // cross-check. Parity with the adapter's filtered_odom_rtk_fixed gate.
+  return rtkPositionCovarianceOk(s.cov_pos_xx, s.cov_pos_yy, s.cov_pos_zz,
+                                 this->rtk_gate_max_pose_var_xy_,
+                                 this->rtk_gate_max_pose_var_z_);
 }
 
 bool gicp_plusplus::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {

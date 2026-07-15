@@ -425,6 +425,12 @@ class P1ImuPcapReplay(Node):
         p1_fraction_ns = int(values[1])
         if p1_seconds == 0xFFFFFFFF or p1_fraction_ns == 0xFFFFFFFF:
             return None
+        # [P3 HARDENING 2026-07-14] A ROS Time nanosec field must be < 1e9.
+        # A corrupt fraction would either raise on assignment (killing the
+        # replay) or, worse, alias into a wrong timestamp downstream. Drop the
+        # sample instead (fail closed, same policy as the sentinel above).
+        if p1_fraction_ns >= 1_000_000_000:
+            return None
 
         accel = values[2:5]
         accel_std = values[5:8]

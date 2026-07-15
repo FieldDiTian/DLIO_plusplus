@@ -794,6 +794,76 @@ def check_normalized_bag(args: argparse.Namespace, bag_path: Path, report_path: 
     return ok
 
 
+def validate_rtk_anchor(dump_dir: Path, log_path: Path) -> None:
+    """[P1 FIX 2026-07-14] Enforce the RTK-anchoring contract on a mapping run.
+
+    A clean glim_rosbag exit only proves local consistency: gnss_global can
+    fail to initialize its world<->ENU transform (or emit zero GNSS factors)
+    and the map is then completely unanchored while still 'successful'.
+    Require, for RTK mapping runs (default):
+      1. T_world_utm.txt exists and parses as a finite 4x4 SE(3) matrix;
+      2. the gnss_global at_exit summary reports transformation_initialized
+         and position_factors > 0.
+    LiDAR/IMU-only mapping must opt out explicitly via --lidar-imu-only.
+    """
+    twu_path = dump_dir / "T_world_utm.txt"
+    if not twu_path.exists():
+        die(
+            f"RTK anchor validation FAILED: {twu_path} was not written — "
+            "gnss_global never initialized the world<->ENU transform (no RTK "
+            "anchoring occurred). Pass --lidar-imu-only for unanchored mapping."
+        )
+    values: List[float] = []
+    for line in twu_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.endswith(":"):
+            continue
+        for token in stripped.split():
+            try:
+                values.append(float(token))
+            except ValueError:
+                die(f"RTK anchor validation FAILED: malformed token '{token}' in {twu_path}")
+    if len(values) != 16 or not all(math.isfinite(v) for v in values):
+        die(
+            f"RTK anchor validation FAILED: {twu_path} does not contain a "
+            f"finite 4x4 matrix (parsed {len(values)} finite-checked values)"
+        )
+    bottom = values[12:16]
+    if any(abs(b - e) > 1e-6 for b, e in zip(bottom, (0.0, 0.0, 0.0, 1.0))):
+        die(f"RTK anchor validation FAILED: {twu_path} bottom row {bottom} != [0,0,0,1]")
+
+    summary_line = ""
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "gnss_global summary:" in line:
+            summary_line = line  # keep the LAST occurrence
+    if not summary_line:
+        die(
+            "RTK anchor validation FAILED: no 'gnss_global summary:' line in "
+            f"{log_path} — gnss_global did not run its at_exit hook (module not "
+            "loaded, or an old build without the audit summary)."
+        )
+    match = re.search(
+        r"transformation_initialized=(\S+)\s+position_factors=(\d+)", summary_line
+    )
+    if not match:
+        die(f"RTK anchor validation FAILED: unparseable summary line: {summary_line}")
+    initialized = match.group(1) in ("true", "1", "True")
+    position_factors = int(match.group(2))
+    if not initialized or position_factors <= 0:
+        die(
+            "RTK anchor validation FAILED: "
+            f"transformation_initialized={match.group(1)}, "
+            f"position_factors={position_factors} — the map is unanchored. "
+            "Check RTK-FIXED availability and the normalized "
+            "/gps_p1/filtered_odom_rtk_fixed topic, or pass --lidar-imu-only."
+        )
+    print(
+        "[prep_bag] RTK anchor validation OK: "
+        f"position_factors={position_factors}, T_world_utm={twu_path}"
+    )
+    print(f"[prep_bag]   {summary_line.strip()}")
+
+
 def run_glim(args: argparse.Namespace, normalized_bag: Path, dump_dir: Path, work_dir: Path) -> None:
     require_ros_package("glim_ros")
     if dump_dir.exists() and args.force:
@@ -857,6 +927,16 @@ def run_glim(args: argparse.Namespace, normalized_bag: Path, dump_dir: Path, wor
     else:
         print(f"[prep_bag] GLIM symptom grep clean: {symptom_report}")
 
+    # [P1 FIX 2026-07-14] Default-on RTK-anchor acceptance gate: a clean exit
+    # code is NOT proof of anchoring.
+    if args.lidar_imu_only:
+        print(
+            "[prep_bag] RTK anchor validation SKIPPED (--lidar-imu-only): "
+            "the map is intentionally unanchored"
+        )
+    else:
+        validate_rtk_anchor(dump_dir, log_path)
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
@@ -870,6 +950,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--p1-imu-pcap", default="", help="Point One INS/IMU PCAP; auto-discovered if omitted")
     ap.add_argument("--skip-normalize", action="store_true", help="use an existing --output bag")
     ap.add_argument("--skip-glim", action="store_true", help="only normalize and check the bag")
+    ap.add_argument(
+        "--lidar-imu-only",
+        action="store_true",
+        help="explicit opt-out of the default-on RTK-anchor validation: accept a "
+        "mapping run without T_world_utm.txt / GNSS position factors "
+        "(LiDAR+IMU-only mapping)",
+    )
     ap.add_argument("--force", action="store_true", help="remove existing output/dump paths created by this script")
 
     ap.add_argument("--rate", type=float, default=1.0, help="ros2 bag play and PCAP replay rate")

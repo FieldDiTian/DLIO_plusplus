@@ -121,12 +121,16 @@
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
-    # RTK quality gate on the gt_odom buffer. Drops every incoming gt_odom
-    # sample whose Atlas-reported pose covariance is worse than the configured
-    # thresholds. This is the P1-native replacement for the NovAtel BESTGNSSPOS
-    # enum gate (RAWIMUSX/INSPVAX/CORRIMUSX path is gone -- everything now
-    # comes from /gps_p1/* and the FusionEngine driver populates Odometry's
-    # covariance directly from its solution quality).
+    # RTK quality gate, applied PER CONSUMER at consumption time — NOT a
+    # buffer filter. Every incoming gt_odom sample enters the buffer; the
+    # covariance check (gtSampleIsRtkFixed: finite, nonnegative, and within
+    # the thresholds) then gates only the consumers that need RTK-quality
+    # data: RTK bias calibration, the INS heading prior, and the GICP-vs-GT
+    # diagnostic cross-check. Snap recovery and use_odom_init intentionally
+    # accept degraded Atlas INS output. This is the P1-native replacement for
+    # the NovAtel BESTGNSSPOS enum gate (RAWIMUSX/INSPVAX/CORRIMUSX path is
+    # gone -- everything now comes from /gps_p1/* and the FusionEngine driver
+    # populates Odometry's covariance directly from its solution quality).
     #
     # The gate inspects msg->pose.covariance[0,7,14] (xx, yy, zz position
     # variances in m^2). Reject if any horizontal variance exceeds
@@ -141,8 +145,9 @@
     # has fully degraded to GPS-only.
     #
     # Disable (enable=false) only for replays of bags lacking covariance
-    # populating, or for diagnostic runs where you want all gt_odom samples
-    # accepted.
+    # population, or for diagnostic runs where the RTK-gated consumers
+    # (calibration / INS prior / cross-check) should accept every sample.
+    # Buffering, snap recovery, and odom-init are unaffected either way.
     localization/rtk_gate/enable: true
     localization/rtk_gate/max_pose_var_xy: 0.25  # m^2; ~0.5 m horizontal std
     localization/rtk_gate/max_pose_var_z: 1.0    # m^2; ~1.0 m vertical std (GPS Z is naturally worse)
@@ -209,16 +214,32 @@
     localization/lidar_concat/enabled: true
     localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
-    localization/lidar_concat/time_threshold: 0.1   # seconds; aux scans further than this from primary are dropped
-                                                    # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
-                                                    #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
-    # Yaw-defect fix (P3): constant per-aux clock offsets (seconds, order =
-    # aux_topics; missing = 0). ADDED to the aux header stamp for matching /
-    # rebasing AND to Luminar absolute per-point times, so a constant clock
-    # offset vs the primary/IMU no longer warps the merged scan during turns
-    # (false yaw pressure). Read the value off the per-aux offset diagnostic
-    # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
-    # runs 19/20 measured 80-90 ms offsets.
+    localization/lidar_concat/time_threshold: 0.1   # seconds; NON-LUMINAR fallback matching + tie-break only.
+                                                    # Luminar acceptance is gated by the absolute point-time
+                                                    # threshold below, never by header proximity (headers carry
+                                                    # 66-92 ms acquisition phase on AV-24 with coherent point times).
+    # Luminar acceptance gate: absolute point-time endpoint-range error
+    # max(|min-min|,|max-max|) must be <= this. Header distance is only a
+    # tie-break between candidates with equal range error.
+    localization/lidar_concat/luminar_point_time_threshold_s: 0.010
+    # Async front/aux synchronizer (Luminar production path). The front
+    # callback only validates + enqueues; a worker releases fronts in order
+    # when every aux is matched or final (watermark), or at this arrival-time
+    # deadline — merging whatever matched. Aux state can NEVER drop a front.
+    localization/lidar_concat/future_aux_wait_timeout_s: 0.150
+    # HARD bound on the pending-front queue (compute-overload policy). If the
+    # GICP pipeline is slower than the front input rate, the OLDEST queued
+    # front is dropped with loud accounting (front_overload_dropped in the
+    # sync summary) — bounded latency/memory instead of a backlog that would
+    # outlive the IMU history. This is the only path that may drop a front,
+    # and never for aux reasons.
+    localization/lidar_concat/primary_queue_size: 8
+    # Measured residual per-aux point-clock corrections (seconds, order =
+    # aux_topics; missing = 0). ADDED to aux header AND absolute point times.
+    # A header phase delta is NOT clock evidence: runs 19/20's "80-90 ms" were
+    # header-delta extrema, while the geometric point-time regression measured
+    # |offset| < 11 ms on both runs. Keep zero until a geometric point-time
+    # measurement establishes a value; never copy header phase in here.
     localization/lidar_concat/aux_time_offsets: []
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at

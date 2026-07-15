@@ -2,11 +2,18 @@
 #include <glob.h>
 #include <termios.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <spdlog/spdlog.h>
 #include <boost/format.hpp>
 #include <Eigen/Core>
@@ -232,9 +239,222 @@ int main(int argc, char** argv) {
   // Keyboard handler for pause/resume
   KeyboardHandler keyboard;
 
+  // Offline future-aware join. The right Iris sweep whose absolute point range
+  // overlaps a front sweep can arrive later in bag order because its header has
+  // a different acquisition phase.
+  //
+  // Preferred mode (two_pass_point_time_join): pass 1 below indexes every
+  // LiDAR scan's absolute point-time range and bag location, then plans each
+  // primary's aux selection by minimum endpoint-range delta within
+  // luminar_time_threshold (header time only as tie-break). The streaming pass
+  // merges a primary exactly when its planned sweeps have arrived — a known
+  // bag time, not a heuristic wait — and maps unmatched primaries front-only
+  // immediately with the miss reason recorded at planning time.
+  //
+  // Fallback mode (streaming wait), used when the primary topic lacks absolute
+  // point times: queue primaries until every aux has a point-coherent match or
+  // watermark, bounded by future_sweep_wait_timeout of bag time.
+  //
+  // Release policy — a primary is NEVER dropped by this queue in either mode.
+  // It is released when the first of these holds:
+  //   1. its planned sweeps have arrived (two-pass) / every aux is ready
+  //      (fallback: match or watermark past the gate);
+  //   2. the bag stream has advanced future_sweep_wait_timeout past the
+  //      planned ready time (two-pass safety) / the primary's enqueue time
+  //      (fallback timed release) — merge whichever aux aligned, possibly
+  //      none. A dead/gappy aux stream can therefore only degrade coverage,
+  //      never park primaries until EOF;
+  //   3. end of input (force flush).
+  // Header stamps are used for diagnostics (duplicate detection, logs) only.
+  const auto header_stamp_ns = [](const builtin_interfaces::msg::Time& t) -> uint64_t {
+    return static_cast<uint64_t>(static_cast<int64_t>(t.sec)) * 1000000000ull + t.nanosec;
+  };
+  // Plan identity is the per-topic BAG-RECORD ORDINAL (0-based count of
+  // messages seen on that topic, in stream order), NOT header.stamp: duplicate
+  // or zero header stamps would silently collapse map keys. Pass 1 and pass 2
+  // read the same bags in the same order, so ordinals align exactly — which is
+  // also why the planner refuses to run under start_offset (the pass-2 seek
+  // would desynchronize the counts; the streaming fallback handles that case).
+  struct PlannedAux {
+    bool selected = false;
+    uint64_t aux_ordinal = 0;     // identity of the chosen sweep in the stream
+    double aux_bag_time_s = 0.0;  // when it arrives in the stream
+    const char* miss_reason = "";
+  };
+  struct PlannedMerge {
+    std::vector<PlannedAux> aux;
+    double ready_bag_time_s = 0.0;  // max bag time over the selected sweeps
+  };
+  struct StoredAuxCloud {
+    glim_ros::BufferedAuxCloud cloud;
+    double bag_time_s = 0.0;  // arrival time, for stranded-entry GC
+  };
+  bool two_pass_active = false;
+  std::unordered_map<uint64_t, PlannedMerge> merge_plan;           // key: primary ordinal
+  std::vector<std::unordered_set<uint64_t>> planned_aux_ordinals;  // per-aux planned sweeps
+  // Ordered by ordinal (== arrival order) so stranded entries can be
+  // garbage-collected from the front by arrival time.
+  std::vector<std::map<uint64_t, StoredAuxCloud>> planned_aux_store;
+  // Pass-2 per-topic ordinal counters (must count every message on the topic,
+  // exactly like pass 1 does).
+  uint64_t primary_ordinal_next = 0;
+  std::vector<uint64_t> aux_ordinal_next;
+  struct PendingPrimaryScan {
+    sensor_msgs::msg::PointCloud2::SharedPtr msg;
+    double enqueue_bag_time_s = 0.0;
+    uint64_t ordinal = 0;  // per-topic bag-record ordinal (two-pass plan key)
+  };
+  std::deque<PendingPrimaryScan> pending_primary_scans;
+  double latest_bag_time_s = 0.0;  // stream time of the newest message read
+  // Primary accounting. Invariant checked at EOF:
+  //   primary_received == primary_forwarded + primary_strict_skipped +
+  //                       primary_imu_skipped + still-pending
+  uint64_t primary_received = 0;        // primary bag messages enqueued
+  uint64_t primary_forwarded = 0;       // merged clouds ingested by GLIM
+  uint64_t primary_strict_skipped = 0;  // merge_clouds nullptr (require_all_aux policy)
+  uint64_t primary_imu_skipped = 0;     // released but rejected by GLIM ingestion
+                                        // (extract_raw_points / TimeKeeper stamp validation)
+  uint64_t primary_timed_release = 0;   // released by the bag-time bound, not readiness
+  uint64_t primary_no_plan = 0;         // two-pass: primary absent from the pass-1 index
+  uint64_t primary_released_incomplete = 0;  // two-pass: planned sweep never arrived
+  const auto drain_pending_primaries = [&](bool force) -> bool {
+    while (!pending_primary_scans.empty()) {
+      const auto& pending = pending_primary_scans.front();
+      const auto& primary = pending.msg;
+
+      const PlannedMerge* plan = nullptr;
+      if (two_pass_active) {
+        const auto found = merge_plan.find(pending.ordinal);
+        if (found != merge_plan.end()) {
+          plan = &found->second;
+        }
+      }
+
+      if (two_pass_active) {
+        // Deterministic release: the planned sweeps arrive at bag times known
+        // from pass 1. Wait only while a planned sweep is genuinely still
+        // ahead of the stream; unmatched primaries release immediately.
+        bool waiting = false;
+        if (plan && !force) {
+          for (size_t i = 0; i < aux_sensors.size() && !waiting; ++i) {
+            const auto& pa = plan->aux[i];
+            if (pa.selected && !planned_aux_store[i].count(pa.aux_ordinal)) {
+              waiting = true;
+            }
+          }
+        }
+        if (waiting) {
+          if (latest_bag_time_s < plan->ready_bag_time_s +
+                                    concat_config.future_sweep_wait_timeout) {
+            break;  // planned sweep is still ahead in the stream; keep order
+          }
+          // Safety: the stream passed the indexed arrival time yet the sweep
+          // never showed up (index/stream mismatch or malformed message).
+          ++primary_released_incomplete;
+          if (primary_released_incomplete <= 10 || primary_released_incomplete % 100 == 0) {
+            spdlog::warn(
+              "lidar_concat: planned aux sweep(s) for primary (stamp={:.6f}) did not "
+              "arrive within {:.3f}s past their indexed bag time; releasing with "
+              "whichever arrived ({} incomplete release(s) so far)",
+              glim_ros::stamp_to_sec(primary->header.stamp),
+              concat_config.future_sweep_wait_timeout, primary_released_incomplete);
+          }
+        }
+        // Stage exactly the planned sweeps for merge_clouds.
+        for (size_t i = 0; i < aux_sensors.size(); ++i) {
+          auto& aux = aux_sensors[i];
+          aux.buffer.clear();
+          if (!plan || !plan->aux[i].selected) {
+            continue;
+          }
+          auto it = planned_aux_store[i].find(plan->aux[i].aux_ordinal);
+          if (it != planned_aux_store[i].end()) {
+            aux.buffer.push_back(std::move(it->second.cloud));
+            planned_aux_store[i].erase(it);
+          }
+        }
+        if (!plan) {
+          ++primary_no_plan;
+          if (primary_no_plan <= 10) {
+            spdlog::warn(
+              "lidar_concat: primary (stamp={:.6f}) missing from the pass-1 index; "
+              "mapping front-only",
+              glim_ros::stamp_to_sec(primary->header.stamp));
+          }
+        }
+      } else if (!force && !glim_ros::aux_buffers_ready_for_primary(
+                             *primary, aux_sensors,
+                             concat_config.luminar_time_threshold)) {
+        if (latest_bag_time_s - pending.enqueue_bag_time_s <
+            concat_config.future_sweep_wait_timeout) {
+          break;  // still inside the wait window; keep primary order
+        }
+        ++primary_timed_release;
+        if (primary_timed_release <= 10 || primary_timed_release % 100 == 0) {
+          spdlog::warn(
+            "lidar_concat: releasing primary (stamp={:.6f}) after {:.3f}s bag-time wait "
+            "without a point-coherent match/watermark for every aux; merging with "
+            "whichever aux aligned ({} timed release(s) so far)",
+            glim_ros::stamp_to_sec(primary->header.stamp),
+            concat_config.future_sweep_wait_timeout, primary_timed_release);
+        }
+      }
+
+      const int epoch_anchor_count =
+        static_cast<int>(primary->width * primary->height);
+      const auto final_points = glim_ros::merge_clouds(
+        primary, aux_sensors, concat_time_threshold,
+        concat_config.require_all_aux,
+        concat_config.max_consecutive_aux_merge_failures,
+        &concat_config.consecutive_merge_failures,
+        concat_config.abort_on_merge_failure,
+        concat_config.frame_diag_log,
+        concat_config.luminar_time_threshold);
+      const double primary_header_s =
+        glim_ros::stamp_to_sec(primary->header.stamp);
+      pending_primary_scans.pop_front();
+
+      size_t workload = 0;
+      if (final_points) {
+        bool ingested = false;
+        workload = glim->points_callback(final_points, epoch_anchor_count, &ingested);
+        if (ingested) {
+          ++primary_forwarded;
+        } else {
+          ++primary_imu_skipped;
+        }
+      } else {
+        ++primary_strict_skipped;
+      }
+      if (primary_header_s > end_time) {
+        spdlog::info("end_time reached");
+        return false;
+      }
+      if (workload > 5) {
+        const size_t sleep_msec = (workload - 4) * 5;
+        spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+      }
+    }
+    // GC: planned sweeps stranded because their primary released before they
+    // arrived (safety-slack incomplete release). Ordinal order == arrival
+    // order, so pruning from the front by stored arrival time is sufficient:
+    // a sweep 10 s behind the stream can no longer be consumed.
+    if (two_pass_active) {
+      for (auto& store : planned_aux_store) {
+        while (!store.empty() &&
+               store.begin()->second.bag_time_s < latest_bag_time_s - 10.0) {
+          store.erase(store.begin());
+        }
+      }
+    }
+    return true;
+  };
+
   // Bag read function
-  const auto read_bag = [&](const std::string& bag_filename) {
-    spdlog::info("opening {}", bag_filename);
+  // Shared bag-open logic (streaming pass and the two-pass index both use it).
+  const auto open_bag_reader =
+    [](const std::string& bag_filename) -> std::unique_ptr<rosbag2_cpp::reader_interfaces::BaseReaderInterface> {
     rosbag2_storage::StorageOptions options;
     options.uri = bag_filename;
 
@@ -263,7 +483,6 @@ int main(int argc, char** argv) {
 
     rosbag2_cpp::ConverterOptions converter_options;
 
-    // rosbag2_cpp::Reader reader;
     std::unique_ptr<rosbag2_cpp::reader_interfaces::BaseReaderInterface> reader_;
     reader_ = std::make_unique<rosbag2_cpp::readers::SequentialReader>();
     reader_->open(options, converter_options);
@@ -274,7 +493,12 @@ int main(int argc, char** argv) {
       reader_ = std::make_unique<rosbag2_compression::SequentialCompressionReader>();
       reader_->open(options, converter_options);
     }
+    return reader_;
+  };
 
+  const auto read_bag = [&](const std::string& bag_filename) {
+    spdlog::info("opening {}", bag_filename);
+    auto reader_ = open_bag_reader(bag_filename);
     auto& reader = *reader_;
     reader.set_filter(filter);
 
@@ -310,6 +534,7 @@ int main(int argc, char** argv) {
       if (bag_t0 == 0) {
         bag_t0 = msg_time;
       }
+      latest_bag_time_s = msg_time / 1e9;
       spdlog::debug("msg_time: {} ({} sec)", msg_time / 1e9, (msg_time - bag_t0) / 1e9);
 
       if (start_offset > 0.0) {
@@ -361,7 +586,8 @@ int main(int argc, char** argv) {
       // Check if this message is for an auxiliary LiDAR sensor
       bool is_aux_sensor = false;
       if (concat_enabled) {
-        for (auto& aux : aux_sensors) {
+        for (size_t aux_i = 0; aux_i < aux_sensors.size(); ++aux_i) {
+          auto& aux = aux_sensors[aux_i];
           if (msg->topic_name == aux.topic) {
             if (topic_type != "sensor_msgs/msg/PointCloud2") {
               g_bag_hard_error = true;
@@ -370,9 +596,21 @@ int main(int argc, char** argv) {
             }
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
-            aux.buffer.push_back(aux_msg);
-            while (aux.buffer.size() > aux.buffer_size) {
-              aux.buffer.pop_front();
+            if (two_pass_active) {
+              // Keep only sweeps the pass-1 plan selected; everything else is
+              // known-unused and discarded immediately. Identity = per-topic
+              // ordinal (counted for EVERY message on the topic, matching the
+              // pass-1 counting rule exactly).
+              const uint64_t akey = aux_ordinal_next[aux_i]++;
+              if (planned_aux_ordinals[aux_i].count(akey)) {
+                planned_aux_store[aux_i].emplace(
+                  akey, StoredAuxCloud{glim_ros::buffer_aux_cloud(aux_msg), latest_bag_time_s});
+              }
+            } else {
+              aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
+              while (aux.buffer.size() > aux.buffer_size) {
+                aux.buffer.pop_front();
+              }
             }
             is_aux_sensor = true;
             break;
@@ -381,7 +619,7 @@ int main(int argc, char** argv) {
       }
 
       if (is_aux_sensor) {
-        // Already handled above; skip to next message
+        // Pending primaries are drained once per message below.
       } else if (msg->topic_name == imu_topic) {
         if (topic_type != "sensor_msgs/msg/Imu") {
           g_bag_hard_error = true;
@@ -400,35 +638,22 @@ int main(int argc, char** argv) {
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
 
-        // Merge auxiliary LiDAR clouds if concatenation is enabled
-        sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = points_msg;
-        int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
-          // Anchor the epoch rebase on the primary scan (its points lead the
-          // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
-          // scan started before the primary.
-          epoch_anchor_count = static_cast<int>(points_msg->width * points_msg->height);
-          final_points = glim_ros::merge_clouds(points_msg, aux_sensors, concat_time_threshold,
-                                                concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
-                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure,
-                                                concat_config.frame_diag_log);
-        }
-        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
-        size_t workload = 0;
-        if (final_points) {
-          workload = glim->points_callback(final_points, epoch_anchor_count);
-        }
-
-        if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
-          spdlog::info("end_time reached");
-          return false;
-        }
-
-        if (workload > 5) {
-          // Odometry estimation is behind
-          const size_t sleep_msec = (workload - 4) * 5;
-          spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
-          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+          pending_primary_scans.push_back(
+            {points_msg, latest_bag_time_s, primary_ordinal_next++});
+          ++primary_received;
+          // Drained once per message below.
+        } else {
+          const size_t workload = glim->points_callback(points_msg);
+          if (glim_ros::stamp_to_sec(points_msg->header.stamp) > end_time) {
+            spdlog::info("end_time reached");
+            return false;
+          }
+          if (workload > 5) {
+            const size_t sleep_msec = (workload - 4) * 5;
+            spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+          }
         }
       } else if (!external_odom_topic.empty() && msg->topic_name == external_odom_topic) {
         if (topic_type != "nav_msgs/msg/Odometry") {
@@ -474,6 +699,15 @@ int main(int argc, char** argv) {
         }
       }
 
+      // Drain once per message, not only on aux/primary arrivals: any message
+      // (IMU at 125 Hz in particular) advances bag time, so the timed release
+      // fires promptly even when an aux stream has died completely.
+      if (concat_enabled && !aux_sensors.empty() && !pending_primary_scans.empty()) {
+        if (!drain_pending_primaries(false)) {
+          return false;
+        }
+      }
+
       glim->timer_callback();
       speed_counter.update(msg_time / 1e9);
 
@@ -495,6 +729,268 @@ int main(int argc, char** argv) {
     return true;
   };
 
+  // ---------- Pass 1: point-time index + deterministic merge plan ----------
+  if (concat_enabled && !aux_sensors.empty() && concat_config.two_pass_point_time_join &&
+      start_offset > 0.0) {
+    spdlog::warn(
+      "two-pass join disabled: start_offset={} seeks the streaming pass, which "
+      "would desynchronize the per-topic ordinal plan keys; falling back to the "
+      "streaming future-sweep wait",
+      start_offset);
+  } else if (concat_enabled && !aux_sensors.empty() &&
+             concat_config.two_pass_point_time_join) {
+    // A scan's identity is its per-topic bag-record ORDINAL. Every message on
+    // the topic gets an ordinal — including malformed ones (indexed with an
+    // invalid range) — so the pass-2 counters, which see every message, stay
+    // aligned. Vector position IS the ordinal for primary_index/aux_index.
+    struct IndexedScan {
+      double bag_time_s = 0.0;
+      uint64_t header_ns = 0;  // diagnostic only (duplicate detection), not identity
+      glim_ros::LuminarTimestampRangeNs range;
+    };
+    std::vector<IndexedScan> primary_index;
+    std::vector<std::vector<IndexedScan>> aux_index(aux_sensors.size());
+
+    rclcpp::Serialization<sensor_msgs::msg::PointCloud2> pc2_ser;
+    rosbag2_storage::StorageFilter lidar_filter;
+    lidar_filter.topics.push_back(points_topic);
+    for (const auto& aux : aux_sensors) {
+      lidar_filter.topics.push_back(aux.topic);
+    }
+
+    spdlog::info("two-pass join: indexing LiDAR point-time ranges ({} bag(s))", bag_filenames.size());
+    bool index_ok = true;
+    for (const auto& bag_filename : bag_filenames) {
+      try {
+        auto reader_ = open_bag_reader(bag_filename);
+        reader_->set_filter(lidar_filter);
+        while (reader_->has_next()) {
+          if (!rclcpp::ok()) {
+            index_ok = false;
+            break;
+          }
+          const auto msg = reader_->read_next();
+          IndexedScan s;
+          s.bag_time_s = get_msg_recv_timestamp(*msg) / 1e9;
+          auto pc = std::make_shared<sensor_msgs::msg::PointCloud2>();
+          try {
+            const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+            pc2_ser.deserialize_message(&serialized_msg, pc.get());
+            s.header_ns = header_stamp_ns(pc->header.stamp);
+            s.range = glim_ros::luminar_timestamp_range(*pc);
+          } catch (const std::exception&) {
+            // Malformed message: still consumes an ordinal (invalid range);
+            // the streaming pass reports the deserialization failure itself.
+          }
+          if (msg->topic_name == points_topic) {
+            primary_index.push_back(s);
+          } else {
+            for (size_t i = 0; i < aux_sensors.size(); ++i) {
+              if (msg->topic_name == aux_sensors[i].topic) {
+                aux_index[i].push_back(s);
+                break;
+              }
+            }
+          }
+        }
+      } catch (const std::exception& e) {
+        spdlog::error("two-pass join: failed to index {}: {}", bag_filename, e.what());
+        index_ok = false;
+      }
+      if (!index_ok) {
+        break;
+      }
+    }
+
+    size_t primary_valid = 0;
+    for (const auto& s : primary_index) {
+      if (s.range.valid) ++primary_valid;
+    }
+    if (!index_ok || primary_index.empty() || primary_valid * 10 < primary_index.size() * 9) {
+      spdlog::warn(
+        "two-pass join disabled: {}/{} primary scans carry absolute point times; "
+        "falling back to the streaming future-sweep wait",
+        primary_valid, primary_index.size());
+    } else {
+      planned_aux_ordinals.assign(aux_sensors.size(), {});
+      planned_aux_store.assign(aux_sensors.size(), {});
+      aux_ordinal_next.assign(aux_sensors.size(), 0);
+      // Loud duplicate-header diagnostic: ordinals make duplicates harmless
+      // for identity, but duplicated/zero primary header stamps usually mean a
+      // recorder or driver fault worth surfacing.
+      {
+        std::unordered_set<uint64_t> seen;
+        uint64_t dup = 0, zero = 0;
+        for (const auto& s : primary_index) {
+          if (s.header_ns == 0) ++zero;
+          else if (!seen.insert(s.header_ns).second) ++dup;
+        }
+        if (dup > 0 || zero > 0) {
+          spdlog::warn(
+            "two-pass join: primary topic has {} duplicate and {} zero header "
+            "stamp(s); plan identity uses bag-record ordinals so matching is "
+            "unaffected, but the recording should be investigated",
+            dup, zero);
+        }
+      }
+      // Per-aux candidates sorted by point-clock-corrected range start for
+      // binary search. Only sweeps with a valid absolute range participate;
+      // each carries its per-topic ordinal (= position in aux_index).
+      struct AuxCandidate {
+        uint64_t shifted_min_ns = 0;
+        glim_ros::LuminarTimestampRangeNs shifted;
+        uint64_t ordinal = 0;
+        double header_s = 0.0;
+        double bag_time_s = 0.0;
+      };
+      std::vector<std::vector<AuxCandidate>> aux_candidates(aux_sensors.size());
+      for (size_t i = 0; i < aux_sensors.size(); ++i) {
+        aux_candidates[i].reserve(aux_index[i].size());
+        for (size_t k = 0; k < aux_index[i].size(); ++k) {
+          const auto& s = aux_index[i][k];
+          if (!s.range.valid) continue;
+          AuxCandidate c;
+          c.shifted = glim_ros::shifted_range(s.range, aux_sensors[i].point_time_offset);
+          c.shifted_min_ns = c.shifted.min_ns;
+          c.ordinal = k;
+          c.header_s = static_cast<double>(s.header_ns) * 1e-9;
+          c.bag_time_s = s.bag_time_s;
+          aux_candidates[i].push_back(c);
+        }
+        std::sort(aux_candidates[i].begin(), aux_candidates[i].end(),
+                  [](const AuxCandidate& a, const AuxCandidate& b) {
+                    return a.shifted_min_ns < b.shifted_min_ns;
+                  });
+      }
+
+      std::vector<uint64_t> planned_matched(aux_sensors.size(), 0);
+      std::vector<uint64_t> planned_no_candidate(aux_sensors.size(), 0);
+      std::vector<uint64_t> planned_exceeds_gate(aux_sensors.size(), 0);
+      std::vector<uint64_t> planned_reserved(aux_sensors.size(), 0);
+      std::vector<uint64_t> planned_no_absolute_time(aux_sensors.size(), 0);
+      uint64_t planned_primary_invalid = 0;
+      uint64_t planned_full = 0;
+      // An aux topic with messages but ZERO valid absolute point-time ranges
+      // (non-UINT8[8] layout or big-endian payload) cannot participate in the
+      // point-time plan at all; say so once instead of per-primary noise.
+      for (size_t i = 0; i < aux_sensors.size(); ++i) {
+        if (aux_candidates[i].empty() && !aux_index[i].empty()) {
+          spdlog::warn(
+            "two-pass join: aux topic {} has {} message(s) but none carry a "
+            "decodable absolute UINT8[8] point-time range — it cannot merge "
+            "under a Luminar primary (the byte-append merge also requires an "
+            "identical schema, so header matching is not a usable fallback); "
+            "normalize the sensor layout upstream",
+            aux_sensors[i].topic, aux_index[i].size());
+        }
+      }
+
+      merge_plan.reserve(primary_index.size());
+      for (size_t p_ord = 0; p_ord < primary_index.size(); ++p_ord) {
+        const auto& p = primary_index[p_ord];
+        PlannedMerge plan;
+        plan.aux.resize(aux_sensors.size());
+        if (!p.range.valid) {
+          ++planned_primary_invalid;
+          for (auto& pa : plan.aux) pa.miss_reason = "primary_range_invalid";
+          merge_plan.emplace(p_ord, std::move(plan));
+          continue;
+        }
+        const double primary_header_s = static_cast<double>(p.header_ns) * 1e-9;
+        size_t selected_count = 0;
+        for (size_t i = 0; i < aux_sensors.size(); ++i) {
+          auto& pa = plan.aux[i];
+          const auto& cands = aux_candidates[i];
+          if (cands.empty()) {
+            pa.miss_reason = aux_index[i].empty() ? "no_candidate" : "no_absolute_time";
+            if (aux_index[i].empty()) {
+              ++planned_no_candidate[i];
+            } else {
+              ++planned_no_absolute_time[i];
+            }
+            continue;
+          }
+          // Endpoint-range error is minimized in a small neighborhood of the
+          // range-start lower bound; header time is only the tie-break.
+          // An aux sweep is reserved by AT MOST ONE primary: without the
+          // reservation, a duplicated primary could plan the same sweep twice,
+          // the streaming pass would consume/erase it once, and the second
+          // primary would stall to its safety slack and merge incomplete
+          // despite a "matched" plan. Select the best in-gate UNRESERVED
+          // candidate; sweeps are ~50 ms apart with a 10 ms gate, so at most
+          // one candidate is in-gate and a reserved hit means front-only.
+          auto lb = std::lower_bound(
+            cands.begin(), cands.end(), p.range.min_ns,
+            [](const AuxCandidate& c, uint64_t v) { return c.shifted_min_ns < v; });
+          size_t lo = (lb - cands.begin() >= 3) ? (lb - cands.begin() - 3) : 0;
+          size_t hi = std::min(cands.size(), static_cast<size_t>(lb - cands.begin()) + 3);
+          const AuxCandidate* best = nullptr;
+          double best_delta = std::numeric_limits<double>::infinity();
+          double best_header = std::numeric_limits<double>::infinity();
+          bool in_gate_reserved = false;
+          for (size_t k = lo; k < hi; ++k) {
+            const double delta = glim_ros::endpoint_delta_seconds(p.range, cands[k].shifted);
+            if (planned_aux_ordinals[i].count(cands[k].ordinal)) {
+              if (delta <= concat_config.luminar_time_threshold) {
+                in_gate_reserved = true;
+              }
+              continue;  // reserved by an earlier primary
+            }
+            const double header_abs = std::abs(
+              cands[k].header_s + aux_sensors[i].match_time_offset - primary_header_s);
+            if (delta < best_delta ||
+                (delta == best_delta && header_abs < best_header)) {
+              best = &cands[k];
+              best_delta = delta;
+              best_header = header_abs;
+            }
+          }
+          if (best && best_delta <= concat_config.luminar_time_threshold) {
+            pa.selected = true;
+            pa.aux_ordinal = best->ordinal;
+            pa.aux_bag_time_s = best->bag_time_s;
+            plan.ready_bag_time_s = std::max(plan.ready_bag_time_s, best->bag_time_s);
+            planned_aux_ordinals[i].insert(best->ordinal);
+            ++planned_matched[i];
+            ++selected_count;
+          } else if (in_gate_reserved) {
+            pa.miss_reason = "candidate_reserved";
+            ++planned_reserved[i];
+          } else {
+            pa.miss_reason = "exceeds_gate";
+            ++planned_exceeds_gate[i];
+          }
+        }
+        if (selected_count == aux_sensors.size()) ++planned_full;
+        merge_plan.emplace(p_ord, std::move(plan));
+      }
+
+      two_pass_active = true;
+      spdlog::info(
+        "two-pass join plan: {} primaries ({} without absolute point times), "
+        "full {}-aux merges planned for {} ({:.1f}%)",
+        primary_index.size(), planned_primary_invalid, aux_sensors.size(), planned_full,
+        primary_index.empty() ? 0.0 : 100.0 * planned_full / primary_index.size());
+      for (size_t i = 0; i < aux_sensors.size(); ++i) {
+        spdlog::info(
+          "two-pass join plan [{}]: matched={} no_candidate={} exceeds_gate={} "
+          "candidate_reserved={} no_absolute_time={} "
+          "(gate {:.3f}s, header only tie-break, one primary per sweep)",
+          aux_sensors[i].topic, planned_matched[i], planned_no_candidate[i],
+          planned_exceeds_gate[i], planned_reserved[i], planned_no_absolute_time[i],
+          concat_config.luminar_time_threshold);
+        if (planned_reserved[i] > 0) {
+          spdlog::warn(
+            "two-pass join: {} primary scan(s) lost the in-gate {} sweep to an "
+            "earlier primary (candidate_reserved) — usually duplicated primary "
+            "messages in the recording; those primaries merge without this aux "
+            "immediately instead of stalling",
+            planned_reserved[i], aux_sensors[i].topic);
+        }
+      }
+    }
+  }
+
   // Read all rosbags
   bool auto_quit = false;
   glim->declare_parameter<bool>("auto_quit", auto_quit);
@@ -508,6 +1004,31 @@ int main(int argc, char** argv) {
     if (!read_bag(bag_filename)) {
       auto_quit = true;
       break;
+    }
+  }
+
+  if (!pending_primary_scans.empty()) {
+    spdlog::info(
+      "lidar_concat: flushing {} queued primary scan(s) at end of input",
+      pending_primary_scans.size());
+    if (!drain_pending_primaries(true)) {
+      auto_quit = true;
+    }
+  }
+
+  if (concat_enabled && !aux_sensors.empty()) {
+    spdlog::info(
+      "lidar_concat primary accounting: received={} forwarded={} strict_skipped={} "
+      "imu_skipped={} timed_release={} no_plan={} released_incomplete={} still_pending={}",
+      primary_received, primary_forwarded, primary_strict_skipped,
+      primary_imu_skipped, primary_timed_release, primary_no_plan,
+      primary_released_incomplete, pending_primary_scans.size());
+    if (primary_received != primary_forwarded + primary_strict_skipped +
+                              primary_imu_skipped + pending_primary_scans.size()) {
+      spdlog::error(
+        "lidar_concat primary accounting MISMATCH: a primary scan was lost on an "
+        "unaccounted path — this violates the never-drop-front contract");
+      g_bag_hard_error = true;
     }
   }
 

@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -541,7 +542,7 @@ int main(int argc, char** argv) {
           if (topic_type == "sensor_msgs/msg/PointCloud2") {
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             pc2_ser.deserialize_message(&serialized_msg, aux_msg.get());
-            aux.buffer.push_back(aux_msg);
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
           } else {
             spdlog::error("topic_type mismatch on aux topic {}: {} (expected PointCloud2)", topic_name, topic_type);
@@ -635,6 +636,90 @@ int main(int argc, char** argv) {
   // the actual vehicle stack) those messages would pre-empt the bag-sourced
   // samples and corrupt TimeKeeper state with future timestamps.
 
+  // Future-aware queued-primary release (parity with glim_rosbag's streaming
+  // fallback). One-pass dispatch previously merged a primary immediately, so
+  // the point-coherent right sweep — later in stream time by its +66..92 ms
+  // acquisition phase — was never in the buffer yet: raw-PCAP mapping missed
+  // valid merges and, with require_all_aux, skipped front scans. The two-pass
+  // bag index is not applicable here because LiDAR originates from PCAP
+  // assembly, so primaries are queued and released when every aux has a
+  // point-coherent match/watermark, bounded by future_sweep_wait_timeout of
+  // STREAM time (the heap already merges pcap+bag events in time order).
+  // A primary is never dropped by this queue; strict-mode skips remain the
+  // explicit merge_clouds policy.
+  struct PendingPrimaryScan {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
+    double enqueue_stream_time_s = 0.0;
+  };
+  std::deque<PendingPrimaryScan> pending_primary_scans;
+  double latest_stream_time_s = 0.0;
+  uint64_t primary_received = 0;        // primaries enqueued (concat path)
+  uint64_t primary_forwarded = 0;       // merged clouds ingested by GLIM
+  uint64_t primary_strict_skipped = 0;  // merge_clouds nullptr (require_all_aux)
+  uint64_t primary_imu_skipped = 0;     // released but rejected by GLIM ingestion
+  uint64_t primary_timed_release = 0;   // released by the stream-time bound
+  bool end_time_reached = false;
+  const auto drain_pending_primaries = [&](bool force) -> bool {
+    while (!pending_primary_scans.empty()) {
+      const auto& pending = pending_primary_scans.front();
+      const auto& primary = pending.msg;
+      if (!force && !glim_ros::aux_buffers_ready_for_primary(
+                      *primary, aux_sensors,
+                      concat_config.luminar_time_threshold)) {
+        if (latest_stream_time_s - pending.enqueue_stream_time_s <
+            concat_config.future_sweep_wait_timeout) {
+          break;  // still inside the wait window; keep primary order
+        }
+        ++primary_timed_release;
+        if (primary_timed_release <= 10 || primary_timed_release % 100 == 0) {
+          spdlog::warn(
+            "lidar_concat: releasing primary (stamp={:.6f}) after {:.3f}s stream-time "
+            "wait without a point-coherent match/watermark for every aux; merging "
+            "with whichever aux aligned ({} timed release(s) so far)",
+            glim_ros::stamp_to_sec(primary->header.stamp),
+            concat_config.future_sweep_wait_timeout, primary_timed_release);
+        }
+      }
+
+      const int epoch_anchor_count =
+        static_cast<int>(primary->width * primary->height);
+      const auto final_points = glim_ros::merge_clouds(
+        primary, aux_sensors, concat_time_threshold,
+        concat_config.require_all_aux,
+        concat_config.max_consecutive_aux_merge_failures,
+        &concat_config.consecutive_merge_failures,
+        concat_config.abort_on_merge_failure,
+        concat_config.frame_diag_log,
+        concat_config.luminar_time_threshold);
+      const double primary_header_s =
+        glim_ros::stamp_to_sec(primary->header.stamp);
+      pending_primary_scans.pop_front();
+
+      size_t workload = 0;
+      if (final_points) {
+        bool ingested = false;
+        workload = glim->points_callback(final_points, epoch_anchor_count, &ingested);
+        if (ingested) {
+          ++primary_forwarded;
+        } else {
+          ++primary_imu_skipped;
+        }
+      } else {
+        ++primary_strict_skipped;
+      }
+      if (primary_header_s > end_time) {
+        spdlog::info("end_time reached");
+        end_time_reached = true;
+        return false;
+      }
+      if (workload > 5) {
+        const size_t sleep_ms = (workload - 4) * 5;
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+      }
+    }
+    return true;
+  };
+
   bool stop = false;
   while (!stop && rclcpp::ok()) {
     if (heap.empty()) break;
@@ -683,41 +768,35 @@ int main(int argc, char** argv) {
     }
 
     // Dispatch.
+    latest_stream_time_s = static_cast<double>(ev.t_ns) / 1e9;
     if (ev.source == Event::Source::PCAP_SCAN) {
       AssembledScan& s = ev.scan;
       if (s.topic == primary_points_topic) {
-        sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
-        int epoch_anchor_count = -1;
-        if (concat_enabled && !aux_sensors.empty()) {
-          // Anchor the epoch rebase on the primary scan (its points lead the
-          // merged cloud) so a multi-LiDAR sweep is not shifted late when an aux
-          // scan started before the primary.
-          epoch_anchor_count = static_cast<int>(s.cloud->width * s.cloud->height);
-          final_points = glim_ros::merge_clouds(s.cloud, aux_sensors, concat_time_threshold,
-                                                concat_config.require_all_aux, concat_config.max_consecutive_aux_merge_failures,
-                                                &concat_config.consecutive_merge_failures, concat_config.abort_on_merge_failure,
-                                                concat_config.frame_diag_log);
-        }
-        // nullptr = strict merge skipped this scan (require_all_aux); drop it.
-        size_t workload = 0;
-        if (final_points) {
-          workload = glim->points_callback(final_points, epoch_anchor_count);
-        }
         cnt_pcap_primary++;
         total_pcap_primary++;
-        if (s.cloud->header.stamp.sec + s.cloud->header.stamp.nanosec * 1e-9 > end_time) {
-          spdlog::info("end_time reached");
-          stop = true;
-          break;
-        }
-        if (workload > 5) {
-          const size_t sleep_ms = (workload - 4) * 5;
-          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        if (concat_enabled && !aux_sensors.empty()) {
+          // Queue for the future-aware release (drained once per event below):
+          // the point-coherent aux sweep can be later in stream time than the
+          // primary, so merging at dispatch would systematically miss it.
+          pending_primary_scans.push_back(
+            {s.cloud, static_cast<double>(ev.t_ns) / 1e9});
+          ++primary_received;
+        } else {
+          const size_t workload = glim->points_callback(s.cloud);
+          if (s.cloud->header.stamp.sec + s.cloud->header.stamp.nanosec * 1e-9 > end_time) {
+            spdlog::info("end_time reached");
+            stop = true;
+            break;
+          }
+          if (workload > 5) {
+            const size_t sleep_ms = (workload - 4) * 5;
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+          }
         }
       } else if (aux_topic_set.count(s.topic)) {
         for (auto& aux : aux_sensors) {
           if (aux.topic == s.topic) {
-            aux.buffer.push_back(s.cloud);
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(s.cloud));
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
             break;
           }
@@ -726,6 +805,16 @@ int main(int argc, char** argv) {
       }
     } else {
       bag_dispatch_fanout(ev);
+    }
+
+    // Drain once per event, not only on primary/aux arrivals: every event
+    // (IMU in particular) advances stream time, so the timed release fires
+    // promptly even when an aux stream has died completely.
+    if (concat_enabled && !aux_sensors.empty() && !pending_primary_scans.empty()) {
+      if (!drain_pending_primaries(false)) {
+        stop = true;
+        break;
+      }
     }
 
     maybe_log_counters(ev.t_ns);
@@ -749,6 +838,29 @@ int main(int argc, char** argv) {
   // a future change had made it reachable it would have silently discarded
   // auxiliary scans. Dispatch logic lives in exactly one place (the main
   // loop) by design now.
+
+  // Flush primaries still pending in the future-aware queue (end of input:
+  // no aligned aux can arrive anymore; merge whatever is buffered).
+  if (concat_enabled && !aux_sensors.empty() && !pending_primary_scans.empty() &&
+      !end_time_reached && rclcpp::ok()) {
+    spdlog::info("lidar_concat: flushing {} queued primary scan(s) at end of input",
+                 pending_primary_scans.size());
+    drain_pending_primaries(true);
+  }
+  if (concat_enabled && !aux_sensors.empty()) {
+    spdlog::info(
+      "lidar_concat primary accounting: received={} forwarded={} strict_skipped={} "
+      "imu_skipped={} timed_release={} still_pending={}",
+      primary_received, primary_forwarded, primary_strict_skipped,
+      primary_imu_skipped, primary_timed_release, pending_primary_scans.size());
+    if (primary_received != primary_forwarded + primary_strict_skipped +
+                              primary_imu_skipped + pending_primary_scans.size()) {
+      spdlog::error(
+        "lidar_concat primary accounting MISMATCH: a primary scan was lost on an "
+        "unaccounted path — this violates the never-drop-front contract");
+      hard_error = true;
+    }
+  }
 
   // [P2 FIX 2026-07-09, moved 2026-07-09b] Zero dispatched primary scans =
   // the pcap did not overlap the bag (wrong-session file, clock skew

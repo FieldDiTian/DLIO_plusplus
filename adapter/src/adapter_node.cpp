@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,25 @@ public:
     imu_p1_sidecar_path_ = declare_parameter("imu_p1_sidecar_path", "");
     imu_p1_sidecar_match_tolerance_sec_ =
       declare_parameter("imu_p1_sidecar_match_tolerance_sec", 0.02);
+
+    // [P3 HARDENING 2026-07-14] Timing parameters must be finite and positive.
+    // The defaults are safe, but a bad override (NaN, 0, negative) silently
+    // degrades retiming: a nonpositive nominal period breaks synthesized
+    // spacing, a zero flush timeout strands the arrival-retime queue, a
+    // nonpositive P1 threshold reclassifies every stamp, and a nonpositive
+    // sidecar tolerance drops every sidecar match. Fail loud at startup.
+    const auto require_positive_finite = [this](const char* name, double v) {
+      if (!std::isfinite(v) || v <= 0.0) {
+        RCLCPP_FATAL(get_logger(), "%s = %g is invalid (must be finite and > 0); refusing to start",
+                     name, v);
+        throw std::runtime_error(std::string(name) + ": invalid timing parameter");
+      }
+    };
+    require_positive_finite("nominal_imu_period_sec", nominal_imu_period_sec_);
+    require_positive_finite("imu_flush_timeout_sec", imu_flush_timeout_sec_);
+    require_positive_finite("p1_like_threshold_sec", p1_like_threshold_sec_);
+    require_positive_finite("imu_p1_sidecar_match_tolerance_sec",
+                            imu_p1_sidecar_match_tolerance_sec_);
 
     if (!imu_p1_sidecar_path_.empty()) {
       loadImuP1Sidecar(imu_p1_sidecar_path_);
@@ -140,7 +160,19 @@ public:
         << " odom_out=" << odom_out_count_
         << " rtk_out=" << rtk_out_count_
         << " imu_in=" << imu_in_count_
-        << " imu_out=" << imu_out_count_;
+        << " imu_out=" << imu_out_count_
+        // Drop counters are ALWAYS reported (P3 hardening): equal in/out
+        // counts alone can hide loss — a run report must be able to prove
+        // pose_dropped_invalid == sidecar_miss_drop == imu_dropped_not_ready
+        // == 0 rather than infer it.
+        << " pose_dropped_invalid=" << pose_dropped_invalid_count_
+        << " imu_sidecar_miss_drop=" << sidecar_miss_drop_count_
+        << " imu_dropped_clock_not_ready=" << p1_imu_dropped_not_ready_count_
+        // [P3 AUDIT 2026-07-14] P1->ROS clock mapping evidence: run reports
+        // must be able to verify the retiming contract (mapper became ready,
+        // and the offset drift over the run stayed sane) end-to-end.
+        << " p1_clock_ready=" << (clock_mapper_.ready() ? 1 : 0)
+        << " p1_clock_drift_ms=" << clock_mapper_.driftMs();
     if (!imu_p1_sidecar_.empty()) {
       out << " imu_p1_sidecar_match=" << imu_p1_sidecar_match_count_
           << " imu_p1_sidecar_miss=" << imu_p1_sidecar_miss_count_

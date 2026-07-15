@@ -40,6 +40,8 @@ Behavior at startup:
     during the mapping session.
 """
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
@@ -95,10 +97,14 @@ class RtkFixedOdomFilter(Node):
         cov_yy = msg.pose.covariance[7]
         cov_zz = msg.pose.covariance[14]
 
+        # [P3 FIX 2026-07-14] Parity with the C++ adapter gate: covariance must
+        # be FINITE and NONNEGATIVE before the threshold comparison. A plain
+        # `<= threshold` accepts negative (unpopulated/garbage) covariance and
+        # NaN handling would silently vary — fail closed instead.
         is_fixed = (
-            cov_xx <= self.max_var_xy and
-            cov_yy <= self.max_var_xy and
-            cov_zz <= self.max_var_z
+            math.isfinite(cov_xx) and cov_xx >= 0.0 and cov_xx <= self.max_var_xy and
+            math.isfinite(cov_yy) and cov_yy >= 0.0 and cov_yy <= self.max_var_xy and
+            math.isfinite(cov_zz) and cov_zz >= 0.0 and cov_zz <= self.max_var_z
         )
 
         if is_fixed:

@@ -381,7 +381,7 @@ void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr
     return;
   }
   auto& aux = aux_concat.aux_sensors[aux_index];
-  aux.buffer.push_back(msg);
+  aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg));
   while (aux.buffer.size() > aux.buffer_size) {
     aux.buffer.pop_front();
   }
@@ -406,7 +406,8 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
       merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold,
                                       aux_concat.require_all_aux, aux_concat.max_consecutive_aux_merge_failures,
                                       &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure,
-                                      aux_concat.frame_diag_log);
+                                      aux_concat.frame_diag_log,
+                                      aux_concat.luminar_time_threshold);
     }
     // nullptr = strict merge skipped this scan (require_all_aux); drop it.
     if (!merged) {
@@ -418,8 +419,11 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
   }
 }
 
-size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count) {
+size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count, bool* ingested) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+  if (ingested) {
+    *ingested = false;
+  }
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
@@ -451,6 +455,9 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
   odometry_estimation->insert_frame(preprocessed);
+  if (ingested) {
+    *ingested = true;
+  }
 
   // Throttle offline bag playback on the SLOWEST stage, not just odometry.
   // glim_rosbag uses this return value to pace playback; reporting only the
