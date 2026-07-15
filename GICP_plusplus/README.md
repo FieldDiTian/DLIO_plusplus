@@ -13,26 +13,26 @@ GICP is the online-localization stage of a four-stage pipeline:
 
 ```
 adapter (Atlas WGS84 → local-ENU, publishes /gps_p1/*)
-   → scripts/prep_bag.py (normalized bag)
-      → GLIM (offline map, PCD)
+   → scripts/prep_bag.py (normalized bag + GLIM dump by default)
+      → scripts/export_glim_dump_to_pcd.py (ENU PCD + manifest)
          → gicp_plusplus (online localize)
 ```
 
 The `adapter` package converts raw Atlas WGS84 fixes into a fixed local-ENU
 datum (Putnam origin from the `race_metadata` TTL) and republishes `/gps_p1/*`
-(including the ENU-framed seed `/gps_p1/filtered_odom`). `scripts/prep_bag.py`
-produces a normalized bag. GICP consumes the GLIM-built PCD map plus that
-ENU-framed seed. GICP is **frame-agnostic**: it localizes the scan against the
-PCD map and reports the pose in whatever frame the map is in — with the adapter,
-that frame is local ENU. See the `adapter` package and `scripts/prep_bag.py` for
-how the map inputs and the seed are produced.
+(including the ENU-framed seed `/gps_p1/filtered_odom`). By default,
+`scripts/prep_bag.py` produces the normalized bag **and** a GLIM dump; export
+that dump with `scripts/export_glim_dump_to_pcd.py` before launching GICP++.
+GICP is **frame-agnostic**: it localizes the scan against the PCD map and reports
+the pose in whatever frame the map is in — with this pipeline, that frame is
+local ENU.
 
 ## Features
 
 - **small_gicp GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
 - **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged). Luminar sweeps are matched by **absolute per-point time** (endpoint-range error ≤ 10 ms; header time only as tie-break — headers carry 66–92 ms acquisition phase on AV-24 while point clocks agree to <1 ms), transformed via offline-resolved extrinsics, and byte-appended onto the primary. An **asynchronous front/aux synchronizer** (see below) decouples waiting for the point-aligned right sweep from the subscription callback, so aux timing can never cost front scans. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
-- **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates; see `docs/action_plan_turn_error_20260704.md` for the evidence):
+- **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates):
   - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
   - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
   - **Degeneracy partial update** (`gicp/degeneracy/*`): when the hessian condition proxy trips `hessianCondMax`, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (full-6D by default — coupled rot/trans null directions included) and the IMU prior is kept along degenerate axes. Accepted-with-projection logs `status=ok_partial`; wholesale `rejected_hessian` remains only for the all-axes-degenerate case. Legacy binary gate available via `degeneracy/partialUpdate: false`.
@@ -43,8 +43,8 @@ how the map inputs and the seed are produced.
 - **GT-driven pose recovery**: when GICP fails for N consecutive scans (default 5), snap pose+twist to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Twist sources resolve independently (P2): angular rate backfills from the live bias-corrected gyro and linear velocity from GT pose finite-differencing when the odom twist is unpopulated — never zeroing a moving vehicle. Falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
 - **Local-ENU output** (operational contract): the primary `map_frame` pose / odom / path are already in the map's frame, which — with the adapter — is a fixed local-ENU datum (Putnam origin from the `race_metadata` TTL). GICP itself is frame-agnostic and simply reports the pose in the map's frame.
-- **UTM-frame output** (optional legacy layer): only active if `localization/utm_transform_path` is set; when provided, publish pose / odom / path in `utm` frame alongside `map`. Not the default.
-- **RViz visualization** of map, aligned scan, pose, debug clouds and markers.
+- **UTM-frame output** (legacy layer, manifest-less world-frame maps ONLY): when `localization/utm_transform_path` is set, publish pose / odom / path in `utm` frame alongside `map`. With an ENU-manifest map (the exporter's default output) the node **fatally refuses to start** if this path is set — leave it empty.
+- **RViz visualization** of map, pose, and debug pose markers.
 
 ## Dependencies
 
@@ -73,9 +73,13 @@ source install/setup.bash
 
 The single supported launch file is `localization_with_tf.launch.py`. It starts the localization node alongside `robot_state_publisher` (which publishes the URDF transforms the node depends on for sensor extrinsics).
 
+`map_path` is **required** — the yaml `localization/map_path` default points at an
+external, untracked map, so pass the ENU PCD you exported from the GLIM dump:
+
 ```bash
 ros2 launch gicp_plusplus localization_with_tf.launch.py \
     rviz:=true \
+    map_path:=/path/to/track_map.pcd \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_p1/imu \
     gt_odom_topic:=/gps_p1/filtered_odom
@@ -88,11 +92,11 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
 | `rviz` | `false` | Launch RViz with the bundled config. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
 | `imu_topic` | `/gps_p1/imu` | Point One Atlas `imu_calibrated` (sensor-calibrated, gravity present, 99 Hz, frame `gps_antenna_top`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
-| `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
+| `odom_topic` | `/odom` | Declared and remapped by the launch but currently **unused** — the node creates no `odom` subscription; `use_odom_init` seeds from the first `gt_odom` message instead. |
 | `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
 | `urdf_path` | (auto-found) | Path to the URDF (`av24.urdf`) used for offline extrinsic resolution. The launch resolves it by walking up from the launch dir; `av24.urdf` is also installed into `share/gicp_plusplus`. |
-| `parent_frame` / `child_frame` | `base_link` / `luminar_front` | Used by the bundled static-TF helper. |
+| `parent_frame` / `child_frame` | `base_link` / `luminar_front` | `child_frame` overrides `localization/lidar_frame` (the LiDAR link the node resolves extrinsics for); `parent_frame` is declared but currently unused (no static-TF helper is launched — `robot_state_publisher` provides the URDF tree). |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
 
 ### Frame conventions (all-P1 single-source design)
@@ -105,7 +109,7 @@ Every comparison the node performs lives at the Atlas antenna phase centre (URDF
 
 Because base_frame, imu_frame, and the gt_odom source all align, the in-code TF lookups in `callbackImu` (`baselink2imu_T`) and `callbackGtOdom` (`T_base_gtbody_`) degenerate to identity. No lever-arm work happens anywhere; the cross-check `gt_pos_err_m` is exact (no constant baseline bias); `applyInitialPose` correctly seeds the state; the snap helper composes a no-op identity TF.
 
-This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is the localized pose lives at the antenna point rather than the controller-expected `cg` (downstream consumers need an extra `gps_antenna_top → cg` TF lookup, which `robot_state_publisher` already provides). See `docs/GICP_GNSS_IMU_bug_report.pdf` for the architectural alternatives and their trade-offs.
+This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is that the localized pose lives at the antenna point rather than the controller-expected `cg`; downstream consumers must apply the `gps_antenna_top → cg` URDF transform that `robot_state_publisher` provides.
 
 ### RTK quality gate — consumer-side, with snap-recovery exemption
 
@@ -130,7 +134,7 @@ localization/rtk_gate/max_pose_var_z:   1.0    # m^2 (~1.0 m vertical std)
 | Consumer | Requires FIXED? | Why |
 |---|---|---|
 | **`tryRtkCalibrationStep`** — RTK-driven IMU bias calibration at startup | ✓ Yes | Needs cm-level truth to estimate gyro/accel bias residuals. If only degraded samples are available the init machine times out and falls back to stationary calibration. |
-| **INS heading prior** (`applyInsHeadingPriorToBasePose`, when `ins_prior/require_rtk` is set) | ✓ Yes | The prior rotates the GICP seed toward the INS heading; a degraded-heading sample would inject the very yaw error the prior exists to remove. |
+| **INS heading prior** (`applyInsHeadingPriorToBasePose`, when `ins_prior/require_rtk_fixed` is set) | ✓ Yes | The prior rotates the GICP seed toward the INS heading; a degraded-heading sample would inject the very yaw error the prior exists to remove. |
 | **Scan cross-check** — diagnostic `gt_pos_err_m` published on every accepted scan | ✓ Yes | A diagnostic comparing GICP against a sub-cm reference is only meaningful when the reference IS sub-cm. |
 | **`maybeSnapPoseToGT`** — recovery after GICP loses LiDAR features | ✗ **No — accepts any sample** | When GICP can't match the LiDAR scan, the next-best truth is Atlas's pose at whatever quality it currently has — not our own software IMU dead-reckoning. See the next subsection. |
 | **`applyInitialPose` (use_odom_init)** | ✗ No | Falls back to whatever Atlas reports at startup; if RTK FIXED is required for init, set `localization/rtk_init/enable: true` (default) which gates through `tryRtkCalibrationStep`. |
@@ -167,8 +171,8 @@ So the policy is: **when GICP cannot match the scan, snap to Atlas's pose at wha
 
 Operator-facing log lines:
 
-- `snap fired: GT covariance was [cov_xx=… cov_yy=… cov_zz=…] (FIXED|degraded) — snapped state to gt at t=…` — appears every time the snap fires; the quality label tells you whether Atlas was RTK-FIXED at that moment.
-- `IMU dead-reckoning fallback: no GT sample within max_dt of scan stamp` — only when even Atlas isn't publishing (true GNSS-denied + INS publication gap).
+- `GT recovery: delta-form snap — correction |t|=… m |rot|=… deg applied to the LIVE observer state…` followed by `Localization: ⟳ snapped pose to GT (… after N consecutive non-accepts) — pose=… v=… ω=… | gt_body=…` — appears every time the snap fires (the snap logs the applied pose/twist; it does not report GT covariance — snap intentionally accepts any-quality Atlas samples).
+- `GT recovery: deferring snap — no GT sample within max_dt=…s of scan stamp … (streak=N)` — only when even Atlas isn't publishing (true GNSS-denied + INS publication gap); each non-accepted scan also logs `Localization: ⚠ GICP … — holding IMU dead-reckoning pose …`.
 
 In normal operation on a well-mapped track you should rarely see either: GICP scan-match converges on every scan and `consecutive_failures_` resets to 0. The snap path exists for the edge case where LiDAR briefly cannot disambiguate the local map.
 
@@ -285,10 +289,9 @@ well-constrained directions (the IMU prior holds the degenerate ones) —
 253-frame dead-reckoning streaks on cross-run replays; wholesale
 `rejected_hessian` now fires only when all six axes are degenerate. The
 fitness-ratio gate catches the opposite failure (wrong-basin matches accepted
-with good-looking fitness). Rationale, measurements, and thresholds:
-`docs/action_plan_turn_error_20260704.md`; score any replay with
-`scripts/analyze_scan_debug_log.py` (it also suggests re-baselined ratio
-thresholds per map).
+with good-looking fitness). Score a replay with
+`scripts/analyze_scan_debug_log.py`; it reports the accepted-fitness baseline
+and suggests ratio thresholds for the map under test.
 
 ### Multi-LiDAR concatenation
 
@@ -342,7 +345,10 @@ exceed the 20 Hz front period and silently shed front clouds at the QoS layer
   front's window), or at its `future_aux_wait_timeout_s` deadline — merging
   whatever matched. Fronts release in arrival (FIFO) order.
 - **Aux state can never drop a front.** The only front drops are: invalid
-  primary data (`front_invalid`), explicit shutdown accounting, and the
+  primary data (`front_invalid`), explicit shutdown accounting, the
+  coordinated epoch-reset queue purge (`front_epoch_dropped` — queued fronts
+  from before a detected timestamp/session reset are discarded with
+  accounting), and the
   **compute-overload policy** — `primary_queue_size` is a hard bound and
   overflow drops the OLDEST queued front with an ERROR log and the
   `front_overload_dropped` counter (bounded latency/memory instead of a
@@ -350,21 +356,25 @@ exceed the 20 Hz front period and silently shed front clouds at the QoS layer
   the solver, not the queue, needs fixing (VGICP/decimation).
 - **Conservation invariant**, checked in the end-of-run summary:
   `front_received == front_released + front_invalid + front_shutdown_unprocessed
-  + front_overload_dropped`. Violation logs an ERROR.
+  + front_overload_dropped + front_epoch_dropped`. (`front_epoch_dropped` counts
+  fronts discarded when a coordinated epoch reset clears the queue on a
+  timestamp/session reset.) Violation logs an ERROR.
 - **Teardown drains, not abandons**: a pre-shutdown callback runs the drain
   while the ROS context is still valid (Ctrl-C and the bag-EOS SIGTERM path),
   so the run tail is processed in order. A pipeline exception on the worker
   (e.g. strict-merge abort) becomes a controlled shutdown and a **nonzero
   exit code** — never `std::terminate`.
 - Per-frame telemetry: `debug/front_release_reason`
-  (0=all_matched 1=watermark 2=timeout 4=shutdown_drain, −1=legacy path),
+  (0=all_matched 1=watermark 2=timeout 4=shutdown_drain 5=primary_no_abstime, −1=legacy path),
   `debug/front_wait_ms`, `debug/primary_queue_depth`, alongside the existing
   `merged_aux_count` / `aux<i>_merge_dt_s` / `scan_time_span_s` records.
   Healthy replay: ~all `all_matched`, `front_wait_ms` ≈ 92 ms,
   `front_overload_dropped=0`, merged span ≈ 49 ms (never ≥ 100 ms).
 
-Full design rationale and validation matrix:
-`docs/online_front_aux_merge_strategy.md`.
+The operational acceptance checks are the conservation invariant above,
+`front_overload_dropped=0`, mostly `all_matched` releases, merged span below
+100 ms, and no systematic per-aux point-time mismatch. These checks are
+available directly from the end-of-run summary and `SCAN DEBUG` telemetry.
 
 **Offline extrinsic resolution (no live `/tf_static` needed).** Aux extrinsics
 are resolved offline, in priority order: URDF (`av24.urdf` via
@@ -467,9 +477,9 @@ correct negative offset.
 |---|---|---|
 | `localized_pose` (`gicp/localization/pose`) | `geometry_msgs/PoseStamped` | Localized pose (scan rate). |
 | `localized_odom` (`gicp/localization/odom`) | `nav_msgs/Odometry` | Localized odom propagated at IMU rate (~100 Hz). |
-| `localized_path` (`gicp/localization/path`) | `nav_msgs/Path` | Trajectory history. |
-| `gicp/localization/pose_utm` / `odom_utm` / `path_utm` | (same types) | Optional legacy UTM-frame mirrors, only when `utm_transform_path` is set (the primary `map`-frame outputs above are already local ENU with the adapter). |
-| `aligned_cloud` (`gicp/localization/aligned_cloud`) | `sensor_msgs/PointCloud2` | Aligned scan in `map`. |
+| `localized_path` (`gicp/localization/path`) | `nav_msgs/Path` | Trajectory history (requires `localization/debug/enable_pub: true`, the default). |
+| `gicp/localization/pose_utm` / `odom_utm` / `path_utm` | (same types) | Legacy UTM-frame mirrors, only when `utm_transform_path` is set — manifest-less world-frame maps only (fatal with an ENU-manifest map). |
+| `gicp/localization/gt_snap` | `geometry_msgs/PoseStamped` | Pose applied by each GT recovery snap (requires `debug/enable_pub`). |
 | `map` (`gicp/localization/map`) | `sensor_msgs/PointCloud2` | Downsampled visualization map. |
 | TF: `map → base_frame` | | Published when `publish_tf=true`. |
 
@@ -480,16 +490,18 @@ Per-scan scalar metrics on `gicp/localization/debug/*`:
 - `fitness`, `gicp_elapsed_ms`, `final_error`, `corr_norm`, `scan_dt`
 - `imu_age`, `imu_buffer_span_s`, `scan_to_latest_imu_lag_s`
 - `num_correspondences`, `correspondence_ratio`
-- `guess_to_solution_m`, `guess_to_solution_deg`
+- `guess_to_solution_trans_m`, `guess_to_solution_rot_deg`
 - `guess_from_last_m`, `guess_from_last_deg`
 - `jump_trans`, `jump_rot_deg` (raw GICP-vs-prior disagreement, pre-projection)
 - `hessian_condition_proxy`
 - **P1 gating**: `fitness_ratio` (−1 during warm-up without seed), `degen_rot_axes`, `degen_trans_axes`, `yaw_veto`
 - **P4 concat**: `merged_aux_count` (−1 = concat disabled), `aux<i>_merge_dt_s` (signed; NaN = not merged), `aux<i>_points`, `scan_time_span_s`
 - `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled; measured against the pose actually applied)
+- `yaw_innovation_deg`, `yaw_marginal_stiffness`, `ins_yaw_diff_deg` (yaw-gate / INS-prior calibration inputs)
+- `raw_points`, `preprocessed_points` (per-frame point counts)
 - `converged` (Bool)
 
-Plus pose / cloud topics: `initial_guess_pose`, `final_pose` (post-projection), `input_cloud_base`, `initial_guess_cloud`, `pose_markers`.
+Plus pose topics: `initial_guess_pose`, `final_pose` (post-projection), `pose_markers`.
 
 `enable_pub` and `verbose_scan_log` are **on by default** so every replay
 produces this evidence; score a run's `localization.log` with
@@ -506,7 +518,7 @@ coverage).
                                                 ↓
                                               GICP align (initial guess = T_prior)
                                                 ↓
-                            gate: fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump
+                            gate: support / fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump
                                 ┌─── accepted (ok | ok_partial) ─┴── rejected ──┐
                                 ↓                                                ↓
                           updateState (geo observer,                dead-reckon: lidarPose ← T_prior,
@@ -526,7 +538,9 @@ coverage).
 - **Accepted**: `ok` (full GICP correction) and `ok_partial` (P1: degeneracy
   projection and/or yaw veto shrank the correction; the projected pose is what
   gets applied, published, and GT-scored).
-- **Rejected**: `failed_to_converge`, `rejected_fitness` (absolute),
+- **Rejected**: `failed_to_converge`, `rejected_support` (min-correspondence
+  gate: `gicp/minCorrespondences: 500` / `minCorrespondenceRatio: 0.2`),
+  `rejected_fitness` (absolute),
   `rejected_fitness_ratio` (P1 wrong-basin gate), `rejected_hessian` (now only
   the all-axes-degenerate case), `rejected_jump`, `invalid_solution` — all fall
   through to the dead-reckoning branch (set `current_pose ← T_prior`, seed
@@ -536,13 +550,23 @@ coverage).
 
 ## Map preparation
 
-GLIM dumps submaps as PLY-format files with a `.pcd` extension. Convert them with:
+A current GLIM dump is a directory of **compact submap folders**, not a single
+cloud. From the repository root, the supported handoff is
+`scripts/export_glim_dump_to_pcd.py`, which
+composes the submaps via their `T_world_origin`, converts WORLD→ENU with
+`inverse(T_world_utm)`, and writes the `*.manifest.yaml` provenance record that
+this node checks at load:
 
 ```bash
-python3 gicp_plusplus/scripts/convert_ply_to_pcd.py \
-    /path/to/glim_map.pcd \
-    /path/to/output_map.pcd
+python3 scripts/export_glim_dump_to_pcd.py /path/to/glim_dump /path/to/track_map.pcd \
+    --voxel-size 0.1
 ```
+
+Do **not** hand-convert individual submap clouds (e.g. a raw PLY→PCD copy): that
+yields a WORLD-frame map with no manifest, which is frame-mismatched against the
+Atlas ENU seeds/GT and which `loadMap` warns about or rejects. The exporter reads
+the datum from `<dump>/enu_origin.txt` when present (the all-in-one `prep_bag.py`
+route writes it); for a hand-run dump pass `--enu-origin "<lat,lon,alt>"`.
 
 The operational contract is **local ENU**: with the adapter, the GLIM-built map,
 the seed `/gps_p1/filtered_odom`, and GICP all share the one ENU datum the adapter
@@ -574,7 +598,18 @@ Look in the log for one of:
 
 ### Scan dropouts during sharp turns
 
-If you see SCAN DEBUG gaps > 200 ms during turns, `lidar_concat/time_threshold` is dropping aux scans that fell out of sync. Try raising it from the default `0.1` toward `0.15`. The merged cloud will have slightly worse intra-frame alignment but that's almost always cheaper than a 600 ms scan-stream gap during cornering. (If `require_all_aux: true`, an out-of-sync aux instead SKIPS the whole scan rather than degrading it.)
+If you see SCAN DEBUG gaps > 200 ms during turns, diagnose the front/aux
+synchronizer rather than reaching for `time_threshold` — in Luminar mode that
+header window is only a fallback/tie-break, and the authoritative match is the
+decoded per-point endpoint error (`luminar_point_time_threshold_s`), so raising
+`time_threshold` will not close a real point-time gap. Inspect the release
+telemetry: `front_release_reason` (was the front released by watermark or by
+timeout?), `front_wait_ms` (how long it waited for aux), `merged_aux_count` (did
+front+left+right actually merge?), and the per-aux point-time range error. A
+persistent timeout-release with low `merged_aux_count` means an aux stream is
+genuinely late or mis-clocked (check the per-aux mean header-offset warning), not
+that the gate is too tight. (If `require_all_aux: true`, an out-of-sync aux SKIPS
+the whole scan rather than degrading it.)
 
 ### GICP slides at corners
 
@@ -611,14 +646,7 @@ CSV columns: `current_*` (final pose), `guess_*` (initial guess), `delta_*` (`gu
 
 ### LiDAR topic visualizer
 
-`scripts/visualize_lidar_topic.py` checks that the localization node is consuming the LiDAR topic you expect, by reconstructing the same cloud (TF + `flip_y`) and comparing against `gicp/localization/debug/input_cloud_base`.
-
-```bash
-python3 scripts/visualize_lidar_topic.py
-python3 scripts/visualize_lidar_topic.py --topic /your/lidar/topic --expected-frame your_lidar_frame
-```
-
-If `mean_err`, `p95_err`, `max_err` stay near zero, the topic path is consistent.
+`scripts/visualize_lidar_topic.py` was written against a `gicp/localization/debug/input_cloud_base` topic that this node **no longer publishes**, so its comparison mode cannot produce output until the script is ported. To verify the node is consuming the LiDAR topic you expect, use the per-frame debug counters instead: `raw_points` / `preprocessed_points` (nonzero at scan rate) and `merged_aux_count` (source set), plus `ros2 topic hz` on the input topic.
 
 ### Profiling
 

@@ -9,9 +9,9 @@ This directory is the GLIM workspace inside the [`augcog/DLIO_plusplus`](https:/
 - `glim_ext` for extension modules
 - `glim_ros2` for ROS2 integration
 
-**Where GLIM sits in the four-stage pipeline.** GLIM is the offline-map stage of a four-stage flow: **adapter** (converts Atlas WGS84 → local-ENU, publishes `/gps_p1/*` and optional `/gnss*`) → **`scripts/prep_bag.py`** (writes a normalized bag: the small adapter streams plus the raw Luminar clouds copied unchanged) → **GLIM** (builds the offline PCD map) → **`gicp_localization`** (online localize against that PCD map). GLIM consumes the normalized bag: it expects `/gps_p1/*` **already in local ENU** from the adapter, so it does not perform any WGS84/UTM projection itself. See the `adapter` package and `scripts/prep_bag.py` for how these inputs are produced.
+**Where GLIM sits in the pipeline.** GLIM is the offline-map stage: **adapter** converts Atlas WGS84 to local ENU `/gps_p1/*`; **`scripts/prep_bag.py`** copies raw Luminar clouds, writes the normalized bag, and by default invokes GLIM to create a dump; the dump is exported to an ENU PCD for either online localizer (`gicp_localization` or `gicp_plusplus`). GLIM consumes `/gps_p1/*` already in local ENU and performs no WGS84/UTM projection itself. Pass `--skip-glim` to `prep_bag.py` only if you will invoke `glim_rosbag` manually.
 
-**Target sensor stack:** AV-24 Cybertruck with three Luminar Iris LiDAR (front + left + right concatenated) and the **Point One Nav Atlas (LG69T) dual-antenna RTK-INS**. All GNSS, RTK, and IMU input comes from Atlas — Atlas projects its IMU output and INS pose solution to the primary GNSS antenna phase centre (URDF link `gps_antenna_top`) via firmware lever-arm, so GLIM consumes both at the same body frame with no second lever-arm step. IMU rate is 99 Hz, RTK is delivered at cm-level horizontal / sub-cm vertical when FIXED.
+**Target sensor stack:** AV-24 Cybertruck with three Luminar Iris LiDAR (front + left + right concatenated) and the **Point One Nav Atlas (LG69T) dual-antenna RTK-INS**. All GNSS, RTK, and IMU input comes from Atlas. Note the two streams are referenced differently: the INS **pose/position** solution is projected to the primary GNSS antenna phase centre (URDF link `gps_antenna_top`), but the **IMU** is *not* — per FusionEngine, `IMUOutput` is bias/scale-corrected and **rotated into vehicle body axes** yet stays at the physical device link (`pointonenav`), not the antenna. Tagging the IMU as `gps_antenna_top` is a deliberate **approximation** that drops the small (~0.63 m) device→antenna accelerometer lever-arm term (`ω×(ω×r)`, negligible at mapping speeds; gyro unaffected) — it is not a firmware projection. IMU rate is 99 Hz, RTK is delivered at cm-level horizontal / sub-cm vertical when FIXED.
 
 ### Differences From Upstream GLIM
 
@@ -24,13 +24,15 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 **Sensor & platform adaptation — Point One Atlas LG69T + Luminar Iris, AV-24**
 
 - `glim/config/config_sensors.json`, `config_ros.json`: LiDAR-IMU extrinsic, topics (`/gps_p1/imu`, `/luminar_front/points`), `intensity_field=reflectance`, Atlas-tuned IMU noise (deliberately conservative vs measured stationary noise — see *Key Parameters*). Frame IDs / `acc_scale` auto-detected.
-- `glim/include/glim/util/ros_cloud_converter.hpp`: optional `flip_points_y` for mirrored clouds.
+- `glim_ros2/src/glim_ros/glim_ros.cpp`: optional `flip_points_y` for mirrored clouds (config key in `config_sensors.json`).
 
 **Luminar per-point timestamps & deskew** — `ros_cloud_converter.hpp`, `config_sensors.json`
 
 - Decode the Luminar `UINT8[8]` little-endian uint64 **PTP epoch-nanosecond** per-point time field (`/1e9` → epoch seconds); deskew is ON. Upstream handles only `UINT32`/`FLOAT32`/`FLOAT64` and would drop these scans as "unsupported time type". Timestamp-format authority: **Luminar Iris Data Output Specification v1.3.0**.
 - **Epoch-axis safeguard**: when absolute per-point times sit on a different epoch than `header.stamp` (sensor clock not PTP-locked to the ROS/INS epoch), `ros_cloud_converter` rebases them onto the header epoch, **anchored on the primary scan** (intra-scan span preserved; threaded `epoch_anchor_count`), so `TimeKeeper`'s absolute-time branch can't overwrite the frame stamp with a wrong-epoch value and drop the scan. This live safeguard is the **sole** timestamp repair — `scripts/prep_bag.py` deliberately copies the raw Luminar clouds byte-for-byte (no offline restamp), so runtime owns epoch alignment. No-op on already-aligned or scan-relative data.
-- Full rationale + validation: root `README.md` → "Luminar Iris per-point timestamps — the definitive account".
+- The converter is the sole timestamp-repair point: `prep_bag.py` copies raw
+  Luminar payloads byte-for-byte, while GLIM preserves intra-sweep span and
+  rebases only an absolute point-time epoch that disagrees with the header.
 
 **Multi-LiDAR concatenation** — `glim_ros2/include/glim_ros/lidar_concat.hpp`, `glim_ros2/src/glim_ros/glim_ros.cpp`
 
@@ -50,7 +52,7 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 - **Primary-anchored epoch handling**: merged-cloud timing anchors on the **primary** scan's earliest timestamp, not the global merged minimum.
 - **Full PointCloud2 schema-equality gate** before byte-appending an aux scan (name/offset/datatype/count + point_step + endianness), not just `point_step` — a same-step-but-different-layout aux cloud is now skipped with a diagnostic instead of being silently misread.
 - **Per-frame merge diagnostics** (P4, 2026-07; `lidar_concat.frame_diag_log`, default **true**): one parseable `CONCAT DEBUG | stamp=… merged=n/N dt<i>=…s pts<i>=… span=…s total_pts=…` INFO line per primary scan — the map-side merge evidence, mirroring GICP's per-frame debug topics (GLIM's offline tools have no node to publish from). The reported `dt<i>` values are raw header acquisition phase, not clock estimates. Point-time endpoint mismatches and rejected candidates are logged separately; only those decoded point times are authoritative for Iris.
-- Live wiring: the live node subscribes to the aux topics, buffers them, and merges on primary-cloud arrival (`points_callback_live`), matching the offline `glim_rosbag` / `glim_pcap_rosbag` merge path.
+- Live wiring: only the **offline** readers (`glim_rosbag` / `glim_pcap_rosbag`) support concat, because merging correctly requires buffering **future** aux sweeps (the point-coherent right sweep arrives ~66–92 ms *after* the primary) — which only the offline future-aware release queue can do. The live path (`points_callback_live`) has no such queue, so as of the 2026-07 guard the live node **throws at startup** when `enable_online_mapping=true` **and** `lidar_concat` is enabled, rather than silently merging front+left only (or the wrong sweep). Build concat maps offline; see the startup guard in `glim_ros2/src/glim_ros/glim_ros.cpp`.
 
 **GNSS / RTK global anchoring** — `glim_ext/modules/mapping/gnss_global`, `config_gnss_global.json`, `config.json`
 
@@ -74,8 +76,8 @@ Reviewer summary of every functional delta from upstream. Base: **koide3 GLIM ~v
 
 **Tooling**
 
-- `glim_ros2/src/iris_pcap_reader.cpp` + `scripts/merge_luminar_pcap.py`: raw Luminar PCAP → merged `PointCloud2` ingestion (`glim_pcap_rosbag`), byte-identical layout between the C++ and Python paths.
-- `glim_ros2/src/glim_dump_to_pcd.cpp`: headless GLIM dump → PCD exporter.
+- `glim_ros2/src/iris_pcap_reader.cpp` + `merge_luminar_pcap.py` (repo root): raw Luminar PCAP → merged `PointCloud2` ingestion (`glim_pcap_rosbag`), byte-identical layout between the C++ and Python paths.
+- `scripts/export_glim_dump_to_pcd.py` (repo root): GLIM dump → composed ENU PCD map + provenance manifest (the supported map handoff to GICP).
 
 ### Key Features
 
@@ -100,8 +102,9 @@ The exact behavior of this fork should be taken from the checked-in config and s
 │   │       └── gnss_global/  # RTK-GPS constraint module
 │   └── config/    # Extension configs
 └── glim_ros2/     # ROS2 interface
-    ├── launch/    # Launch files
-    └── src/       # ROS2 nodes
+    ├── include/   # lidar_concat + ros compatibility headers
+    ├── src/       # ROS2 nodes (glim_rosbag, glim_pcap_rosbag, glim_rosnode, tools)
+    └── test/      # concat point-time gtests
 ```
 
 ## Dependencies
@@ -184,7 +187,14 @@ source install/setup.bash
 
 ### Mapping pipeline overview
 
-> **Inputs.** GLIM is stage 3 of the four-stage flow (**adapter → `scripts/prep_bag.py` → GLIM → `gicp_localization`**). Before mapping, run the **adapter** (WGS84 → local ENU, publishes `/gps_p1/*` in ENU) and **`scripts/prep_bag.py`** to produce the normalized bag GLIM consumes — the small adapter streams plus the raw Luminar clouds copied unchanged. GLIM expects `/gps_p1/*` **already in local ENU**; it does no projection itself.
+Run commands beginning with `scripts/` from the DLIO++ repository root (the
+directory containing `GLIM/`, `adapter/`, and `scripts/`).
+
+> **Inputs.** GLIM consumes a normalized bag whose Atlas-derived `/gps_p1/*`
+> streams are already local ENU and whose Luminar payloads are raw. The default
+> `prep_bag.py` route creates that bag **and maps it with GLIM**; use
+> `--skip-glim` only for a manual `glim_rosbag` run. GLIM itself does no WGS84
+> or UTM projection.
 
 ```
                               ┌─────────────────────────────┐
@@ -210,7 +220,7 @@ source install/setup.bash
                                                             └──────────────────────┘
 ```
 
-The odometry estimator and the GNSS extension are deliberately decoupled. Odometry runs every scan regardless of GNSS state. The GNSS extension turns each *received* message into one prior factor on the global graph; if no messages arrive, no factors are added — but the trajectory still gets scan-to-scan factors from VGICP and IMU preintegration, so the map perimeter keeps extending.
+The odometry estimator and the GNSS extension are deliberately decoupled. Odometry runs every scan regardless of GNSS state. Once its world↔ENU alignment is initialized, the GNSS extension turns each eligible associated sample into position (and, when quality allows, yaw) prior factors on the global graph; if no qualified messages arrive, no factors are added — but the trajectory still gets scan-to-scan factors from VGICP and IMU preintegration, so the map perimeter keeps extending.
 
 ### Startup procedure (RTK FIXED required at session start)
 
@@ -231,23 +241,31 @@ First INS sample received at stamp=… cov=[…] -> FIXED
 ```
 If `-> NOT FIXED` instead, wait. The filter will log the transition the moment Atlas reaches FIXED.
 
-**Step 3 — Record the session, then build the map offline:**
+**Step 3 — Record the session, then normalize and map it offline:**
 
 GLIM maps **offline only**, so the parked-init + drive sequence below is performed
 while **recording a bag** (the standstill and RTK-FIXED conditions govern the
-recorded data quality). Build the map afterward from that bag:
+recorded data quality). The recommended command normalizes the bag and runs GLIM
+in one step:
 ```bash
-ros2 run glim_ros glim_rosbag <your_bag> --ros-args -p dump_path:=<out_dir>
+python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag> \
+    --p1-imu-pcap <ins.pcap> --dump-dir <out_dir>
 ```
 During the offline run you should see `estimate initial IMU state` from the
-LiDAR+IMU loose-init within ~5 s of the bag's parked segment, followed by the
-first GNSS-prior factor insertion from `gnss_global` once a FIXED sample lands.
+LiDAR+IMU loose-init within ~5 s of the bag's parked segment, followed by
+`T_world_utm=…` and GNSS-prior insertion after replay reaches the first ≥5 m of
+FIXED-quality travel. To invoke `glim_rosbag` manually instead, first run the
+same command with `--skip-glim`, then use the manual bag command in **Running
+modes** below; otherwise you would map the bag twice.
 Map points appear in the viewer. The two-phase init conditions below apply to the
 **recording**; the same standstill/RTK ordering is what the offline run replays.
 
-> ### Two sequenced init conditions — both completed in the park position
+> ### Two sequenced init conditions — parked IMU init, then a short FIXED-quality drive
 >
-> GLIM init is two-staged. The conditions are **sequenced, not in conflict**: Atlas LG69T's dual-antenna design resolves RTK FIXED and INS attitude at standstill (heading from the antenna baseline), so a single parked phase satisfies both before driving.
+> GLIM init is two-staged. The conditions are **sequenced, not in conflict**:
+> Atlas LG69T's dual-antenna design resolves RTK FIXED and INS attitude at
+> standstill, so the parked phase establishes IMU initialization and RTK
+> quality. The world↔ENU alignment then requires the first ≥5 m of travel.
 >
 > **🅐 Phase 1 — Stationary calibration completes the GLIM init step.**
 >
@@ -255,15 +273,15 @@ Map points appear in the viewer. The two-phase init conditions below apply to th
 >
 > The `LOOSE` init in `config_odometry_gpu.json` (`initialization_mode: "LOOSE"`, `initialization_window_size: 5.0`) runs a 5-second batch optimization that **estimates the gravity direction by averaging the IMU specific-force vector** (see `loose_initial_state_estimation.cpp:142-165`). The math assumes `mean(acc_local) ≈ gravity` — exact at standstill. Aggressive accel/braking/cornering during this window tilts the gravity estimate and rotates the resulting map. `fix_imu_bias: true` then **locks** the IMU bias at the init value, so a bad init cannot self-correct — a restart from a stationary state is the only fix.
 >
-> **🅑 Phase 2 — RTK-FIXED required before any map data is integrated.**
+> **🅑 Phase 2 — RTK-FIXED world↔ENU alignment after the first ≥5 m.**
 >
 > > **DO NOT BEGIN DRIVING UNTIL `rtk_fixed_odom_filter.py` HAS LOGGED `RTK transition: ... -> FIXED`.** Then drive the first **≥ 5 m carefully** and verify `gnss_global` logs `T_world_utm=...` followed by prior-factor insertions.
 >
 > The pre-filter forwards Atlas samples to `libgnss_global.so` only while pose covariance indicates RTK-FIXED. Note the actual initialization sequence: `gnss_global` **cannot** emit any prior factor while the vehicle is parked — it waits until the trajectory baseline exceeds `min_baseline: 5.0 m` (`config_gnss_global.json`) before fitting the one-shot world↔ENU transform, and only then emits GNSS factors. So "wait for the first prior factor before driving" is unsatisfiable; the correct contract is: (1) RTK-FIXED while parked, (2) drive the first ≥5 m gently (this segment seeds the alignment fit), (3) verify `T_world_utm` initialization and factor insertion in the log. The pre-baseline segment is **backfilled** with factors once the baseline is reached, so no early submap is left unanchored. **The map's first geo-referenced frames must come from FIXED-quality Atlas poses, not a degraded RTK-FLOAT or GPS-only fallback.** Driving before RTK-FIXED means the early trajectory grows in a local odom frame and only retroactively aligns to global when RTK reacquires — iSAM2 will smooth it, but the map no longer starts from cm-level absolute coordinates.
 >
-> Both phases typically complete during the same parked 30 s – 2 min Atlas RTK acquisition window. If Atlas never reaches FIXED while parked, fix the hardware/sky-view condition before driving — don't paper over it by starting GLIM and hoping RTK lands en route.
+> Atlas normally reaches FIXED during the parked 30 s – 2 min acquisition window; the transform fit and first factors then arrive during the first few metres of the run. If Atlas never reaches FIXED while parked, fix the hardware/sky-view condition before driving — don't paper over it by starting GLIM and hoping RTK lands en route.
 >
-> **Safe sequence:** park level with clear sky view → wait for Atlas display to show RTK FIXED + INS aligned → launch `rtk_fixed_odom_filter.py` and GLIM → confirm both `estimate initial IMU state` AND `gnss_global insert ... GNSS prior factors` appear in the log → only then start driving.
+> **Safe sequence:** park level with clear sky view → wait for Atlas display to show RTK FIXED + INS aligned → launch `rtk_fixed_odom_filter.py` and GLIM → confirm `estimate initial IMU state` (the 5 s LOOSE init) in the log → **then begin driving gently for the first ≥ 5 m** → confirm `gnss_global` logs `T_world_utm=…` (INFO level) during that stretch. (The per-insertion `insert ... GNSS prior factors` line is DEBUG level and invisible at the default log level; the `T_world_utm=` line is the reliable INFO-level confirmation. Prior factors CANNOT appear while parked — the transform fit needs the ≥5 m baseline; the parked FIXED samples are backfilled once it's reached.)
 
 **Step 4 — Drive the track:**
 Watch the viewer; the map should grow continuously. The filter will print FIXED↔NOT_FIXED transitions whenever Atlas's RTK quality crosses the covariance gate — these are diagnostic, not errors, and the map keeps extending through them.
@@ -289,7 +307,7 @@ This is why mapping **never** falls back to pure IMU dead-reckoning (would drift
 If the dropout is long enough or feature-poor enough that residual error matters, two follow-ups help:
 
 - **Re-traverse the dropout area** on a later lap. Loop closure factors get added, further refining the dropout trajectory.
-- **Bump `smoother_lag`** in `config_odometry_gpu.json` from 2 s to a duration longer than your expected dropout (e.g. 10–30 s for a ~200 m tunnel at 30 m/s). iSAM2 needs the dropout to fall inside the active smoothing window for retroactive correction to work.
+- Note: raising `smoother_lag` does **not** help here. GNSS priors are inserted into the **global** submap graph (via `gnss_global` → global mapping), not the local fixed-lag smoother — the old 30 s lag was removed for exactly this reason. Dropout behavior is governed by `max_interp_gap_sec` (submaps inside a dropout are left un-anchored by design) plus loop closures on re-traversal.
 
 ### Running modes
 
@@ -306,13 +324,38 @@ and invokes GLIM callbacks **directly, without publishing them to ROS topics**.
 An externally-running `rtk_fixed_odom_filter.py` therefore receives **nothing**
 from this replay and cannot gate anything. If your bag carries only the raw
 `/gps_p1/filtered_odom`, you must pre-normalize it so it contains
-`/gps_p1/filtered_odom_rtk_fixed` before mapping — the intended route:
+`/gps_p1/filtered_odom_rtk_fixed` before mapping — the intended route is
+`prep_bag.py`, which **by default normalizes AND runs GLIM in one shot** (into
+`--dump-dir`, writing `enu_origin.txt` for the exporter):
 ```bash
-python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag>
+python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag> --dump-dir <dump_dir>
 ```
-(`prep_bag.py` replays through the adapter's RTK covariance gate and records the
-qualified topic; it also enforces the RTK-anchor acceptance gate on the
-resulting map unless `--lidar-imu-only` is passed.)
+Do **not** then run `glim_rosbag` again on the normalized bag — that double-maps.
+Only if you want to drive `glim_rosbag` yourself, pass `--skip-glim` to make
+`prep_bag.py` normalization-only, then run the `glim_rosbag` command above on
+`<normalized_bag>` (that hand-run dump will have no `enu_origin.txt`, so pass
+`--enu-origin` to the exporter explicitly). Either way, `prep_bag.py` replays
+through the adapter's RTK covariance gate, records the qualified topic, and
+enforces the RTK-anchor acceptance gate on the resulting map unless
+`--lidar-imu-only` is passed.
+
+### Exporting the localization map
+
+A GLIM dump is in GLIM's internal WORLD frame, not automatically the adapter's
+local ENU frame. Export it before giving it to either localizer:
+
+```bash
+python3 scripts/export_glim_dump_to_pcd.py <dump_dir> /path/to/track_map.pcd \
+    --voxel-size 0.1
+```
+
+The exporter composes compact submaps, applies `inverse(T_world_utm)` to produce
+an ENU PCD, and writes `/path/to/track_map.pcd.manifest.yaml`. The all-in-one
+`prep_bag.py` route records the chosen datum in `<dump_dir>/enu_origin.txt`, which
+the exporter reads automatically. For a hand-run dump, append
+`--enu-origin "<lat,lon,alt>"` using the exact adapter origin. Do not use the
+viewer point export or a hand-converted individual submap: those are WORLD-frame
+and lack the manifest needed to verify the ENU contract.
 
 Note: with `two_pass_point_time_join` (default on), `glim_rosbag` first
 re-reads the bag's LiDAR topics once to index absolute point-time ranges and
@@ -341,15 +384,25 @@ unanchored (zero GNSS factors, no `T_world_utm.txt`) and still exit 0. Two
 mechanisms close this:
 
 1. `gnss_global` emits a machine-parseable audit line at save time —
-   `gnss_global summary: transformation_initialized=… position_factors=…
-   orientation_factors=… yaw_gate_skips=… gap_unanchored=…
-   nonmonotonic_drops=… bracket_count=… bracket_max_s=… bracket_mean_s=…` —
-   covering factor counts, GNSS-to-submap bracket widths, and every rejection
-   class (dropout gaps, non-monotonic stamps).
+   `gnss_global summary: transformation_initialized=… fit_rms_m=…
+   position_factors=… orientation_factors=… factors_delivered=…
+   factors_undelivered=… yaw_gate_skips=… gap_unanchored=… submaps_seen=…
+   submaps_dropped_pre_gnss=… submaps_dropped_no_bracket=…
+   submap_anchor_coverage=… nonmonotonic_drops=… bracket_count=…
+   bracket_max_s=… bracket_mean_s=…` — covering the latched one-shot-fit RMS
+   residual (`fit_rms_m`), factors EMITTED vs actually DELIVERED to the graph
+   (`factors_delivered` / `factors_undelivered` — a nonzero undelivered count
+   means `save()` flushed before delivery, so the serialized map has fewer
+   anchors than emitted), submap anchoring coverage (`submaps_seen` and the
+   per-cause drop counters vs the factored fraction, so a run anchored only in
+   its last minute is distinguishable from a fully anchored one), GNSS-to-submap
+   bracket widths, and every rejection class (dropout gaps, non-monotonic
+   stamps).
 2. `scripts/prep_bag.py` applies a **default-on RTK-anchor acceptance gate**
    after mapping: the run fails unless `T_world_utm.txt` exists and parses as
    a finite 4×4 SE(3) AND the summary reports an initialized transform with
-   `position_factors > 0`. LiDAR/IMU-only mapping must opt out explicitly
+   `position_factors > 0` **and** `factors_undelivered == 0`. Fields are parsed
+   by name (order-independent). LiDAR/IMU-only mapping must opt out explicitly
    with `--lidar-imu-only`.
 
 Pre-filter messages (live tracking of RTK quality):
@@ -372,7 +425,7 @@ GLIM `gnss_global` messages (global anchoring):
 GLIM odometry messages (LiDAR+IMU pipeline health):
 ```
 [odometry_estimation] estimate initial IMU state          # ~5 s after start
-[validate_imu] residual=…                                 # per-keyframe IMU sanity
+IMU validation results: / num_validations=…               # IMU sanity summary (debug log level)
 ```
 
 ### Map Output
@@ -474,7 +527,7 @@ Revert to 0.2 / 0.05 if you ever re-point GLIM at a raw MEMS IMU stream.
     "initialization_window_size": 5.0,    // seconds of IMU+LiDAR before init optimization runs
     "init_pose_damping_scale": 1e10,      // tight origin anchor while initializing
     "fix_imu_bias": true,                 // Atlas bias is pre-calibrated; freezing is safer through long GNSS dropouts
-    "smoother_lag": 2.0,                  // seconds; bump to ≥ expected_dropout_duration for retroactive correction
+    "smoother_lag": 5.0,                  // seconds; local odometry window only (GNSS priors live in the GLOBAL graph)
     "num_threads": 2
   }
 }
@@ -483,7 +536,7 @@ Revert to 0.2 / 0.05 if you ever re-point GLIM at a raw MEMS IMU stream.
 **Threading (adjust based on your CPU):**
 ```json
 "odometry_estimation": { "num_threads": 2 },
-"preprocess":          { "num_threads": 2 }
+"preprocess":          { "num_threads": 1 }
 ```
 Sub/global mapping use library defaults; tune up if you have spare cores.
 
@@ -493,7 +546,7 @@ Sub/global mapping use library defaults; tune up if you have spare cores.
 |---|---|
 | Loop closures show >10 cm Z error through dropouts | Tighten `prior_inf_scale[2]` from 1e3 to 1e4 |
 | GNSS factors visibly tug the trajectory each scan | Loosen `prior_inf_scale` to `[5e3, 5e3, 5e2]` |
-| Dropout segment shows visible kink after iSAM2 finishes | Bump `smoother_lag` to ≥ longest expected dropout duration (5×–10× by default) |
+| Dropout segment shows visible kink after iSAM2 finishes | Re-traverse the segment (loop closures refine it); check `max_interp_gap_sec` didn't anchor a chord across the dropout. `smoother_lag` does not help — GNSS priors live in the global graph, not the local smoother |
 | Map-viewer points jitter on still vehicle | Tighten `imu_acc_noise` further (e.g. 0.02) or check vibration coupling |
 | Sub-mm jitter in IMU bias estimates | Already at `imu_bias_noise: 1e-5`; if still problematic, set `fix_imu_bias: true` (already is in current config) |
 | Pre-filter never reaches FIXED | Loosen `max_pose_var_xy` / `max_pose_var_z` to admit RTK-FLOAT for that session |
@@ -539,7 +592,7 @@ And saved to the map directory when mapping completes:
 - Almost certainly Phase 1 (stationary calibration) was violated. The `LOOSE` init estimates gravity direction over the first 5 s of IMU samples and assumes mean acceleration ≈ gravity vector; any sustained accel/cornering during those 5 s tilts the estimate. Combined with `fix_imu_bias: true`, the bias is also locked at a wrong value. Stop GLIM, return to a level stationary park, re-launch, wait the 5 s for the first sub-map to appear in the viewer, then drive.
 
 ### Map's first frame isn't geo-referenced (jumps when RTK lands)
-- Phase 2 (RTK anchoring) was violated — driving started before the pre-filter reported FIXED. The early trajectory grew in a local odom frame and only got rigidly transformed to the global frame when the first GNSS factor finally landed. iSAM2 will smooth this and the final map is still correct, but the first map frame is no longer cm-aligned. Future sessions: wait for both `estimate initial IMU state` AND `gnss_global insert ... GNSS prior factors` in the log before moving.
+- Phase 2 (RTK anchoring) was violated — driving started before the pre-filter reported FIXED. The early trajectory grew in a local odom frame and only got rigidly transformed to the global frame when the first GNSS factor finally landed. iSAM2 will smooth this and the final map is still correct, but the first map frame is no longer cm-aligned. Future sessions: wait for `estimate initial IMU state` **and** a FIXED transition before moving, then drive the first ≥5 m gently and confirm `T_world_utm=…` plus GNSS-factor insertion.
 
 ### Pre-filter never reports FIXED
 - Atlas itself hasn't reached FIXED. Check `ros2 topic echo /gps_p1/filtered_odom --once` and inspect `pose.covariance[0]`; it should drop to ~1×10⁻⁴ m² or below.
@@ -548,22 +601,22 @@ And saved to the map directory when mapping completes:
 ### Map not anchoring to global frame (no `T_world_utm` log line)
 - The pre-filter is running but `libgnss_global.so` isn't subscribing. Check `extension_modules` in `config_ros.json` includes `libgnss_global.so`.
 - Verify `gnss_topic` in `config_gnss_global.json` matches the filter's output (`/gps_p1/filtered_odom_rtk_fixed` by default).
-- Vehicle hasn't traveled `min_baseline` (5.0 m by default) since the first GNSS factor — `libgnss_global.so` needs two well-separated samples to initialize the SE(3) anchor.
+- Vehicle has not yet accumulated `min_baseline` (5.0 m by default) in both the estimated trajectory and GNSS samples — `libgnss_global.so` needs two well-separated samples before it can initialize the SE(3) anchor and emit factors.
 
 ### Map shows discontinuity / kink after a GNSS-denied passage
-- Increase `smoother_lag` in `config_odometry_gpu.json` to a duration longer than the dropout. iSAM2 can only redistribute error inside the active smoothing window.
-- For very long dropouts, plan re-traversal on a later lap so loop closure factors can refine the trajectory.
+- Plan re-traversal on a later lap so loop closure factors refine the dropout trajectory — this, not `smoother_lag`, is the lever: GNSS priors are inserted into the **global** submap graph, so the local fixed-lag smoother's window cannot redistribute dropout error.
+- Verify `max_interp_gap_sec` (default 1.0 s) is active so no chord was anchored across the dropout; the `gnss_global summary:` line reports `gap_unanchored` counts.
 
 ### Trajectory drifts visibly during long FIXED stretch
 - IMU bias may not be locked. Verify `fix_imu_bias: true` in `config_odometry_gpu.json` (current default).
 - Check Atlas's pose covariance is actually still FIXED (`pose.covariance[0]` < 1e-3 m²); transient bias-walk during good FIXED can briefly degrade.
 
 ### LiDAR points appear shifted by a fixed offset everywhere
-- The IMU/LiDAR extrinsic (`T_lidar_imu` in `config_sensors.json`) is wrong. With Atlas, the IMU lives at `gps_antenna_top` (firmware-projected), so the translation is `luminar_front` (URDF) → `gps_antenna_top` (URDF) = `(−0.95065, −0.005, 0.47194)`. Verify against `av24.urdf`.
+- The IMU/LiDAR extrinsic (`T_lidar_imu` in `config_sensors.json`) is wrong. With Atlas, the IMU is *treated as* located at `gps_antenna_top` — a deliberate approximation (the FusionEngine IMU is body-axis-rotated but device-located; see the sensor-stack note at the top) — so the translation is `luminar_front` (URDF) → `gps_antenna_top` (URDF) = `(−0.95065, −0.005, 0.47194)`. Verify against `av24.urdf`.
 
 ### Low performance
 - Reduce thread counts if CPU usage is 100%
-- Increase downsampling: lower `random_downsample_target` from the default `10000`
+- Increase downsampling: lower `random_downsample_target` from the default `80000` (dense-map profile; the legacy sparse profile uses `30000`)
 - Disable viewers if running headless
 
 ### CUDA errors
@@ -572,7 +625,8 @@ And saved to the map directory when mapping completes:
 
 ### Map not saving
 - Use `tee` for logging instead of piping through `grep` so the SIGINT shutdown
-  sequence reaches GLIM directly: `ros2 launch ... | tee output.log`
+  sequence reaches GLIM directly:
+  `ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=<dir> | tee output.log`
 - Default dump path is `/tmp/dump`; override with `-p dump_path:=<dir>` and
   check write permissions on the chosen directory
 

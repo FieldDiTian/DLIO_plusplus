@@ -4,7 +4,7 @@ The Atlas adapter is the **normalization boundary** (stage 1) of the DLIO++
 pipeline:
 
 ```
-adapter → scripts/prep_bag.py → GLIM (map) → gicp_localization (localize)
+adapter → prep_bag.py (normalize + map by default) → GLIM dump → ENU PCD → localizer
 ```
 
 It keeps sensor-specific WGS84 parsing, RTK covariance gating, and Point One P1
@@ -12,8 +12,9 @@ time mapping at the edge so GLIM/GICP consume a stable, vendor-neutral contract:
 `/gps_p1/*` (and optional `/gnss*`) already in the **local ENU** `map` frame.
 The raw Luminar LiDAR topics are **not** touched by the adapter — they are copied
 through unchanged by `prep_bag.py`, and multi-LiDAR merge / timestamp handling
-stays owned by GLIM/GICP `lidar_concat`. See the [root README](../README.md) for
-the full pipeline and the local-ENU coordinate contract.
+stays owned by GLIM/GICP `lidar_concat`. The adapter's output contract is one
+local-ENU `map` datum shared by mapping and either online localizer
+(`gicp_localization` or `gicp_plusplus`).
 
 This package normalizes Point One Atlas inputs for the default DLIO
 mapping/localization contract:
@@ -72,7 +73,7 @@ gyro is unaffected (rigid body). Model it only if pushing high-yaw-rate segments
 
 ## Origin
 
-Exactly one origin source must be configured:
+Configure **at most one** origin source:
 
 - `local_enu_origin: "lat,lon,alt"`
 - `local_enu_origin_ttl_path: "/path/to/ttl.csv"`
@@ -86,6 +87,10 @@ default is the shared Putnam map/local ENU origin from
 39.58227391,-86.74232215,260.4
 ```
 
+If neither parameter is supplied, the node warns and uses that built-in Putnam
+origin. The checked-in launch configuration also supplies the same inline value.
+Supplying both sources is a startup error.
+
 ## Example
 
 ```bash
@@ -94,9 +99,9 @@ ros2 launch adapter adapter.launch.py \
   local_enu_origin_ttl_path:=/path/to/race_metadata/ttls/PUTNAM_ENU_TTL_CSV/ttl_2.csv
 ```
 
-The launch file overrides the YAML default origin when
-`local_enu_origin_ttl_path` is passed. The node fails at startup if both origin
-sources are set or both are empty.
+The launch file overrides the YAML inline origin when
+`local_enu_origin_ttl_path` is passed. It rejects both sources being set; with
+neither source set, the node uses the documented built-in origin above.
 
 ## Run summary and audit counters
 
@@ -106,12 +111,15 @@ inferring it from matching in/out totals:
 
 ```text
 pose_in=… gnss_out=… gnss_rtk_out=… odom_out=… rtk_out=… imu_in=… imu_out=…
-pose_dropped_invalid=… imu_sidecar_miss_drop=… imu_dropped_clock_not_ready=…
+pose_dropped_invalid=… imu_dropped_invalid_stamp=… imu_sidecar_miss_drop=… imu_dropped_clock_not_ready=…
 p1_clock_ready=… p1_clock_drift_ms=…
 ```
 
 - `pose_dropped_invalid` — NaN / invalid-solution FusionEngine poses rejected
-  before publication (cold-start samples land here).
+  before publication (cold-start samples land here); also counts poses dropped
+  for an invalid or quarantined-forward-spike P1 stamp.
+- `imu_dropped_invalid_stamp` — IMU samples dropped at ingest for a non-finite /
+  ≤0 / ≥4e9 (sentinel) header stamp, before they can reach a consumer buffer.
 - `imu_sidecar_miss_drop` — IMU samples dropped because no sidecar P1 stamp
   matched within tolerance (sidecar replay mode only).
 - `imu_dropped_clock_not_ready` — IMU samples dropped from the bounded
@@ -122,8 +130,10 @@ p1_clock_ready=… p1_clock_drift_ms=…
   gap/non-monotonic rejections, factor counts) these close the RTK timing
   audit chain from PCAP to map factors.
 
-All three drop counters are expected to be **0** on a healthy run; the
-sidecar match/miss/skip triple is additionally printed in sidecar mode.
+All four drop counters (`pose_dropped_invalid`, `imu_dropped_invalid_stamp`,
+`imu_sidecar_miss_drop`, `imu_dropped_clock_not_ready`) are expected to be **0**
+on a healthy run; the sidecar match/miss/skip triple is additionally printed in
+sidecar mode.
 
 ## Startup validation (fail loud, not degraded)
 
