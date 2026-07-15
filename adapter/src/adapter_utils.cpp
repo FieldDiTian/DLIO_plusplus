@@ -23,8 +23,22 @@ double stampToSec(const builtin_interfaces::msg::Time& stamp)
 
 builtin_interfaces::msg::Time secToStamp(double sec)
 {
-  const int64_t ns = static_cast<int64_t>(std::llround(sec * 1e9));
   builtin_interfaces::msg::Time stamp;
+  // [P2 FIX 2026-07-14] Guard the int32 seconds field. `sec * 1e9` for a
+  // non-finite or out-of-range input overflows the int32 cast (UB): the
+  // FusionEngine 0xFFFFFFFF "time unavailable" sentinel (~4.29e9 s) lands
+  // directly past INT32_MAX seconds (~2.147e9). Clamp to a representable
+  // range so a poisoned stamp becomes a benign bounded value, never UB.
+  if (!std::isfinite(sec) || sec <= 0.0) {
+    stamp.sec = 0;
+    stamp.nanosec = 0;
+    return stamp;
+  }
+  constexpr double kMaxStampSec = 2147483647.0;  // INT32_MAX seconds
+  if (sec > kMaxStampSec) {
+    sec = kMaxStampSec;
+  }
+  const int64_t ns = static_cast<int64_t>(std::llround(sec * 1e9));
   stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
   stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
   return stamp;
@@ -187,6 +201,15 @@ void P1ClockMapper::addPosePair(double arrival_ros, double p1_time)
 bool P1ClockMapper::ready() const
 {
   return std::any_of(bins_.begin(), bins_.end(), [](const Bin& b) { return b.count > 0; });
+}
+
+void P1ClockMapper::reset()
+{
+  bins_.clear();
+  first_p1_ = std::numeric_limits<double>::quiet_NaN();
+  applied_offset_ = std::numeric_limits<double>::quiet_NaN();
+  last_slew_p1_ = std::numeric_limits<double>::quiet_NaN();
+  forward_glitch_streak_ = 0;
 }
 
 double P1ClockMapper::toRos(double p1_time)

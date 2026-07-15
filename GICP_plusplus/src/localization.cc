@@ -736,6 +736,12 @@ gicp_plusplus::LuminarTimestampRangeNs luminarTimestampRangeFromCloud(
             time_datatype, time_count, bytes_avail, timestamp_ns)) {
       return gicp_plusplus::LuminarTimestampRangeNs{};
     }
+    // [P3 FIX 2026-07-14] A zero per-point timestamp is the "no valid time"
+    // sentinel (GLIM's matcher already skips ts==0). Including it here pins
+    // min_ns to 0, which poisons the deskew anchor (a garbage arc), breaks the
+    // aux watermark, and silently unmatches every aux. Skip it; range.valid
+    // stays false only if EVERY point was zero.
+    if (timestamp_ns == 0) continue;
     range.min_ns = std::min(range.min_ns, timestamp_ns);
     range.max_ns = std::max(range.max_ns, timestamp_ns);
     ++range.count;
@@ -1040,6 +1046,7 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->imu_calib_count_ = 0;
   this->imu_calib_gyro_sum_ = Eigen::Vector3f::Zero();
   this->imu_calib_accel_sum_ = Eigen::Vector3f::Zero();
+  this->imu_calib_gyro_sq_sum_ = Eigen::Vector3f::Zero();
 
   // Initialize RTK-driven calibration state
   this->init_phase_ = InitPhase::WAITING;
@@ -1170,17 +1177,30 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
     this->aux_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     auto aux_sub_opt = rclcpp::SubscriptionOptions();
     aux_sub_opt.callback_group = this->aux_cb_group_;
+    // [P3 FIX 2026-07-14] Reject an aux topic that resolves to the same topic as
+    // the primary cloud: the same message would be delivered to BOTH the primary
+    // and aux callbacks, which the front/aux synchronizer cannot reconcile
+    // (parity with the offline readers, where it desynchronizes the two-pass
+    // ordinal plan and maps zero scans). Compare RESOLVED names so a remap
+    // collision is caught too. Fail loud at construction.
+    const std::string primary_resolved = this->pointcloud_sub->get_topic_name();
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
-      const std::string topic = this->aux_lidars_[i]->topic;
       const int idx = static_cast<int>(i);
       auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          topic, rclcpp::SensorDataQoS(),
+          this->aux_lidars_[i]->topic, rclcpp::SensorDataQoS(),
           [this, idx](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
             this->callbackAuxPointCloud(idx, std::move(msg));
           },
           aux_sub_opt);
+      if (std::string(sub->get_topic_name()) == primary_resolved) {
+        RCLCPP_FATAL(this->get_logger(),
+                     "lidar_concat: aux topic '%s' resolves to the primary cloud topic '%s' — "
+                     "the same cloud would feed both primary and aux; refusing to start",
+                     this->aux_lidars_[i]->topic.c_str(), primary_resolved.c_str());
+        throw std::runtime_error("lidar_concat: aux topic collides with the primary cloud topic");
+      }
       this->aux_subs_.push_back(sub);
-      RCLCPP_INFO(this->get_logger(), "Subscribed to aux LiDAR topic: %s", topic.c_str());
+      RCLCPP_INFO(this->get_logger(), "Subscribed to aux LiDAR topic: %s", sub->get_topic_name());
     }
   }
 
@@ -1484,29 +1504,67 @@ void gicp_plusplus::LocalizationNode::drainFrontSync() {
   // End-of-run conservation summary. The invariant has no aux term because
   // no code path drops a front for aux reasons (front_dropped_due_to_aux is
   // structurally zero); overload_dropped is the only drop and it is counted.
-  const uint64_t accounted = this->front_released_ + this->front_invalid_ +
-                             this->front_shutdown_unprocessed_ +
-                             this->front_overload_dropped_;
+  //
+  // [P3 FIX 2026-07-14] Snapshot the counters UNDER sync_mtx_. The worker is
+  // joined, but the subscription is still live: a late callbackPointCloud ->
+  // enqueuePrimary can still increment these counters concurrently, so the
+  // former unlocked reads were a data race and could compute a spurious
+  // "conservation VIOLATED". enqueuePrimary now accounts post-shutdown fronts
+  // as shutdown_unprocessed (rather than orphaning them in primary_queue_), so
+  // received == accounted holds at every instant and a locked snapshot is
+  // self-consistent. Any front still queued here (worker exited before
+  // draining it) is also folded into shutdown_unprocessed.
+  uint64_t received, released, invalid, shutdown_unprocessed, overload_dropped, epoch_dropped,
+      epoch_inflight_dropped;
+  uint64_t c_all, c_wm, c_to, c_sd, c_noabs;
+  bool fatal;
+  {
+    std::lock_guard<std::mutex> lk(this->sync_mtx_);
+    while (!this->primary_queue_.empty()) {
+      this->primary_queue_.pop_front();
+      ++this->front_shutdown_unprocessed_;
+    }
+    received = this->front_received_;
+    released = this->front_released_;
+    invalid = this->front_invalid_;
+    shutdown_unprocessed = this->front_shutdown_unprocessed_;
+    overload_dropped = this->front_overload_dropped_;
+    epoch_dropped = this->front_epoch_dropped_;
+    epoch_inflight_dropped = this->front_epoch_inflight_dropped_;
+    c_all = this->release_reason_counts_[RELEASE_ALL_MATCHED];
+    c_wm = this->release_reason_counts_[RELEASE_WATERMARK];
+    c_to = this->release_reason_counts_[RELEASE_TIMEOUT];
+    c_sd = this->release_reason_counts_[RELEASE_SHUTDOWN_DRAIN];
+    c_noabs = this->release_reason_counts_[RELEASE_PRIMARY_NO_ABSTIME];
+    fatal = this->sync_fatal_.load();
+  }
+  const uint64_t accounted =
+      released + invalid + shutdown_unprocessed + overload_dropped + epoch_dropped;
   RCLCPP_INFO(
       this->get_logger(),
       "front sync summary: received=%lu released=%lu invalid=%lu "
-      "shutdown_unprocessed=%lu overload_dropped=%lu | releases: "
-      "all_matched=%lu watermark=%lu timeout=%lu shutdown_drain=%lu%s",
-      static_cast<unsigned long>(this->front_received_),
-      static_cast<unsigned long>(this->front_released_),
-      static_cast<unsigned long>(this->front_invalid_),
-      static_cast<unsigned long>(this->front_shutdown_unprocessed_),
-      static_cast<unsigned long>(this->front_overload_dropped_),
-      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_ALL_MATCHED]),
-      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_WATERMARK]),
-      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_TIMEOUT]),
-      static_cast<unsigned long>(this->release_reason_counts_[RELEASE_SHUTDOWN_DRAIN]),
-      this->sync_fatal_.load() ? " | FATAL pipeline error occurred" : "");
-  if (this->front_received_ != accounted) {
+      "shutdown_unprocessed=%lu overload_dropped=%lu epoch_dropped=%lu "
+      "epoch_inflight_dropped=%lu | releases: "
+      "all_matched=%lu watermark=%lu timeout=%lu shutdown_drain=%lu "
+      "primary_no_abstime=%lu%s",
+      static_cast<unsigned long>(received),
+      static_cast<unsigned long>(released),
+      static_cast<unsigned long>(invalid),
+      static_cast<unsigned long>(shutdown_unprocessed),
+      static_cast<unsigned long>(overload_dropped),
+      static_cast<unsigned long>(epoch_dropped),
+      static_cast<unsigned long>(epoch_inflight_dropped),
+      static_cast<unsigned long>(c_all),
+      static_cast<unsigned long>(c_wm),
+      static_cast<unsigned long>(c_to),
+      static_cast<unsigned long>(c_sd),
+      static_cast<unsigned long>(c_noabs),
+      fatal ? " | FATAL pipeline error occurred" : "");
+  if (received != accounted) {
     RCLCPP_ERROR(this->get_logger(),
                  "front sync: conservation VIOLATED (received=%lu != accounted=%lu) — "
                  "a front cloud was lost on an unaccounted path",
-                 static_cast<unsigned long>(this->front_received_),
+                 static_cast<unsigned long>(received),
                  static_cast<unsigned long>(accounted));
   }
 }
@@ -1610,10 +1668,17 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/gt_odom/enable", true);  // [P3 FIX 2026-07-10] yaml-aligned
   this->declare_parameter<int>("localization/gt_odom/buffer_size", 200);
   this->declare_parameter<double>("localization/gt_odom/max_dt", 0.1);
-  bool gt_enable = false; int gt_buf = 200; double gt_max_dt = 0.1;
+  // [P2 FIX 2026-07-14] Bracket-width bound for GT interpolation (see
+  // getGtPoseAt / getGtFiniteDiffVelWorld). Independent of max_dt, which only
+  // bounds the nearer endpoint. Default 0.5 s: at nominal 10 Hz GT this is 5×
+  // the sample period, so it never rejects a healthy stream but forbids
+  // chording across a real dropout.
+  this->declare_parameter<double>("localization/gt_odom/interp_max_gap", 0.5);
+  bool gt_enable = false; int gt_buf = 200; double gt_max_dt = 0.1; double gt_interp_gap = 0.5;
   this->get_parameter("localization/gt_odom/enable", gt_enable);
   this->get_parameter("localization/gt_odom/buffer_size", gt_buf);
   this->get_parameter("localization/gt_odom/max_dt", gt_max_dt);
+  this->get_parameter("localization/gt_odom/interp_max_gap", gt_interp_gap);
   this->gt_odom_enabled_ = gt_enable;
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
@@ -1623,6 +1688,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
     RCLCPP_WARN(this->get_logger(), "localization/gt_odom/max_dt=%.3f invalid; using 0.15",
                 this->gt_odom_max_dt_);
     this->gt_odom_max_dt_ = 0.15;
+  }
+  this->gt_interp_max_gap_ = gt_interp_gap;
+  if (!std::isfinite(this->gt_interp_max_gap_) || this->gt_interp_max_gap_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(), "localization/gt_odom/interp_max_gap=%.3f invalid; using 0.5",
+                this->gt_interp_max_gap_);
+    this->gt_interp_max_gap_ = 0.5;
   }
 
   // RTK quality gate (P1-native): drop gt_odom samples whose Atlas-reported
@@ -2317,6 +2388,20 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
                      "--frame enu.", mf_frame.c_str());
         return false;
       }
+      // [P3 FIX 2026-07-14] frame='enu' + a configured utm_transform_path is a
+      // double transform. A frame='enu' map was RE-EXPORTED into the ENU frame,
+      // so a utm_transform computed for the pre-ENU SLAM world no longer applies:
+      // applying T_utm_map_ to ENU poses composes ENU->old_world->utm and
+      // double-offsets every utm output topic. The ENU<->UTM relationship is
+      // already fixed by the datum. Reject the combination.
+      if (mf_frame == "enu" && this->utm_enabled_) {
+        RCLCPP_FATAL(this->get_logger(),
+                     "Map manifest declares frame='enu' but localization/utm_transform_path is set: "
+                     "the map is already in the ENU frame, so a UTM transform built for the pre-ENU "
+                     "world would double-transform every utm output topic. Remove utm_transform_path "
+                     "for ENU maps (the datum fixes ENU<->UTM). Aborting.");
+        return false;
+      }
       std::string expected_origin;
       this->get_parameter("localization/expected_enu_origin", expected_origin);
       if (!expected_origin.empty()) {
@@ -2324,16 +2409,42 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
           RCLCPP_WARN(this->get_logger(),
                       "localization/expected_enu_origin is set but the map manifest carries no "
                       "datum — origin compatibility CANNOT be verified.");
-        } else if (mf_origin != expected_origin) {
-          RCLCPP_FATAL(this->get_logger(),
-                       "ENU datum mismatch: map manifest origin '%s' != expected '%s' — the map "
-                       "and the live adapter use different datums; localization would be "
-                       "silently wrong everywhere. Aborting.",
-                       mf_origin.c_str(), expected_origin.c_str());
-          return false;
         } else {
-          RCLCPP_INFO(this->get_logger(), "Map manifest verified: frame=enu, origin matches ('%s')",
-                      mf_origin.c_str());
+          // [P2 FIX 2026-07-14] Compare the datum NUMERICALLY with tolerance,
+          // not by raw string: a raw compare false-rejects on whitespace /
+          // precision differences (the exporter now canonicalizes to 8/3 dp,
+          // but a hand-set expected_enu_origin need not match byte-for-byte) and
+          // says nothing meaningful about how far apart two datums actually are.
+          auto parse_origin = [](const std::string& s, double& lat, double& lon, double& alt) {
+            std::string norm = s;
+            std::replace(norm.begin(), norm.end(), ',', ' ');
+            std::istringstream ss(norm);
+            return static_cast<bool>(ss >> lat >> lon >> alt);
+          };
+          double mlat, mlon, malt, elat, elon, ealt;
+          const bool mf_ok = parse_origin(mf_origin, mlat, mlon, malt);
+          const bool ex_ok = parse_origin(expected_origin, elat, elon, ealt);
+          if (!mf_ok || !ex_ok) {
+            RCLCPP_FATAL(this->get_logger(),
+                         "ENU datum unparsable (manifest='%s' expected='%s'); expected "
+                         "'lat_deg,lon_deg,alt_m'. Aborting.",
+                         mf_origin.c_str(), expected_origin.c_str());
+            return false;
+          }
+          constexpr double kLatLonTolDeg = 1e-6;  // ~0.1 m at this latitude
+          constexpr double kAltTolM = 1.0;
+          if (std::abs(mlat - elat) > kLatLonTolDeg || std::abs(mlon - elon) > kLatLonTolDeg ||
+              std::abs(malt - ealt) > kAltTolM) {
+            RCLCPP_FATAL(this->get_logger(),
+                         "ENU datum mismatch: map manifest origin '%s' != expected '%s' (beyond "
+                         "tolerance) — the map and the live adapter use different datums; "
+                         "localization would be silently wrong everywhere. Aborting.",
+                         mf_origin.c_str(), expected_origin.c_str());
+            return false;
+          }
+          RCLCPP_INFO(this->get_logger(),
+                      "Map manifest verified: frame=enu, origin matches numerically "
+                      "(manifest='%s' expected='%s')", mf_origin.c_str(), expected_origin.c_str());
         }
       } else if (!mf_frame.empty()) {
         RCLCPP_INFO(this->get_logger(),
@@ -2561,10 +2672,147 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
               this->initial_pose_roll_, this->initial_pose_pitch_, this->initial_pose_yaw_);
 }
 
+void gicp_plusplus::LocalizationNode::resetEstimatorForEpochChangeLocked(const char* source, double regress_s) {
+  RCLCPP_WARN(this->get_logger(),
+              "EPOCH RESET (%s, rewind %.3f s): coordinated re-initialization of the estimator "
+              "(buffers, timestamp seeds, calibration, observer). Output pauses until re-seeded on "
+              "the new epoch.",
+              source, regress_s);
+
+  {
+    // Canonical lock order: pose -> seed -> calib -> gt_odom -> geo -> imu.
+    // A superset of every nested acquisition elsewhere, so no concurrent callback
+    // can observe a partially-reset state and none can deadlock against this.
+    std::lock_guard<std::mutex> pose_lock(this->pose_mutex);
+    std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+    std::lock_guard<std::mutex> calib_lock(this->calib_mtx_);
+
+    {
+      std::lock_guard<std::mutex> gt_lock(this->gt_odom_mtx_);
+      this->gt_odom_buffer_.clear();
+    }
+    {
+      std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
+      this->imu_buffer.clear();
+      // imu_meas is intentionally left as-is: it is overwritten by the next
+      // buffered sample before any consumer reads it (propagateState is gated
+      // off while initialized == false, set below).
+    }
+
+    // Timestamp seeds -> unknown (0), exactly as constructed. prev_scan_stamp=0
+    // makes the next scan a clean "first scan" that re-anchors the scan chain to
+    // the new epoch within a frame or two (no scan-queue surgery needed).
+    this->prev_scan_stamp = 0.0;
+    this->base_pose_stamp_ = 0.0;
+    this->t_prior_stamp_ = 0.0;
+    this->scan_stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+    this->last_gicp_stamp_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+    this->last_scan_time_span_s_ = -1.0;
+
+    // Init / calibration state machine -> fresh (re-seed + re-calibrate on the
+    // new epoch). Biases are re-estimated rather than carried across a physical
+    // power-cycle.
+    this->first_imu_received = false;
+    this->first_imu_stamp_ = -1.0;
+    this->imu_calibrated_ = false;
+    this->init_phase_ = InitPhase::WAITING;
+    this->imu_calib_start_stamp_ = -1.0;
+    this->imu_calib_count_ = 0;
+    this->imu_calib_gyro_sum_.setZero();
+    this->imu_calib_accel_sum_.setZero();
+    this->imu_calib_gyro_sq_sum_.setZero();
+    this->rtk_calib_start_stamp_ = -1.0;
+    this->rtk_calib_count_ = 0;
+    this->rtk_gyro_bias_sum_.setZero();
+    this->rtk_accel_bias_sum_.setZero();
+    this->rtk_gyro_bias_sq_sum_.setZero();
+    this->rtk_accel_bias_sq_sum_.setZero();
+    this->has_prev_gt_for_accel_ = false;
+    this->prev_gt_stamp_ = 0.0;
+    this->prev_v_world_.setZero();
+    this->has_latest_rtk_seed_ = false;
+
+    // Accept / fitness tracking.
+    this->last_gicp_valid_ = false;
+    this->last_accepted_fitness_score_ = -1.0;
+    this->last_accepted_scan_stamp_ = -1.0;
+    this->consecutive_failures_ = 0;
+    this->fitness_history_.clear();
+
+    // Poses -> identity; the re-seed below (param pose / odom-init / first scan)
+    // establishes the real new-epoch pose.
+    this->current_pose = Eigen::Matrix4f::Identity();
+    this->T_prior = Eigen::Matrix4f::Identity();
+    this->observer_prior_pose_ = Eigen::Matrix4f::Identity();
+    this->last_gicp_pose_ = Eigen::Matrix4f::Identity();
+    this->basePose.p = Eigen::Vector3f::Zero();
+    this->basePose.q = Eigen::Quaternionf::Identity();
+    this->prev_vel.setZero();
+
+    {
+      std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+      this->state.p.setZero();
+      this->state.q = Eigen::Quaternionf::Identity();
+      this->state.v.lin.w.setZero();
+      this->state.v.lin.b.setZero();
+      this->state.v.ang.w.setZero();
+      this->state.v.ang.b.setZero();
+      this->state.b.gyro.setZero();
+      this->state.b.accel.setZero();
+      this->geo.prev_p.setZero();
+      this->geo.prev_q = Eigen::Quaternionf::Identity();
+      this->geo.prev_vel.setZero();
+      this->geo.first_opt_done = false;
+      this->geo.dp = 0.0;
+      this->geo.dq_deg = 0.0;
+      ++this->geo.update_seq;  // discard any in-flight propagateState computation
+    }
+
+    // Re-seed sources: unseeded until the new epoch provides a seed.
+    this->initialized = false;
+    this->gt_odom_received_ = false;
+    this->use_odom_init_applied_ = false;
+  }  // all estimator locks released here
+
+  // [P2 FIX 2026-07-15] Discard the front synchronizer's old-epoch state too.
+  // The estimator reset above does not touch primary_queue_ / aux buffers, so a
+  // pre-reset front could otherwise be processed immediately after the reset (as
+  // a fresh scan, re-seeding prev_scan_stamp to the OLD epoch) or merged against
+  // stale old-epoch aux sweeps (a wrong-sweep concat). Clear both; the discarded
+  // fronts are accounted via front_epoch_dropped_ so the conservation invariant
+  // (checked in drainFrontSync) still holds. Lock order sync_mtx_ -> aux.mtx
+  // matches the worker. Separate scope from the estimator locks above — the two
+  // sets are independent, so keeping them unnested avoids entangling the lock
+  // graph. The worker never holds sync_mtx_ while inside processScan (it unlocks
+  // before calling it), so this cannot deadlock against the caller.
+  if (this->sync_active_) {
+    std::lock_guard<std::mutex> sync_lock(this->sync_mtx_);
+    // Advance the admission generation before accepting any new front. A front
+    // already popped by the worker retains the old generation and is rejected
+    // at the scan-gate entry below instead of being run against reset state.
+    this->sync_epoch_.fetch_add(1);
+    while (!this->primary_queue_.empty()) {
+      this->primary_queue_.pop_front();
+      ++this->front_epoch_dropped_;
+    }
+    for (auto& auxp : this->aux_lidars_) {
+      std::lock_guard<std::mutex> alk(auxp->mtx);
+      auxp->buffer.clear();
+    }
+  }
+
+  // Re-apply the epoch-agnostic param initial pose (if configured) so output
+  // resumes immediately without waiting for GT / odom-init. Called OUTSIDE the
+  // lock scope above because it takes pose_mutex/seed_mtx_ itself (self-guarded
+  // by use_param_initial_pose_, so a no-op otherwise).
+  this->applyInitialPoseFromParams();
+}
+
 void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
                                                           const Eigen::Quaternionf& q_in,
                                                           const rclcpp::Time& stamp,
-                                                          const std::string& source) {
+                                                          const std::string& source,
+                                                          const Eigen::Vector3f* v_world_lin) {
 
   Eigen::Quaternionf q = q_in;
   if (q.squaredNorm() < 1e-10f) {
@@ -2595,8 +2843,12 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     std::lock_guard<std::mutex> lock(this->geo.mtx);
     this->state.p = p;
     this->state.q = q;
-    this->state.v.lin.w = Eigen::Vector3f::Zero();
-    this->state.v.lin.b = Eigen::Vector3f::Zero();
+    // [P3 FIX 2026-07-14] Seed linear velocity from the caller when provided
+    // (GT odom-init carries a valid twist), else zero. Angular velocity is left
+    // zero — the seed only knows a linear velocity.
+    const Eigen::Vector3f v0 = v_world_lin ? *v_world_lin : Eigen::Vector3f::Zero();
+    this->state.v.lin.w = v0;
+    this->state.v.lin.b = q.conjugate() * v0;
     this->state.v.ang.w = Eigen::Vector3f::Zero();
     this->state.v.ang.b = Eigen::Vector3f::Zero();
     // [REVIEW FIX 2026-07-08 P3] Same bias preservation as the param-pose
@@ -2608,7 +2860,7 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     }
     this->geo.prev_p = p;
     this->geo.prev_q = q;
-    this->geo.prev_vel = Eigen::Vector3f::Zero();
+    this->geo.prev_vel = v0;
     if (this->imu_only_mode_) {
       this->geo.first_opt_done = true;
     }
@@ -2624,10 +2876,22 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
   }
   this->initialized = true;  // publish only after ALL pose state is consistent
 
-  // Clear trajectory path on reinitialization
-  this->path_msg.poses.clear();
-  this->path_msg.header.frame_id = this->map_frame;
-  this->path_msg.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->now();
+  // Clear trajectory path on reinitialization.
+  // [P2 FIX 2026-07-14] Take pose_mutex: publishPose (worker thread) assigns and
+  // serializes path_msg.poses under this same lock, so mutating it here unlocked
+  // was a vector data race on a mid-run RViz reinit with the path subscribed.
+  // Also clear the ring buffers — without that the old trajectory is re-appended
+  // from path_buffer_/utm_path_buffer_ on the very next scan, so the clear was
+  // functionally inert.
+  {
+    std::lock_guard<std::mutex> lock(this->pose_mutex);
+    this->path_buffer_.clear();
+    this->utm_path_buffer_.clear();
+    this->path_msg.poses.clear();
+    this->path_msg.header.frame_id = this->map_frame;
+    this->path_msg.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->now();
+    this->utm_path_msg_.poses.clear();
+  }
 
   RCLCPP_INFO(this->get_logger(), "Received initial pose (%s) at [%.2f, %.2f, %.2f]",
               source.c_str(), p.x(), p.y(), p.z());
@@ -2669,7 +2933,21 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
   }
 
   // Legacy synchronous path (concat disabled or non-Luminar sensor).
-  this->processScan(pc_in);
+  // [P3 FIX 2026-07-14] Catch a pipeline exception (e.g. strict-merge abort)
+  // HERE, on whatever executor thread ran this callback. The try/catch around
+  // executor.spin() in main() only covers the single spin-calling thread; under
+  // a MultiThreadedExecutor this callback can run on any of the other N-1
+  // threads, whose uncaught exception bypasses that catch and reaches
+  // std::terminate. Mirror the sync worker's controlled-shutdown handling so
+  // main() converts it into a nonzero exit code via syncFatal().
+  try {
+    this->processScan(pc_in);
+  } catch (const std::exception& e) {
+    this->sync_fatal_.store(true);
+    RCLCPP_FATAL(this->get_logger(),
+                 "legacy scan pipeline threw: %s — initiating controlled shutdown", e.what());
+    rclcpp::shutdown();
+  }
 }
 
 // Front-cloud admission: the ONLY reasons a front cloud is not enqueued are
@@ -2705,6 +2983,15 @@ void gicp_plusplus::LocalizationNode::enqueuePrimary(
   {
     std::lock_guard<std::mutex> lk(this->sync_mtx_);
     ++this->front_received_;
+    // [P3 FIX 2026-07-14] Worker is draining or already joined: account this
+    // late front as shutdown_unprocessed instead of queuing it (the worker will
+    // never release it, so it would otherwise orphan in primary_queue_ and read
+    // as a spurious conservation violation). Keeps received == accounted at all
+    // times so the locked summary snapshot in drainFrontSync is consistent.
+    if (this->sync_shutdown_.load()) {
+      ++this->front_shutdown_unprocessed_;
+      return;
+    }
     // Compute-overload policy — the queue IS a hard bound. One worker runs
     // one full GICP pipeline per front; when the solver is slower than the
     // input rate an unbounded backlog would grow until queued scans outlive
@@ -2725,6 +3012,7 @@ void gicp_plusplus::LocalizationNode::enqueuePrimary(
           this->concat_primary_queue_size_);
     }
     pending.arrival_seq = this->sync_seq_++;
+    pending.epoch = this->sync_epoch_.load();
     this->primary_queue_.push_back(std::move(pending));
   }
   this->sync_cv_.notify_all();
@@ -2759,11 +3047,15 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
         const double clock_off = (i < this->concat_aux_time_offsets_.size())
                                      ? this->concat_aux_time_offsets_[i] : 0.0;
         bool matched = false;
+        bool any_valid_range = false;
+        bool buffer_empty = true;
         LuminarTimestampRangeNs newest;
         {
           std::lock_guard<std::mutex> alk(aux.mtx);
+          buffer_empty = aux.buffer.empty();
           for (const auto& buffered : aux.buffer) {
             if (!buffered.luminar_range.valid) continue;
+            any_valid_range = true;
             const auto shifted = shiftedRange(buffered.luminar_range, clock_off);
             if (endpointDeltaSeconds(front.range, shifted) <=
                 this->concat_luminar_point_threshold_) {
@@ -2776,6 +3068,15 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
           }
         }
         if (matched) continue;
+        // [P3 FIX 2026-07-14] "aux with no absolute point time => final": an aux
+        // whose buffered sweeps carry NO decodable absolute Luminar time can
+        // only ever be merged header-nearest — it will never point-time match.
+        // Treat it as satisfied instead of blocking every release for the full
+        // future-aux timeout (the old behavior added ~concat_future_aux_wait_s
+        // to every front while still reporting the release as ALL_MATCHED). An
+        // EMPTY buffer is genuinely pending — its sweep just hasn't arrived —
+        // so only a non-empty all-invalid buffer counts as final here.
+        if (!buffer_empty && !any_valid_range) continue;
         all_matched = false;
         // Watermark: aux stream has already advanced past this front's window.
         if (!luminarWatermarkPassed(front.range, newest,
@@ -2786,16 +3087,27 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
       }
     }
 
+    // [P2 FIX 2026-07-14] Copy the deadline before waiting. wait_until takes
+    // its time_point by const reference and libstdc++ re-reads it after wake;
+    // the overload path (enqueuePrimary pop_front) can destroy this `front`
+    // element while the lock is released inside wait_until, dangling the
+    // reference — UB precisely in the overload regime the policy targets.
+    const auto deadline = front.deadline;
     const auto now = std::chrono::steady_clock::now();
-    const bool timed_out = now >= front.deadline;
+    const bool timed_out = now >= deadline;
     if (!ready && !timed_out) {
-      this->sync_cv_.wait_until(lk, front.deadline);
+      this->sync_cv_.wait_until(lk, deadline);
       continue;  // re-evaluate: aux arrival, deadline, or shutdown
     }
 
     // Decide the release reason before popping.
     int reason;
-    if (ready && all_matched) {
+    if (!front.range.valid) {
+      // [P3 FIX 2026-07-14] Primary had no decodable absolute point time: the
+      // aux-matching block above was skipped entirely, so "all_matched" is
+      // vacuously true. Report it distinctly instead of as a healthy match.
+      reason = RELEASE_PRIMARY_NO_ABSTIME;
+    } else if (ready && all_matched) {
       reason = RELEASE_ALL_MATCHED;
     } else if (ready) {
       reason = RELEASE_WATERMARK;
@@ -2828,7 +3140,7 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
     // and bypass all accounting — convert it into a controlled shutdown that
     // main() turns into a nonzero exit code.
     try {
-      this->processScan(released.msg);
+      this->processScan(released.msg, released.epoch);
     } catch (const std::exception& e) {
       this->sync_fatal_.store(true);
       RCLCPP_FATAL(this->get_logger(),
@@ -2858,7 +3170,7 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
       this->last_queue_depth_ = static_cast<int>(this->primary_queue_.size());
       lk.unlock();
       try {
-        this->processScan(released.msg);
+        this->processScan(released.msg, released.epoch);
       } catch (const std::exception& e) {
         this->sync_fatal_.store(true);
         RCLCPP_FATAL(this->get_logger(),
@@ -2875,7 +3187,47 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
 }
 
 void gicp_plusplus::LocalizationNode::processScan(
-    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in,
+    uint64_t sync_epoch) {
+
+  // The synchronizer worker intentionally unlocks sync_mtx_ before entering
+  // the expensive scan pipeline. Serialize that handoff with epoch reset: if a
+  // reset wins the gate first, a front that was already popped is identified by
+  // its admission generation and dropped instead of re-seeding reset state.
+  std::unique_lock<std::mutex> epoch_scan_lock(this->epoch_scan_mtx_);
+  const uint64_t no_sync_epoch = std::numeric_limits<uint64_t>::max();
+  if (sync_epoch != no_sync_epoch && sync_epoch != this->sync_epoch_.load()) {
+    {
+      std::lock_guard<std::mutex> sync_lock(this->sync_mtx_);
+      ++this->front_epoch_inflight_dropped_;
+    }
+    RCLCPP_WARN(this->get_logger(),
+                "front sync: dropping in-flight old-epoch front (front_epoch=%lu current_epoch=%lu) "
+                "after coordinated reset",
+                static_cast<unsigned long>(sync_epoch),
+                static_cast<unsigned long>(this->sync_epoch_.load()));
+    return;
+  }
+
+  // [P1 FIX 2026-07-14] Perform a pending coordinated epoch reset at scan-
+  // pipeline entry, on the (serialized) scan thread with no estimator locks
+  // held. Doing it here — rather than only on the IMU thread — keeps the reset
+  // synchronized with the scan pipeline, so a whole scan never runs half across
+  // the reset boundary. The IMU-thread entry (callbackImu) remains as the
+  // fallback for imu_only_mode (no scans). exchange() ensures it runs once.
+  if (this->epoch_reset_pending_.exchange(false)) {
+    this->resetEstimatorForEpochChangeLocked("scan-pipeline", this->epoch_reset_regress_s_.load());
+    // This scan may have been popped from the old epoch just before the reset
+    // flag was set. Fail closed at the boundary; the next admitted front is
+    // tagged with the new generation and seeds a clean estimator.
+    if (sync_epoch != no_sync_epoch) {
+      std::lock_guard<std::mutex> sync_lock(this->sync_mtx_);
+      ++this->front_epoch_inflight_dropped_;
+    }
+    RCLCPP_WARN(this->get_logger(),
+                "dropping scan at epoch-reset boundary to prevent cross-epoch deskew/registration");
+    return;
+  }
 
   // Multi-LiDAR concatenation: merge point-time-aligned aux scans into the
   // primary cloud before any other processing. Downstream steps (TF cache,
@@ -3829,12 +4181,18 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   // placement so the whole prior chain is consistent (see helper above).
   this->applyInsHeadingPriorToBasePose();
 
-  // [REVIEW FIX 2026-07-08] Default validity time for this scan's T_prior /
-  // basePose: the scan header stamp. Every fallback branch below (deskew off,
-  // unsupported sensor, first scan, empty/short IMU history, integration
-  // failure) produces a pose that is best described by the header time; the
-  // main deskew path overrides this with the actual median point time.
-  this->t_prior_stamp_ = this->scan_stamp.seconds();
+  // [P3 FIX 2026-07-14] Default validity time for this scan's T_prior: the time
+  // basePose is ACTUALLY valid at (its previous median point time,
+  // base_pose_stamp_). Every fallback branch below sets T_prior =
+  // basePoseMatrix() — the UN-ADVANCED basePose — so labeling it with the
+  // current header time (the old default) claimed motion that never happened:
+  // a later reject then discarded the median→header interval and mis-timed the
+  // INS-prior GT query on the next scan. Branches that genuinely advance the
+  // pose override this with their real time (the deskew-off integration-success
+  // branch → its integrated stamp; the main deskew path → the median point
+  // time). Fall back to the header only before base_pose_stamp_ is ever set.
+  this->t_prior_stamp_ =
+      (this->base_pose_stamp_ > 0.0) ? this->base_pose_stamp_ : this->scan_stamp.seconds();
 
   // [REVIEW FIX 2026-07-08 P2] Default: cloud NOT world-frame. Only branches
   // that actually transform/place points into the world set this true.
@@ -3864,6 +4222,10 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
                                         this->basePose.p, this->prev_vel, single_ts);
       if (frames.size() == 1 && matrixFinite(frames[0])) {
         this->T_prior = frames[0];
+        // [P3 FIX 2026-07-14] This branch DID advance the pose (integrated to
+        // the clamped header time single_ts[0]); label t_prior_stamp_ with that
+        // real time, overriding the not-advanced default set above.
+        this->t_prior_stamp_ = single_ts[0];
       } else {
         this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
       }
@@ -3931,7 +4293,11 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     } else {
       anchor_ts = std::numeric_limits<uint64_t>::max();
       for (const auto& pt : this->original_scan->points) {
-        anchor_ts = std::min(anchor_ts, luminarPointTimestampNs(pt));
+        // [P3 FIX 2026-07-14] Skip the ts==0 "no valid time" sentinel so one
+        // zero-stamped point cannot anchor the whole sweep at epoch 0.
+        const uint64_t ts = luminarPointTimestampNs(pt);
+        if (ts == 0) continue;
+        anchor_ts = std::min(anchor_ts, ts);
       }
     }
     const uint64_t min_ts_captured = anchor_ts;
@@ -5171,7 +5537,10 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
                 gicp_partial ? " [PARTIAL: degenerate axes kept on IMU prior]" : "",
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
-                this->basePose.p.x(), this->basePose.p.y(), this->basePose.p.z());
+                // [P3 FIX 2026-07-14] Log the local new_p (== basePose.p just
+                // written under seed_mtx_) instead of re-reading this->basePose.p
+                // unlocked, which raced a cross-thread /initialpose reinit.
+                new_p.x(), new_p.y(), new_p.z());
   } else {
     // Any non-accepted scan (failed_to_converge, rejected_fitness, rejected_jump, invalid_solution)
     // falls back to the IMU-integrated prior. Freezing at last_gicp_pose_ causes cascade
@@ -5238,8 +5607,17 @@ void gicp_plusplus::LocalizationNode::publishPose() {
   // scan_stamp on snap). Stamping everything with the raw header time skewed
   // TF/path/pose consumers by ~half a sweep (~50 ms: 1.5 deg at 30 deg/s,
   // 3 m at 60 m/s for anyone interpolating against another sensor).
-  const rclcpp::Time pub_stamp = (this->base_pose_stamp_ > 0.0)
-      ? rclcpp::Time(static_cast<int64_t>(this->base_pose_stamp_ * 1e9),
+  // [P3 FIX 2026-07-14] Snapshot base_pose_stamp_ under seed_mtx_ (its owner
+  // lock): the accept/reject/snap paths write it under seed_mtx_ on the scan
+  // thread while this publisher runs on another thread holding only pose_mutex.
+  // Lock order pose -> seed matches every other site.
+  double base_pose_stamp_snapshot;
+  {
+    std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+    base_pose_stamp_snapshot = this->base_pose_stamp_;
+  }
+  const rclcpp::Time pub_stamp = (base_pose_stamp_snapshot > 0.0)
+      ? rclcpp::Time(static_cast<int64_t>(base_pose_stamp_snapshot * 1e9),
                      this->scan_stamp.get_clock_type())
       : this->scan_stamp;
 
@@ -5438,7 +5816,16 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
     if (!this->use_odom_init_applied_.load() && this->composeGtPoseInBase(s, init_p, init_q)) {
       this->use_odom_init_applied_ = true;
       const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
-      this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom");
+      // [P3 FIX 2026-07-14] Seed velocity from the GT message's own twist so a
+      // mid-run start does not dead-reckon from v=0 (which makes the first IMU
+      // prior integrate from zero and immediately re-fail). Compose the twist
+      // into base frame and rotate the linear part into world with init_q.
+      Eigen::Vector3f init_v_lin_base_body, init_v_ang_base_body;
+      const bool have_twist =
+          this->composeGtTwistInBase(s, init_v_lin_base_body, init_v_ang_base_body);
+      const Eigen::Vector3f init_v_world = init_q * init_v_lin_base_body;
+      this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom",
+                             have_twist ? &init_v_world : nullptr);
       {
         std::lock_guard<std::mutex> lock(this->geo.mtx);
         this->geo.first_opt_done = true;
@@ -5457,6 +5844,21 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
 
   std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
   if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
+    // [P1 FIX 2026-07-14] A large backward jump is an epoch reset (bag loop /
+    // adapter re-anchor / power-cycle): flag a COORDINATED estimator reset
+    // (performed on the IMU thread — see resetEstimatorForEpochChange). Do NOT
+    // clear gt_odom_buffer_ alone here: with the observer seeds / calibration
+    // timers still on the old epoch, GT lookups would read a fresh buffer with
+    // old-epoch scan stamps and the INS prior / snap / cross-check would
+    // silently misbehave. Small regressions are dropped as out-of-order.
+    if (this->gt_odom_buffer_.back().stamp - s.stamp > 5.0 && !this->epoch_reset_pending_.load()) {
+      this->epoch_reset_regress_s_.store(this->gt_odom_buffer_.back().stamp - s.stamp);
+      this->epoch_reset_pending_.store(true);
+      RCLCPP_WARN(this->get_logger(),
+                  "GT odom stamp EPOCH RESET detected (rewind %.3f s → %.3f); scheduling coordinated "
+                  "estimator re-initialization.",
+                  this->gt_odom_buffer_.back().stamp - s.stamp, s.stamp);
+    }
     // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
     return;
   }
@@ -5520,7 +5922,15 @@ bool gicp_plusplus::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
   auto a = std::prev(it);
   auto b = it;
   const double dt_total = b->stamp - a->stamp;
-  if (dt_total <= 0.0 || std::min(stamp - a->stamp, b->stamp - stamp) > this->gt_odom_max_dt_) {
+  // [P2 FIX 2026-07-14] Bound the BRACKET WIDTH, not just the nearer endpoint.
+  // gt_odom_max_dt_ only limits the closer of the two bracketing samples, so a
+  // query landing mid-gap across an unbounded GT dropout returned a chord pose
+  // (up to metres / degrees through a curve) whose conservatively-combined
+  // covariance can still pass the RTK gate and then feed the INS heading prior,
+  // calibration and cross-check. Reject interpolation across a large gap
+  // (mirrors GLIM's max_interp_gap_sec P1 fix).
+  if (dt_total <= 0.0 || dt_total > this->gt_interp_max_gap_ ||
+      std::min(stamp - a->stamp, b->stamp - stamp) > this->gt_odom_max_dt_) {
     return false;
   }
   const float u = static_cast<float>((stamp - a->stamp) / dt_total);
@@ -5566,6 +5976,10 @@ bool gicp_plusplus::LocalizationNode::getGtFiniteDiffVelWorld(
   if (a == b) b = std::next(b);  // query before first sample: use first pair
   const double dt = b->stamp - a->stamp;
   if (dt <= 1e-6) return false;
+  // [P2 FIX 2026-07-14] Bound the bracket width too (see getGtPoseAt): a finite
+  // difference taken across an unbounded GT dropout yields a chord velocity
+  // that backfills the snap twist with a wrong value.
+  if (dt > this->gt_interp_max_gap_) return false;
   // Both endpoints must be reasonably close to the query, mirroring
   // getGtPoseAt's staleness contract.
   if (std::min(std::abs(stamp - a->stamp), std::abs(b->stamp - stamp)) >
@@ -5608,10 +6022,18 @@ bool gicp_plusplus::LocalizationNode::composeGtTwistInBase(
   const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
   const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
   const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
+  // Base origin position expressed in gt_body coords (translation of the inverse
+  // transform); the lever-arm cross product below is therefore in gt_body coords.
   const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
 
-  v_ang_body_out = R_gtbody_base * gt.v_ang_body;
-  v_lin_body_out = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+  // [P3 FIX 2026-07-14] Rotate the gt_body-frame twist INTO base coordinates
+  // with R_base_gtbody (T_base_gtbody maps gt_body -> base, so a free vector
+  // transforms v_base = R_base_gtbody * v_gtbody). The former code used the
+  // TRANSPOSE R_gtbody_base, which applies the inverse rotation — wrong frame
+  // whenever the gt_body -> base rotation is not identity (identity on AV-24
+  // today, so latent, but a real bug for any off-base gt source).
+  v_ang_body_out = R_base_gtbody * gt.v_ang_body;
+  v_lin_body_out = R_base_gtbody * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
   return true;
 }
 
@@ -5905,7 +6327,9 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   Eigen::Vector3f omega_base_body = Eigen::Vector3f::Zero();
   bool omega_from_imu = false;
   if (gt_ang_valid) {
-    omega_base_body = R_gtbody_base * gt.v_ang_body;
+    // [P3 FIX 2026-07-14] R_base_gtbody (not the transpose) rotates the gt_body
+    // twist into base coords — see composeGtTwistInBase.
+    omega_base_body = R_base_gtbody * gt.v_ang_body;
   } else {
     std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
     if (this->first_imu_received &&
@@ -5920,7 +6344,8 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   bool lin_resolved = false;
   bool lin_from_fd = false;
   if (gt_lin_valid) {
-    v_base_body = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+    // [P3 FIX 2026-07-14] R_base_gtbody (not the transpose) — see composeGtTwistInBase.
+    v_base_body = R_base_gtbody * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
     lin_resolved = true;
   } else {
     Eigen::Vector3f v_fd_world;
@@ -6070,6 +6495,16 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
 
 void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu) {
 
+  // [P1 FIX 2026-07-14] Perform a pending coordinated epoch reset here — at IMU
+  // callback entry, with NO estimator locks held (detection in the buffer-insert
+  // block below and in callbackGtOdom only SETS the flag; it cannot safely
+  // acquire the higher locks while holding a leaf lock). exchange() makes exactly
+  // one reentrant IMU thread perform the reset.
+  if (this->epoch_reset_pending_.exchange(false)) {
+    std::unique_lock<std::mutex> epoch_scan_lock(this->epoch_scan_mtx_);
+    this->resetEstimatorForEpochChangeLocked("imu-stream", this->epoch_reset_regress_s_.load());
+  }
+
   double stamp = imu->header.stamp.sec + imu->header.stamp.nanosec * 1e-9;
 
   Eigen::Vector3f ang_vel(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
@@ -6193,10 +6628,27 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
       // 100+ Hz the information loss is negligible and every downstream
       // invariant holds.
       if (stamp <= newest_stamp) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                             "IMU sample out of order (%.6f <= newest %.6f) — dropped to keep "
-                             "the buffer monotonic (reentrant callback race)",
-                             stamp, newest_stamp);
+        // [P1 FIX 2026-07-14] Distinguish a reentrant-race inversion (ms-scale)
+        // from an epoch reset (bag loop / adapter re-anchor / power-cycle,
+        // seconds-scale). A large backward jump invalidates the whole estimator
+        // timeline, so flag a COORDINATED reset (performed at the next IMU
+        // callback entry — see callbackImu top / resetEstimatorForEpochChange).
+        // A per-buffer clear here would leave base_pose_stamp_ / deskew /
+        // calibration on the old epoch and silently corrupt output. Either way
+        // this sample is dropped to keep the buffer monotone.
+        if (newest_stamp - stamp > 5.0 && !this->epoch_reset_pending_.load()) {
+          this->epoch_reset_regress_s_.store(newest_stamp - stamp);
+          this->epoch_reset_pending_.store(true);
+          RCLCPP_WARN(this->get_logger(),
+                      "IMU stamp EPOCH RESET detected (rewind %.3f s → %.6f); scheduling coordinated "
+                      "estimator re-initialization.",
+                      newest_stamp - stamp, stamp);
+        } else {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                               "IMU sample out of order (%.6f <= newest %.6f) — dropped to keep "
+                               "the buffer monotonic (reentrant callback race)",
+                               stamp, newest_stamp);
+        }
         return;
       }
       imu_meas_temp.dt = stamp - newest_stamp;
@@ -6323,13 +6775,51 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
 
       this->imu_calib_gyro_sum_ += ang_vel;
       this->imu_calib_accel_sum_ += lin_accel;
+      this->imu_calib_gyro_sq_sum_ += ang_vel.cwiseProduct(ang_vel);
       this->imu_calib_count_++;
 
       double elapsed = stamp - this->imu_calib_start_stamp_;
       if (elapsed >= this->imu_calib_time_ && this->imu_calib_count_ > 0) {
-        Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
-        Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
+        const float calib_n = static_cast<float>(this->imu_calib_count_);
+        Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / calib_n;
+        Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / calib_n;
 
+        // [P3 FIX 2026-07-14] Stationarity sanity check. This path ASSUMES
+        // omega=0; under seed-and-go with GNSS absent the window can complete
+        // while the vehicle is actually turning (up to ~0.5 rad/s), which would
+        // bake real body rates permanently into state.b.gyro. Require the mean
+        // gyro near zero AND small per-axis spread AND |accel| ~ gravity, plus
+        // the RTK path's plausibility bounds. If the window is not stationary,
+        // restart it rather than trusting a motion-contaminated bias — the gyro
+        // bias stays at its safe default (0) until a stationary window or an
+        // opportunistic RTK-FIXED pairing calibrates it.
+        constexpr float kMaxStationaryGyroMean = 0.05f;    // ~3 deg/s
+        constexpr float kMaxStationaryGyroStd = 0.05f;
+        const Eigen::Vector3f gyro_var =
+            (this->imu_calib_gyro_sq_sum_ / calib_n - gyro_avg.cwiseProduct(gyro_avg))
+                .cwiseMax(0.0f);
+        const float gyro_std_max = std::sqrt(gyro_var.maxCoeff());
+        const float g = static_cast<float>(this->gravity_);
+        const bool stationary =
+            gyro_avg.norm() < kMaxStationaryGyroMean && gyro_std_max < kMaxStationaryGyroStd &&
+            gyro_avg.norm() < 1.0f &&                       // RTK-path plausibility bound
+            std::abs(accel_avg.norm() - g) < 0.5f * g;      // |accel| ~ gravity, not accelerating
+        if (!stationary) {
+          RCLCPP_WARN_THROTTLE(
+              this->get_logger(), *this->get_clock(), 2000,
+              "Stationary IMU calibration: window NOT stationary (|gyro_mean|=%.3f rad/s, "
+              "gyro_std=%.3f rad/s, |accel|=%.2f m/s^2); vehicle likely moving. Restarting the "
+              "window; gyro bias stays 0 until a stationary window or an RTK-FIXED pairing.",
+              gyro_avg.norm(), gyro_std_max, accel_avg.norm());
+          this->imu_calib_start_stamp_ = stamp;
+          this->imu_calib_count_ = 0;
+          this->imu_calib_gyro_sum_.setZero();
+          this->imu_calib_accel_sum_.setZero();
+          this->imu_calib_gyro_sq_sum_.setZero();
+          if (!can_propagate_now) return;  // unseeded: keep waiting for a stationary window
+          // seeded: fall through past the bake and keep propagating; the window
+          // retries in the background.
+        } else {
         // [P2 FIX 2026-07-09] Gravity SIGN. This rig's documented convention
         // (see the specific-force note in tryRtkCalibrationStep) is that a
         // level stationary body reads accel ~= (0,0,+g), and the propagation
@@ -6386,6 +6876,7 @@ void gicp_plusplus::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::S
                     gyro_avg.x(), gyro_avg.y(), gyro_avg.z(),
                     this->state.b.accel.x(), this->state.b.accel.y(), this->state.b.accel.z(),
                     grav_body.x(), grav_body.y(), grav_body.z());
+        }  // end else (stationary window accepted)
       } else if (!can_propagate_now) {
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "IMU calibrating (stationary)... %.1f/%.1fs (%d samples)",

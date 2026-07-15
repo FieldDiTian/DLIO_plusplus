@@ -137,6 +137,19 @@ int main(int argc, char** argv) {
   const double concat_time_threshold = concat_config.time_threshold;
   auto& aux_sensors = concat_config.aux_sensors;
 
+  // [P3 FIX 2026-07-14] Reject an aux topic that equals the primary points
+  // topic. Pass 1 (aux-first classification) and pass 2 (primary-first, see the
+  // dispatch below) would classify such a message differently, desynchronizing
+  // the ordinal plan so zero scans map. Fail loud at startup.
+  for (const auto& sensor : aux_sensors) {
+    if (sensor.topic == points_topic) {
+      spdlog::error("lidar_concat: aux_topics contains the primary points topic '{}' — "
+                    "this desynchronizes the two-pass ordinal plan (zero scans map); "
+                    "refusing to start", points_topic);
+      return 1;
+    }
+  }
+
   for (const auto& sensor : aux_sensors) {
     topics.push_back(sensor.topic);
   }
@@ -303,6 +316,11 @@ int main(int argc, char** argv) {
     sensor_msgs::msg::PointCloud2::SharedPtr msg;
     double enqueue_bag_time_s = 0.0;
     uint64_t ordinal = 0;  // per-topic bag-record ordinal (two-pass plan key)
+    // [P3 FIX 2026-07-14] Cache the primary's point-time range + header time at
+    // enqueue so the streaming-fallback readiness poll never re-walks ~10^5
+    // points per bag event.
+    glim_ros::LuminarTimestampRangeNs range;
+    double header_s = 0.0;
   };
   std::deque<PendingPrimaryScan> pending_primary_scans;
   double latest_bag_time_s = 0.0;  // stream time of the newest message read
@@ -383,7 +401,7 @@ int main(int argc, char** argv) {
           }
         }
       } else if (!force && !glim_ros::aux_buffers_ready_for_primary(
-                             *primary, aux_sensors,
+                             pending.range, pending.header_s, aux_sensors,
                              concat_config.luminar_time_threshold)) {
         if (latest_bag_time_s - pending.enqueue_bag_time_s <
             concat_config.future_sweep_wait_timeout) {
@@ -402,14 +420,29 @@ int main(int argc, char** argv) {
 
       const int epoch_anchor_count =
         static_cast<int>(primary->width * primary->height);
-      const auto final_points = glim_ros::merge_clouds(
-        primary, aux_sensors, concat_time_threshold,
-        concat_config.require_all_aux,
-        concat_config.max_consecutive_aux_merge_failures,
-        &concat_config.consecutive_merge_failures,
-        concat_config.abort_on_merge_failure,
-        concat_config.frame_diag_log,
-        concat_config.luminar_time_threshold);
+      // [P3 FIX 2026-07-14] The strict-merge abort (require_all_aux past budget)
+      // throws std::runtime_error from merge_clouds. Uncaught it unwound out of
+      // read_bag to std::terminate — no glim->save(), no accounting. Convert it
+      // to a controlled stop (partial dump kept, nonzero exit), matching GICP
+      // and these readers' own hard-error policy. The un-merged primary stays in
+      // pending_primary_scans, so it is counted as still_pending.
+      sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points;
+      try {
+        final_points = glim_ros::merge_clouds(
+          primary, aux_sensors, concat_time_threshold,
+          concat_config.require_all_aux,
+          concat_config.max_consecutive_aux_merge_failures,
+          &concat_config.consecutive_merge_failures,
+          concat_config.abort_on_merge_failure,
+          concat_config.frame_diag_log,
+          concat_config.luminar_time_threshold,
+          concat_config.float64_time_is_epoch_ns);
+      } catch (const std::exception& e) {
+        g_bag_hard_error = true;
+        spdlog::error("lidar_concat: strict-merge abort: {} — stopping the run "
+                      "(partial dump kept, exiting nonzero)", e.what());
+        return false;
+      }
       const double primary_header_s =
         glim_ros::stamp_to_sec(primary->header.stamp);
       pending_primary_scans.pop_front();
@@ -594,20 +627,37 @@ int main(int argc, char** argv) {
         spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
               return false;
             }
+            // [P2 FIX 2026-07-14] Consume the per-topic ordinal BEFORE
+            // deserializing so a corrupt CDR message still advances it and the
+            // pass-1/pass-2 plan identity stays aligned (pass 1 also consumes an
+            // ordinal for malformed messages). Guard the deserialize: an
+            // uncaught throw here reached std::terminate — no glim->save(), no
+            // accounting. Report it (streaming-pass contract) + hard error + skip.
+            const uint64_t akey = two_pass_active ? aux_ordinal_next[aux_i]++ : 0;
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
-            points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
+            try {
+              points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
+            } catch (const std::exception& e) {
+              g_bag_hard_error = true;
+              spdlog::error("failed to deserialize aux PointCloud2 (topic={} ordinal={}): {} — "
+                            "skipping (ordinal consumed to keep the two-pass plan aligned)",
+                            msg->topic_name, akey, e.what());
+              is_aux_sensor = true;
+              break;
+            }
             if (two_pass_active) {
               // Keep only sweeps the pass-1 plan selected; everything else is
               // known-unused and discarded immediately. Identity = per-topic
               // ordinal (counted for EVERY message on the topic, matching the
               // pass-1 counting rule exactly).
-              const uint64_t akey = aux_ordinal_next[aux_i]++;
               if (planned_aux_ordinals[aux_i].count(akey)) {
                 planned_aux_store[aux_i].emplace(
-                  akey, StoredAuxCloud{glim_ros::buffer_aux_cloud(aux_msg), latest_bag_time_s});
+                  akey, StoredAuxCloud{glim_ros::buffer_aux_cloud(
+                    aux_msg, concat_config.float64_time_is_epoch_ns), latest_bag_time_s});
               }
             } else {
-              aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
+              aux.buffer.push_back(glim_ros::buffer_aux_cloud(
+                aux_msg, concat_config.float64_time_is_epoch_ns));
               while (aux.buffer.size() > aux.buffer_size) {
                 aux.buffer.pop_front();
               }
@@ -627,8 +677,20 @@ int main(int argc, char** argv) {
           return false;
         }
         auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
-        imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
-        glim->imu_callback(imu_msg);
+        // [P2 FIX 2026-07-14] Guard deserialize: an uncaught throw reached
+        // std::terminate (no glim->save()). Report + hard error + skip the
+        // callback (fall through so the per-message drain/timer still run).
+        bool imu_deser_ok = true;
+        try {
+          imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
+        } catch (const std::exception& e) {
+          imu_deser_ok = false;
+          g_bag_hard_error = true;
+          spdlog::error("failed to deserialize Imu (topic={}): {} — skipping", msg->topic_name, e.what());
+        }
+        if (imu_deser_ok) {
+          glim->imu_callback(imu_msg);
+        }
       } else if (msg->topic_name == points_topic) {
         if (topic_type != "sensor_msgs/msg/PointCloud2") {
           g_bag_hard_error = true;
@@ -636,11 +698,35 @@ int main(int argc, char** argv) {
           return false;
         }
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
-        points_serialization.deserialize_message(&serialized_msg, points_msg.get());
+        // [P2 FIX 2026-07-14] Guard deserialize (an uncaught throw reached
+        // std::terminate, no glim->save()). On failure in two-pass concat mode
+        // the primary ordinal MUST still be consumed so the pass-1/pass-2 plan
+        // stays aligned (pass 1 consumes an ordinal for a malformed primary
+        // too); the corrupt scan is simply never received/forwarded, which keeps
+        // the primary-accounting invariant intact.
+        bool points_deser_ok = true;
+        try {
+          points_serialization.deserialize_message(&serialized_msg, points_msg.get());
+        } catch (const std::exception& e) {
+          points_deser_ok = false;
+          g_bag_hard_error = true;
+          spdlog::error("failed to deserialize primary PointCloud2 (topic={}): {} — skipping",
+                        msg->topic_name, e.what());
+        }
 
-        if (concat_enabled && !aux_sensors.empty()) {
-          pending_primary_scans.push_back(
-            {points_msg, latest_bag_time_s, primary_ordinal_next++});
+        if (!points_deser_ok) {
+          if (concat_enabled && !aux_sensors.empty()) {
+            ++primary_ordinal_next;  // stay aligned with the pass-1 ordinal plan
+          }
+        } else if (concat_enabled && !aux_sensors.empty()) {
+          PendingPrimaryScan scan;
+          scan.msg = points_msg;
+          scan.enqueue_bag_time_s = latest_bag_time_s;
+          scan.ordinal = primary_ordinal_next++;
+          scan.range = glim_ros::luminar_timestamp_range(
+            *points_msg, concat_config.float64_time_is_epoch_ns);  // decode once
+          scan.header_s = glim_ros::stamp_to_sec(points_msg->header.stamp);
+          pending_primary_scans.push_back(std::move(scan));
           ++primary_received;
           // Drained once per message below.
         } else {
@@ -662,8 +748,18 @@ int main(int argc, char** argv) {
           return false;
         }
         auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
-        odometry_serialization.deserialize_message(&serialized_msg, odom_msg.get());
-        glim->external_odom_callback(odom_msg);
+        // [P2 FIX 2026-07-14] Guard deserialize (uncaught throw -> std::terminate).
+        bool odom_deser_ok = true;
+        try {
+          odometry_serialization.deserialize_message(&serialized_msg, odom_msg.get());
+        } catch (const std::exception& e) {
+          odom_deser_ok = false;
+          g_bag_hard_error = true;
+          spdlog::error("failed to deserialize Odometry (topic={}): {} — skipping", msg->topic_name, e.what());
+        }
+        if (odom_deser_ok) {
+          glim->external_odom_callback(odom_msg);
+        }
       }
 #ifdef BUILD_WITH_CV_BRIDGE
       else if (msg->topic_name == image_topic) {
@@ -777,7 +873,8 @@ int main(int argc, char** argv) {
             const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
             pc2_ser.deserialize_message(&serialized_msg, pc.get());
             s.header_ns = header_stamp_ns(pc->header.stamp);
-            s.range = glim_ros::luminar_timestamp_range(*pc);
+            s.range = glim_ros::luminar_timestamp_range(
+              *pc, concat_config.float64_time_is_epoch_ns);
           } catch (const std::exception&) {
             // Malformed message: still consumes an ordinal (invalid range);
             // the streaming pass reports the deserialization failure itself.

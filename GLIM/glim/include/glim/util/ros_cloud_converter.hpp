@@ -71,7 +71,12 @@ Eigen::Vector4d get_vec4(const void* x, const void* y, const void* z) {
 // these primary points instead of the global merged minimum, so an aux scan that
 // began before the primary does not drag the whole merged sweep late. For a
 // single sensor it is left at -1 and the global minimum is used (unchanged).
-static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const std::string& intensity_channel, const std::string& ring_channel, int epoch_anchor_count = -1) {
+// `float64_time_is_epoch_ns` (default false): when the per-point time field is
+// FLOAT64, treat its raw bytes as a uint64 PTP epoch-NANOSECOND value (the
+// documented Luminar driver variant) instead of IEEE-754 seconds. This is an
+// EXPLICIT operator/driver contract, never inferred from value magnitude — see
+// the FLOAT64 case below.
+static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const std::string& intensity_channel, const std::string& ring_channel, int epoch_anchor_count = -1, bool float64_time_is_epoch_ns = false) {
   int num_points = points_msg.width * points_msg.height;
 
   int x_type = 0;
@@ -168,9 +173,24 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         case PointField::FLOAT32:
           raw_points->times[i] = *reinterpret_cast<const float*>(time_ptr);
           break;
-        case PointField::FLOAT64:
-          raw_points->times[i] = *reinterpret_cast<const double*>(time_ptr);
+        case PointField::FLOAT64: {
+          // [P2 FIX 2026-07-15] Decode FLOAT64 as genuine IEEE-754 seconds by
+          // default. A previous attempt disambiguated the Luminar FLOAT64-epoch-
+          // ns driver variant from a magnitude heuristic, but that is unsound:
+          // the IEEE-754 bit pattern of an ordinary small relative offset (e.g.
+          // 1e-5 s -> 0x3EE5798EE2308C3A ~= 4.53e18 as uint64) falls inside the
+          // epoch-ns range, so 10 us point offsets were misread as year-2113
+          // stamps. The raw-uint64 decode is now an EXPLICIT Luminar-contract
+          // opt-in (float64_time_is_epoch_ns), never guessed from magnitude.
+          if (float64_time_is_epoch_ns) {
+            std::uint64_t time_ns = 0;
+            std::memcpy(&time_ns, time_ptr, sizeof(std::uint64_t));
+            raw_points->times[i] = static_cast<double>(time_ns) / 1e9;
+          } else {
+            raw_points->times[i] = *reinterpret_cast<const double*>(time_ptr);
+          }
           break;
+        }
         case PointField::UINT8:
           if (time_count == 8) {
             // Luminar Iris: little-endian uint64 PTP epoch nanoseconds.
@@ -227,7 +247,17 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         (epoch_anchor_count > 0 && static_cast<size_t>(epoch_anchor_count) <= raw_points->times.size())
           ? static_cast<size_t>(epoch_anchor_count)
           : raw_points->times.size();
-      const double min_time = *std::min_element(raw_points->times.begin(), raw_points->times.begin() + anchor_n);
+      // [P3 FIX 2026-07-14] Skip the ts==0 "no valid time" sentinel when finding
+      // the anchor minimum (GICP's decoder skips it too): one zero-stamped point
+      // would otherwise pin min_time to 0 and rebase the entire sweep against
+      // epoch 0. Fall back to 0 only if EVERY anchor point was zero.
+      double min_time = 0.0;
+      bool have_min = false;
+      for (size_t i = 0; i < anchor_n; ++i) {
+        const double t = raw_points->times[i];
+        if (t == 0.0) continue;
+        if (!have_min || t < min_time) { min_time = t; have_min = true; }
+      }
       const double header_sec = to_sec(points_msg.header.stamp);
       if (max_time >= 1.0 && std::abs(header_sec - min_time) > 1.0) {
         const double offset = header_sec - min_time;

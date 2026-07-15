@@ -40,6 +40,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -131,8 +132,13 @@ private:
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
   bool maybeSnapPoseToGT(const char* reason);
+  // [P3 FIX 2026-07-14] Optional world-frame linear velocity seed. When null
+  // (RViz /initialpose, param pose) velocity is zeroed as before; the GT
+  // odom-init path passes the message's own twist so a mid-run seed does not
+  // start dead-reckoning from v=0.
   void applyInitialPose(const Eigen::Vector3f& p, const Eigen::Quaternionf& q,
-                        const rclcpp::Time& stamp, const std::string& source);
+                        const rclcpp::Time& stamp, const std::string& source,
+                        const Eigen::Vector3f* v_world_lin = nullptr);
   // RTK-driven calibration: accumulate one residual sample if a time-matched GT
   // exists at `stamp`. Returns true if the calibration window has filled and
   // biases were applied (caller should mark imu_calibrated_).
@@ -156,6 +162,28 @@ private:
   void performLocalization();
   void publishPose();
   void applyInitialPoseFromParams();
+
+  // [P1 FIX 2026-07-14] Coordinated epoch reset. A large backward stamp jump
+  // (bag loop / adapter re-anchor / device power-cycle) invalidates the WHOLE
+  // estimator's timestamped state at once; clearing one buffer in isolation
+  // leaves the rest cross-epoch-inconsistent and silently corrupts output.
+  // resetEstimatorForEpochChangeLocked re-initializes every runtime-resettable piece
+  // coherently — imu/gt buffers, timestamp seeds, the init/calibration state
+  // machine, and the observer state — so the node re-seeds cleanly on the new
+  // epoch (re-applying the param initial pose when configured). It runs on the
+  // IMU thread with NO estimator locks held and acquires them in the canonical
+  // order pose -> seed -> calib -> gt_odom -> geo -> imu (a consistent superset
+  // of every nested acquisition elsewhere), so a concurrent scan/gt/imu callback
+  // only ever observes the fully-reset state, never a half-reset one. The scan
+  // path then re-converges within a frame or two as prev_scan_stamp (reset to 0)
+  // tracks the new epoch. Detection (imuCallback / callbackGtOdom) only sets
+  // epoch_reset_pending_; the next scan or IMU callback performs the reset.
+  // Caller must hold epoch_scan_mtx_. Keeping the reset and a whole scan under
+  // one gate prevents either from observing the other half-complete.
+  void resetEstimatorForEpochChangeLocked(const char* source, double regress_s);
+  std::atomic<bool> epoch_reset_pending_{false};
+  std::atomic<double> epoch_reset_regress_s_{0.0};
+  std::mutex epoch_scan_mtx_;
   bool loadUTMTransform(const std::string& path);
 
   // Multi-LiDAR concatenation. Aux callbacks decode the absolute point-time
@@ -183,7 +211,10 @@ public:
 private:
   // The pre-existing scan pipeline (merge -> deskew -> GICP); runs on the
   // executor scan thread in legacy mode, on the sync worker otherwise.
-  void processScan(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in);
+  // sync_epoch is captured at front admission. Legacy callers use the sentinel
+  // because they do not pass through the asynchronous front queue.
+  void processScan(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in,
+                   uint64_t sync_epoch = std::numeric_limits<uint64_t>::max());
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
@@ -222,6 +253,7 @@ private:
   bool gt_odom_enabled_;
   size_t gt_odom_buffer_size_;
   double gt_odom_max_dt_;  // seconds; reject lookups farther than this from scan stamp
+  double gt_interp_max_gap_ = 0.5;  // [P2 FIX 2026-07-14] max bracket width for GT interpolation
   std::deque<GtSample> gt_odom_buffer_;
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
@@ -310,6 +342,7 @@ private:
     std::chrono::steady_clock::time_point enqueued;
     std::chrono::steady_clock::time_point deadline;
     uint64_t arrival_seq = 0;
+    uint64_t epoch = 0;  // synchronizer epoch at admission
   };
   enum FrontReleaseReason : int {
     RELEASE_ALL_MATCHED = 0,
@@ -320,6 +353,11 @@ private:
     // instead of releasing it early.
     RELEASE_QUEUE_PRESSURE = 3,
     RELEASE_SHUTDOWN_DRAIN = 4,
+    // [P3 FIX 2026-07-14] Primary cloud carried no decodable absolute point
+    // time: point-time matching is impossible, so the front is released
+    // immediately (header-nearest merge downstream). Formerly counted as
+    // RELEASE_ALL_MATCHED, which reported a broken-schema stream as healthy.
+    RELEASE_PRIMARY_NO_ABSTIME = 5,
   };
   bool sync_active_ = false;        // Luminar + concat: worker owns release order
   std::deque<PendingPrimaryCloud> primary_queue_;  // guarded by sync_mtx_
@@ -328,15 +366,21 @@ private:
   std::thread sync_worker_;
   std::atomic<bool> sync_shutdown_{false};
   uint64_t sync_seq_ = 0;                          // guarded by sync_mtx_
+  std::atomic<uint64_t> sync_epoch_{0};            // incremented with reset queue purge
   // Conservation counters (sync_mtx_). Invariant, checked in the summary:
   //   front_received_ == front_released_ + front_invalid_
   //                      + front_shutdown_unprocessed_ + front_overload_dropped_
+  //                      + front_epoch_dropped_
   uint64_t front_received_ = 0;
   uint64_t front_released_ = 0;
   uint64_t front_invalid_ = 0;
   uint64_t front_shutdown_unprocessed_ = 0;
   uint64_t front_overload_dropped_ = 0;  // compute-overload coalescing drops
-  uint64_t release_reason_counts_[5] = {0, 0, 0, 0, 0};
+  uint64_t front_epoch_dropped_ = 0;     // [P2 FIX 2026-07-15] fronts discarded on an epoch reset
+  // Already counted as released when the worker had popped it before reset;
+  // kept separate from the conservation invariant for explicit visibility.
+  uint64_t front_epoch_inflight_dropped_ = 0;
+  uint64_t release_reason_counts_[6] = {0, 0, 0, 0, 0, 0};
   // Set when the scan pipeline throws on the worker thread (e.g. the strict
   // require_all_aux abort): the worker stops processing, requests shutdown,
   // and main() converts this into a nonzero exit code.
@@ -559,6 +603,9 @@ private:
   int imu_calib_count_;
   Eigen::Vector3f imu_calib_gyro_sum_;
   Eigen::Vector3f imu_calib_accel_sum_;
+  // [P3 FIX 2026-07-14] Per-axis sum of squares for the stationarity sanity
+  // check (variance = sq_sum/n - mean^2) before baking a stationary gyro bias.
+  Eigen::Vector3f imu_calib_gyro_sq_sum_ = Eigen::Vector3f::Zero();
 
   // RTK-driven IMU calibration (uses GT odom as truth source; allows calibrating
   // while moving). Falls back to the stationary path above if no GT sample

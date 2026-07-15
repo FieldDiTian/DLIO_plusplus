@@ -80,6 +80,7 @@ private:
   bool dump_on_unload;
 
   std::string intensity_field, ring_field;
+  bool float64_time_is_epoch_ns = false;  // [P2 FIX 2026-07-15] Luminar FLOAT64-epoch-ns opt-in
   bool flip_points_y;
 
   // Extension modulles

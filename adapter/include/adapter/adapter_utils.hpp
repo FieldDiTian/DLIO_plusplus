@@ -35,6 +35,11 @@ public:
 
   void addPosePair(double arrival_ros, double p1_time);
   bool ready() const;
+  // [P1 FIX 2026-07-15] Force a re-anchor (clear bins + slew + streaks). The
+  // node calls this when it accepts an epoch change (backward power-cycle OR a
+  // persistence-confirmed forward epoch), so the mapper never carries a stale
+  // min-lag from the previous epoch into the new one.
+  void reset();
   // [P3 FIX 2026-07-10] Non-const: applies a SLEW-LIMITED offset. Online
   // bin refinement moves the raw offset in steps (each new bin contributes
   // its first sample's full transport latency before min_lag converges);

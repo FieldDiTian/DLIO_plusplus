@@ -58,6 +58,10 @@ public:
     body_frame_id_ = declare_parameter("body_frame_id", "gps_antenna_top");
     rtk_max_var_xy_ = declare_parameter("rtk_max_var_xy", 1e-3);
     rtk_max_var_z_ = declare_parameter("rtk_max_var_z", 5e-3);
+    // [P2 FIX 2026-07-14] Max forward jump (s) of an output pose stamp vs the
+    // last published one before it is treated as a glitch and dropped. A
+    // persistent jump past this bound is accepted as a session reset.
+    pose_max_forward_jump_sec_ = declare_parameter("pose_max_forward_jump_sec", 5.0);
     publish_gnss_pose_ = declare_parameter("publish_gnss_pose", true);
     summary_output_path_ = declare_parameter("summary_output_path", "");
     imu_p1_sidecar_path_ = declare_parameter("imu_p1_sidecar_path", "");
@@ -82,17 +86,29 @@ public:
     require_positive_finite("p1_like_threshold_sec", p1_like_threshold_sec_);
     require_positive_finite("imu_p1_sidecar_match_tolerance_sec",
                             imu_p1_sidecar_match_tolerance_sec_);
+    require_positive_finite("pose_max_forward_jump_sec", pose_max_forward_jump_sec_);
 
     if (!imu_p1_sidecar_path_.empty()) {
       loadImuP1Sidecar(imu_p1_sidecar_path_);
     }
 
-    const std::string origin_text = declare_parameter(
-      "local_enu_origin", "39.58227391,-86.74232215,260.4");
+    // [P3 FIX 2026-07-14] The inline-origin default used to be non-empty, so
+    // setting ONLY local_enu_origin_ttl_path left BOTH params non-empty and
+    // tripped the both/neither guard with a misleading "exactly one must be
+    // set". Default the inline origin to empty: nothing set -> documented
+    // built-in default; exactly one set -> use it; both set -> real conflict.
+    constexpr const char* kDefaultEnuOrigin = "39.58227391,-86.74232215,260.4";
+    std::string origin_text = declare_parameter("local_enu_origin", std::string(""));
     const std::string origin_ttl_path = declare_parameter("local_enu_origin_ttl_path", "");
-    if (origin_text.empty() == origin_ttl_path.empty()) {
+    if (!origin_text.empty() && !origin_ttl_path.empty()) {
       throw std::runtime_error(
-        "exactly one of local_enu_origin or local_enu_origin_ttl_path must be set");
+        "set at most one of local_enu_origin or local_enu_origin_ttl_path, not both");
+    }
+    if (origin_text.empty() && origin_ttl_path.empty()) {
+      RCLCPP_WARN(get_logger(),
+                  "Neither local_enu_origin nor local_enu_origin_ttl_path set; "
+                  "using built-in default origin %s", kDefaultEnuOrigin);
+      origin_text = kDefaultEnuOrigin;
     }
     if (!origin_text.empty()) {
       if (!parseLocalEnuOrigin(origin_text, local_origin_lat_, local_origin_lon_, local_origin_alt_)) {
@@ -166,6 +182,7 @@ public:
         // pose_dropped_invalid == sidecar_miss_drop == imu_dropped_not_ready
         // == 0 rather than infer it.
         << " pose_dropped_invalid=" << pose_dropped_invalid_count_
+        << " imu_dropped_invalid_stamp=" << imu_dropped_invalid_stamp_count_
         << " imu_sidecar_miss_drop=" << sidecar_miss_drop_count_
         << " imu_dropped_clock_not_ready=" << p1_imu_dropped_not_ready_count_
         // [P3 AUDIT 2026-07-14] P1->ROS clock mapping evidence: run reports
@@ -320,22 +337,65 @@ private:
     ++pose_in_count_;
     const double arrival = stampToSec(msg->header.stamp);
     const double p1_time = p1ToSec(msg->p1_time);
+    const bool p1_valid = std::isfinite(p1_time) && p1_time > 0.0 && p1_time < 4.0e9;
 
-    // [P2 FIX 2026-07-09] P1 epoch-reset detection (device power-cycle or
-    // bag loop): the clock mapper re-learns internally (see addPosePair);
-    // the node-side stamp map and sidecar cursor must reset with it or every
-    // subsequent output stays frozen at last+1us / the sidecar never matches.
-    if (std::isfinite(last_p1_time_) && p1_time < last_p1_time_ - 5.0) {
+    // [P1 FIX 2026-07-15] Forward-spike QUARANTINE, BEFORE any stateful update
+    // (last_p1_time_, addPosePair, toRos). A single in-range forward glitch
+    // (e.g. +10 s) must never reach the clock mapper: with prep_bag's default
+    // single huge clock bin it would become the bin's minimum lag and publish
+    // every subsequent NORMAL sample ~spike-seconds early, and it would also
+    // advance last_p1_time_ so the next normal sample reads as a backward epoch
+    // reset. Drop isolated spikes without touching any state; only a PERSISTENT
+    // forward jump (kPoseForwardJumpResetCount consecutive) is a genuine new
+    // epoch, which is then committed AND re-anchors the mapper below.
+    constexpr int kPoseForwardJumpResetCount = 20;
+    bool forward_epoch_accepted = false;
+    if (p1_valid && std::isfinite(last_p1_time_) &&
+        p1_time > last_p1_time_ + pose_max_forward_jump_sec_) {
+      if (++pose_forward_jump_streak_ < kPoseForwardJumpResetCount) {
+        ++pose_dropped_invalid_count_;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Quarantining pose: P1 jumped +%.3f s forward vs last (%.3f, > %.3f s "
+                             "bound) — likely a glitch; dropped without touching the clock mapper "
+                             "(%lu dropped so far)",
+                             p1_time - last_p1_time_, last_p1_time_, pose_max_forward_jump_sec_,
+                             static_cast<unsigned long>(pose_dropped_invalid_count_));
+        return;  // DO NOT update last_p1_time_ / addPosePair / toRos / publish
+      }
+      forward_epoch_accepted = true;
+      pose_forward_jump_streak_ = 0;
       RCLCPP_WARN(get_logger(),
-                  "P1 time regressed %.3f -> %.3f (device power-cycle or bag loop); "
-                  "resetting stamp map and sidecar cursor",
-                  last_p1_time_, p1_time);
+                  "P1 forward jump persisted %d samples — accepting as a new epoch (%.3f -> %.3f)",
+                  kPoseForwardJumpResetCount, last_p1_time_, p1_time);
+    } else if (p1_valid) {
+      pose_forward_jump_streak_ = 0;
+    }
+
+    // [P2 FIX 2026-07-09] Epoch-reset detection (device power-cycle or bag loop):
+    // the node-side stamp map and sidecar cursor must reset or every subsequent
+    // output stays frozen at last+1us / the sidecar never matches. Covers BOTH a
+    // backward regression and a persistence-confirmed forward epoch, and forces
+    // the clock mapper to re-anchor (clear its stale-epoch bins) — the mapper's
+    // own internal re-anchor only fires for backward jumps, not forward ones.
+    const bool backward_epoch =
+        p1_valid && std::isfinite(last_p1_time_) && p1_time < last_p1_time_ - 5.0;
+    if (backward_epoch || forward_epoch_accepted) {
+      RCLCPP_WARN(get_logger(),
+                  "P1 epoch change (%s) %.3f -> %.3f; resetting stamp map, sidecar cursor, and "
+                  "re-anchoring the clock mapper",
+                  backward_epoch ? "backward regression" : "forward persistence", last_p1_time_,
+                  p1_time);
       last_stamp_by_topic_.clear();
       imu_p1_sidecar_index_ = 0;
+      clock_mapper_.reset();
     }
-    if (std::isfinite(p1_time) && p1_time > 0.0 && p1_time < 4.0e9) {
+
+    if (p1_valid) {
       last_p1_time_ = p1_time;
     }
+    // Fed even during pose outages (invalid solution below): the mapper keeps
+    // learning the P1->ROS clock. It validates its own inputs, and after the
+    // reset() above it re-anchors on this sample.
     clock_mapper_.addPosePair(arrival, p1_time);
 
     // [P2 FIX 2026-07-09] Fail closed on invalid solutions. FusionEngine
@@ -361,8 +421,23 @@ private:
       return;
     }
 
+    // [P1 FIX 2026-07-15] Output stamp validity. The forward-spike quarantine at
+    // the top already protected the mapper and the node-side state; here we only
+    // need to refuse publishing an invalid-P1 sample (the 0xFFFFFFFF sentinel or
+    // a non-finite/<=0 stamp), which would otherwise set a far-future header
+    // stamp that poisons the monotone consumer buffers.
+    if (!p1_valid) {
+      ++pose_dropped_invalid_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping pose with invalid P1 stamp %.3f — %lu dropped so far",
+                           p1_time, static_cast<unsigned long>(pose_dropped_invalid_count_));
+      return;
+    }
+    // toRos is slew-limited and stateful — call it exactly once per sample.
+    const double ros_stamp = clock_mapper_.toRos(p1_time);
+
     nav_msgs::msg::Odometry odom;
-    odom.header.stamp = monotonicStamp("/gps_p1/filtered_odom", clock_mapper_.toRos(p1_time));
+    odom.header.stamp = monotonicStamp("/gps_p1/filtered_odom", ros_stamp);
     odom.header.frame_id = odom_frame_id_;
     odom.child_frame_id = body_frame_id_;
 
@@ -403,10 +478,14 @@ private:
     odom.twist.twist.linear.x = msg->velflu.x;
     odom.twist.twist.linear.y = msg->velflu.y;
     odom.twist.twist.linear.z = msg->velflu.z;
+    // [P3 FIX 2026-07-14] Sanitize twist covariance with the same fail-closed
+    // policy as the pose covariance above: a NaN velocity variance must map to
+    // +inf (KNOWN-BAD), never reach the wire raw. No in-scope consumer reads it
+    // today, but the fail-closed contract must hold uniformly.
     const auto& vc = msg->velflu_covariance;
-    odom.twist.covariance[0] = static_cast<double>(vc[0]);
-    odom.twist.covariance[7] = static_cast<double>(vc[4]);
-    odom.twist.covariance[14] = static_cast<double>(vc[8]);
+    odom.twist.covariance[0] = fail_closed(static_cast<double>(vc[0]));
+    odom.twist.covariance[7] = fail_closed(static_cast<double>(vc[4]));
+    odom.twist.covariance[14] = fail_closed(static_cast<double>(vc[8]));
     // P2#2: angular twist from the latest Atlas gyro (see publishImu note).
     // Only when reasonably fresh; a stale gyro (IMU stream stalled) is worse
     // than the documented "no angular twist" default of zero, which consumers
@@ -481,6 +560,19 @@ private:
     latest_gyro_wall_ = last_imu_wall_time_;
     has_gyro_ = true;
     const double stamp = stampToSec(msg->header.stamp);
+    // [P2 FIX 2026-07-14] Validate the IMU input stamp with the same predicate
+    // the pose path / clock mapper use. The IMU path previously had no stamp
+    // validation (the pose path and the pcap replay node both did): a
+    // cold-start 0xFFFFFFFF "time unavailable" sentinel (~4.29e9 s) emitted one
+    // year-2106 IMU message, and the next real sample then regressed ~2.5e9 s,
+    // wedging both consumers' monotone IMU buffers for the run.
+    if (!(std::isfinite(stamp) && stamp > 0.0 && stamp < 4.0e9)) {
+      ++imu_dropped_invalid_stamp_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Dropping IMU with invalid stamp %.3f — %lu dropped so far",
+                           stamp, static_cast<unsigned long>(imu_dropped_invalid_stamp_count_));
+      return;
+    }
     if (!imu_p1_sidecar_.empty()) {
       double sidecar_p1 = 0.0;
       if (lookupSidecarP1(stamp, sidecar_p1)) {
@@ -691,8 +783,14 @@ private:
   std::vector<ImuP1SidecarSample> imu_p1_sidecar_;
   size_t imu_p1_sidecar_index_ = 0;
   double last_p1_time_ = std::numeric_limits<double>::quiet_NaN();  // P2 fix: epoch-reset detection
+  // [P1 FIX 2026-07-15] P1-domain forward-spike quarantine (poseCallback). A
+  // jump > pose_max_forward_jump_sec_ vs last_p1_time_ is quarantined before it
+  // can reach the clock mapper; a persistent one is accepted as a new epoch.
+  double pose_max_forward_jump_sec_ = 5.0;
+  int pose_forward_jump_streak_ = 0;
   uint64_t pose_dropped_invalid_count_ = 0;       // P2 fix: NaN/Invalid solution drops
   uint64_t sidecar_miss_drop_count_ = 0;          // P2 fix: sidecar tolerance misses
+  uint64_t imu_dropped_invalid_stamp_count_ = 0;  // P2 fix: invalid IMU input stamps
   uint64_t p1_imu_dropped_not_ready_count_ = 0;   // P2 fix: bounded not-ready queue drops
   std::map<std::string, double> last_stamp_by_topic_;
 

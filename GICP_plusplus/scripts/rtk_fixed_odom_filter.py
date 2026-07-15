@@ -11,9 +11,20 @@ Why a separate node rather than a flag inside GLIM:
 * GLIM's libodometry_estimation_ins.so has no awareness of RTK status; it
   only checks temporal coverage of its INS buffer.  Filtering upstream is
   the smallest, most surgical change.
-* The same gate is reused by gicp_localization (covariance check inside
-  callbackGtOdom).  Keeping the policy in one place -- a topic remap --
-  avoids the two consumers drifting apart.
+
+DEPRECATION / SCOPE NOTE (2026-07-14):
+* This node is a LEGACY fallback. The adapter now publishes
+  /gps_p1/filtered_odom_rtk_fixed with its OWN native gate
+  (adapter::posePassesRtkGate), which additionally requires
+  solution_type == RTK_FIXED. Prefer subscribing GLIM to the adapter's
+  topic directly rather than running this node.
+* This node can only gate on pose COVARIANCE: the FusionEngine
+  solution_type is stripped by the adapter (nav_msgs/Odometry carries no
+  such field), so this gate is strictly weaker than the adapter's and the
+  two are NOT identical policies. Do not describe them as one policy.
+* Parity fix: the covariance test below now matches the C++ rtk_gate
+  (finite AND non-negative AND <= threshold). The former bare `<=` admitted
+  a negative "covariance not populated" sentinel (-1 <= 0.001) as FIXED.
 
 Threshold rationale (default values):
 * Atlas RTK-FIXED on the AV-24 publishes cov_xx in the ~1e-6 -- 1e-4 m^2
@@ -39,6 +50,8 @@ Behavior at startup:
     reverse) so the operator can see RTK acquisition and any drop-outs
     during the mapping session.
 """
+
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -95,10 +108,16 @@ class RtkFixedOdomFilter(Node):
         cov_yy = msg.pose.covariance[7]
         cov_zz = msg.pose.covariance[14]
 
+        # Parity with the C++ rtk_gate: finite AND non-negative AND <= threshold.
+        # A bare `<=` used to admit a negative "covariance not populated"
+        # sentinel (-1) as FIXED.
+        def _ok(v, mx):
+            return math.isfinite(v) and 0.0 <= v <= mx
+
         is_fixed = (
-            cov_xx <= self.max_var_xy and
-            cov_yy <= self.max_var_xy and
-            cov_zz <= self.max_var_z
+            _ok(cov_xx, self.max_var_xy) and
+            _ok(cov_yy, self.max_var_xy) and
+            _ok(cov_zz, self.max_var_z)
         )
 
         if is_fixed:

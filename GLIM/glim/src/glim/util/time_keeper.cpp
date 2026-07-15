@@ -38,6 +38,29 @@ bool TimeKeeper::validate_imu_stamp(const double imu_stamp) {
   if (last_imu_stamp < 0.0) {
     // First IMU frame
   } else if (imu_stamp < last_imu_stamp) {
+    // Rewind: DROP the sample and keep last_imu_stamp unchanged.
+    // [P1 2026-07-14] Do NOT re-anchor in place on a large ("epoch reset")
+    // rewind. Re-anchoring only this validator while the downstream
+    // preintegration queue (imu_integration imu_queue), odometry state and the
+    // gnss_global submap/utm queues stay on the OLD epoch mixes epochs and
+    // SILENTLY corrupts deskew/odometry/map output — strictly worse than a
+    // visible stall. integrate_imu() breaks on the first old-epoch sample, so
+    // the old queue entries are never retired and every new integration reuses
+    // a stale measurement. A genuine mid-run epoch change (bag loop /
+    // power-cycle) needs a coordinated node re-initialization, not a local
+    // buffer poke; surface it loudly and let the operator restart.
+    if (last_imu_stamp - imu_stamp > 5.0) {
+      static bool epoch_reset_warned = false;
+      if (!epoch_reset_warned) {
+        epoch_reset_warned = true;
+        spdlog::error(
+          "IMU timestamp EPOCH RESET detected (rewind {:.3f}s, e.g. bag loop / sensor power-cycle). "
+          "GLIM cannot recover a mid-run epoch change in place: new-epoch IMU/LiDAR is dropped and "
+          "mapping will STALL from here. Restart the node (or split the input at the epoch boundary) "
+          "to map the new epoch.",
+          last_imu_stamp - imu_stamp);
+      }
+    }
     spdlog::warn("IMU timestamp rewind detected!!");
     spdlog::warn("current={:.6f} last={:.6f} diff={:.6f}", imu_stamp, last_imu_stamp, imu_diff);
     return false;
@@ -58,6 +81,14 @@ bool TimeKeeper::validate_imu_stamp(const double imu_stamp) {
 
 bool TimeKeeper::process(const glim::RawPoints::Ptr& points) {
   replace_points_stamp(points);
+
+  // [P3 FIX 2026-07-14] Apply the operator-configured point time offset HERE,
+  // after replace_points_stamp has (for absolute-time clouds) overwritten the
+  // frame stamp with the raw min point time. Applying it earlier — as the ROS
+  // layer used to, before process() — let that overwrite silently discard it
+  // for Luminar/absolute clouds. Uniform application covers every stamp source
+  // (pseudo-times, relative, absolute).
+  points->stamp += point_time_offset;
 
   if (points->points.size() != points->times.size()) {
     // Here must not be reached
@@ -82,6 +113,22 @@ bool TimeKeeper::process(const glim::RawPoints::Ptr& points) {
   if (last_points_stamp < 0.0) {
     // First LiDAR frame
   } else if (time_diff < 0.0) {
+    // Rewind: DROP the frame and keep last_points_stamp unchanged.
+    // [P1 2026-07-14] See validate_imu_stamp: a large ("epoch reset") rewind is
+    // NOT recovered in place. Re-anchoring only this validator leaves the
+    // preintegration queue and gnss_global submap/utm queues on the old epoch,
+    // silently corrupting the map. A real epoch change needs a node restart.
+    if (last_points_stamp - points->stamp > 5.0) {
+      static bool epoch_reset_warned = false;
+      if (!epoch_reset_warned) {
+        epoch_reset_warned = true;
+        spdlog::error(
+          "LiDAR timestamp EPOCH RESET detected (rewind {:.3f}s). GLIM cannot recover a mid-run "
+          "epoch change in place — mapping will STALL. Restart the node (or split the input at the "
+          "epoch boundary) to map the new epoch.",
+          last_points_stamp - points->stamp);
+      }
+    }
     spdlog::warn("point timestamp rewind detected!!");
     spdlog::warn("current={:.6f} last={:.6f} diff={:.6f}", points->stamp, last_points_stamp, time_diff);
     return false;

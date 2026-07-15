@@ -31,6 +31,34 @@ from typing import Iterable, Optional
 import numpy as np
 
 
+# [P2 FIX 2026-07-14] ENU datum single source of truth. prep_bag writes the
+# resolved origin into the dump dir as enu_origin.txt; the exporter reads it as
+# the default and CANONICALIZES it so the manifest carries a fixed-precision
+# form (GICP then compares numerically with tolerance, not by raw string). This
+# kills both the false-accept on a typo'd free-text origin and the false-reject
+# on whitespace/precision differences.
+ENU_ORIGIN_FILENAME = "enu_origin.txt"
+
+
+def parse_enu_origin(text: str) -> tuple[float, float, float]:
+    """Parse 'lat,lon,alt' (comma- or whitespace-separated) into floats."""
+    parts = [p for p in re.split(r"[\s,]+", text.strip()) if p]
+    if len(parts) != 3:
+        raise ValueError(f"expected 'lat_deg,lon_deg,alt_m', got {text!r}")
+    lat, lon, alt = (float(p) for p in parts)
+    if not all(math.isfinite(v) for v in (lat, lon, alt)):
+        raise ValueError(f"non-finite ENU origin: {text!r}")
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        raise ValueError(f"ENU origin out of range (lat/lon): {text!r}")
+    return lat, lon, alt
+
+
+def canonical_enu_origin(text: str) -> str:
+    """Fixed-precision canonical form written to the manifest."""
+    lat, lon, alt = parse_enu_origin(text)
+    return f"{lat:.8f},{lon:.8f},{alt:.3f}"
+
+
 def parse_matrix(lines: list[str], key: str) -> np.ndarray:
     for idx, line in enumerate(lines):
         if line.strip() == f"{key}:":
@@ -196,6 +224,23 @@ def main() -> int:
 
     if args.voxel_size < 0.0 or not math.isfinite(args.voxel_size):
         parser.error("--voxel-size must be finite and >= 0")
+
+    # [P2 FIX 2026-07-14] Single source of truth: default the ENU origin from the
+    # datum prep_bag recorded in the dump (<dump_dir>/enu_origin.txt) when the
+    # operator did not pass one explicitly. Then parse/canonicalize whatever we
+    # have so the manifest carries a validated fixed-precision datum.
+    if args.frame == "enu" and not args.enu_origin:
+        origin_file = args.dump_dir / ENU_ORIGIN_FILENAME
+        if origin_file.is_file():
+            args.enu_origin = origin_file.read_text(encoding="utf-8").strip()
+            print(f"[export_glim_dump_to_pcd] ENU origin read from {origin_file}: {args.enu_origin}",
+                  flush=True)
+    if args.enu_origin:
+        try:
+            args.enu_origin = canonical_enu_origin(args.enu_origin)
+        except ValueError as exc:
+            parser.error(f"--enu-origin invalid: {exc}")
+
     # [P3 FIX 2026-07-10] Provenance is ENFORCED, not just recorded: an ENU
     # map without its datum cannot be validated against the live adapter.
     if args.frame == "enu" and not args.enu_origin and not args.allow_missing_origin:

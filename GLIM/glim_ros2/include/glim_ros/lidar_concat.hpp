@@ -244,7 +244,8 @@ inline bool find_time_field(const sensor_msgs::msg::PointCloud2& msg, int& time_
 // Luminar driver. Other timestamp layouts deliberately return invalid so they
 // continue through the generic header-based fallback.
 inline LuminarTimestampRangeNs luminar_timestamp_range(
-  const sensor_msgs::msg::PointCloud2& msg) {
+  const sensor_msgs::msg::PointCloud2& msg,
+  bool float64_time_is_epoch_ns = false) {
   LuminarTimestampRangeNs range;
   // The decode below memcpy's little-endian uint64 nanoseconds. A big-endian
   // payload would produce garbage ranges that could still fall inside the
@@ -255,8 +256,16 @@ inline LuminarTimestampRangeNs luminar_timestamp_range(
   int time_off = -1;
   uint8_t datatype = 0;
   int count = 0;
-  if (!find_time_field(msg, time_off, datatype, count) ||
-      datatype != sensor_msgs::msg::PointField::UINT8 || count != 8 ||
+  if (!find_time_field(msg, time_off, datatype, count)) {
+    return range;
+  }
+  // FLOAT64 is a raw epoch-ns carrier only under the explicit driver contract.
+  // Otherwise it remains IEEE-754 seconds; raw-bit magnitude cannot safely
+  // distinguish the two encodings.
+  const bool is_u8x8 = datatype == sensor_msgs::msg::PointField::UINT8 && count == 8;
+  const bool is_f64_epoch_ns = float64_time_is_epoch_ns &&
+                              datatype == sensor_msgs::msg::PointField::FLOAT64 && count == 1;
+  if (!(is_u8x8 || is_f64_epoch_ns) ||
       time_off < 0 || msg.point_step == 0 ||
       static_cast<size_t>(time_off) + sizeof(uint64_t) > msg.point_step) {
     return range;
@@ -281,9 +290,10 @@ inline LuminarTimestampRangeNs luminar_timestamp_range(
 }
 
 inline BufferedAuxCloud buffer_aux_cloud(
-  sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+  sensor_msgs::msg::PointCloud2::SharedPtr msg,
+  bool float64_time_is_epoch_ns = false) {
   BufferedAuxCloud buffered;
-  buffered.luminar_range = luminar_timestamp_range(*msg);
+  buffered.luminar_range = luminar_timestamp_range(*msg, float64_time_is_epoch_ns);
   buffered.msg = std::move(msg);
   return buffered;
 }
@@ -319,13 +329,17 @@ inline std::optional<LuminarSweepMatch> find_closest_luminar_sweep(
 // Offline readers call this before releasing a queued primary scan. A primary
 // is ready once every aux either has a point-coherent match or has advanced
 // beyond the point-time gate, proving that no future match can still arrive.
+// [P3 FIX 2026-07-14] Cached-range overload. The streaming-fallback readiness
+// poll runs on EVERY bag event while a primary waits (~20-40× per primary), and
+// the primary's point-time range is invariant — decoding it each call walked
+// ~10^5 points per poll. Callers cache the range once at enqueue and pass it
+// here.
 inline bool aux_buffers_ready_for_primary(
-  const sensor_msgs::msg::PointCloud2& primary,
+  const LuminarTimestampRangeNs& primary_range,
+  double primary_header_s,
   const std::vector<AuxLidarSensor>& aux_sensors,
   double luminar_time_threshold) {
-  const auto primary_range = luminar_timestamp_range(primary);
   if (!primary_range.valid) return true;
-  const double primary_header_s = stamp_to_sec(primary.header.stamp);
   for (const auto& aux : aux_sensors) {
     if (aux.buffer.empty()) return false;
     const auto match = find_closest_luminar_sweep(
@@ -347,6 +361,18 @@ inline bool aux_buffers_ready_for_primary(
   return true;
 }
 
+// Convenience wrapper that decodes the primary range on the spot. Prefer the
+// cached-range overload above on the hot readiness-poll path (P3-10).
+inline bool aux_buffers_ready_for_primary(
+  const sensor_msgs::msg::PointCloud2& primary,
+  const std::vector<AuxLidarSensor>& aux_sensors,
+  double luminar_time_threshold,
+  bool float64_time_is_epoch_ns = false) {
+  return aux_buffers_ready_for_primary(
+    luminar_timestamp_range(primary, float64_time_is_epoch_ns), stamp_to_sec(primary.header.stamp),
+    aux_sensors, luminar_time_threshold);
+}
+
 // Shift per-point timestamps by `dt` seconds to rebase an aux scan from its
 // own header.stamp onto the merged cloud's primary header.stamp.
 //
@@ -354,14 +380,9 @@ inline bool aux_buffers_ready_for_primary(
 // nanoseconds-since-scan-start): add dt so the value reads as "offset since
 // primary scan start" and deskew works.
 //
-// CAVEAT: the FLOAT64 branch ALWAYS adds dt, i.e. it assumes scan-relative
-// seconds. This is correct for every aux LiDAR wired up today, but FLOAT64
-// is also a valid carrier for ABSOLUTE epoch seconds (and GLIM's converter
-// + TimeKeeper interpret large FLOAT64 values as absolute). A future aux
-// sensor emitting FLOAT64 epoch seconds would therefore be double-shifted
-// here, exactly like an unguarded UINT8[8] sensor would be. If such a
-// sensor is added, gate the FLOAT64 shift the same way UINT8[8] is left
-// untouched below (e.g. skip the shift when values look epoch-scaled).
+// FLOAT64 normally means scan-relative seconds and therefore receives dt. The
+// explicit float64_time_is_epoch_ns driver contract instead routes it through
+// the absolute raw-uint64 path below; never infer that choice from magnitude.
 //
 // ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns):
 // do not get the header-relative dt shift. They are shifted only by the
@@ -384,24 +405,19 @@ inline void shift_cloud_timestamps(
   uint8_t time_datatype,
   int time_count,
   double dt,
-  double abs_clock_shift_s = 0.0) {
+  double abs_clock_shift_s = 0.0,
+  bool float64_time_is_epoch_ns = false) {
   if (time_off < 0) return;
 
-  // UINT8[8] (Luminar Iris uint64 PTP epoch nanoseconds -- driver reconstruction of
-  // header seconds + per-ray nanoseconds) is ABSOLUTE: skip the header-relative dt
-  // shift, but apply a configured constant clock correction so aux clouds align with
-  // the primary/IMU timebase before GLIM deskew.
-  if (time_datatype == sensor_msgs::msg::PointField::UINT8) {
-    if (time_count != 8) {
-      static bool warned_uint8_count = false;
-      if (!warned_uint8_count) {
-        spdlog::warn("shift_cloud_timestamps: UINT8 time field with count={} (expected 8 for Luminar epoch-ns); leaving unshifted", time_count);
-        warned_uint8_count = true;
-      }
-      (void)dt;
-      (void)abs_clock_shift_s;
-      return;
-    }
+  // Raw uint64 PTP epoch nanoseconds are ABSOLUTE: skip the header-relative dt
+  // shift, but apply a configured constant clock correction so aux clouds align
+  // with the primary/IMU timebase before GLIM deskew. The explicitly configured
+  // Luminar FLOAT64 variant holds those same raw bytes, so doing IEEE-754
+  // arithmetic on it would corrupt every merged auxiliary timestamp.
+  const bool raw_epoch_ns =
+    (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8) ||
+    (float64_time_is_epoch_ns && time_datatype == sensor_msgs::msg::PointField::FLOAT64 && time_count == 1);
+  if (raw_epoch_ns) {
     if (abs_clock_shift_s == 0.0) {
       (void)dt;
       return;
@@ -520,7 +536,8 @@ inline void shift_cloud_timestamps(
 // Units by encoding: UINT8[8] = uint64 epoch ns; UINT32 = ns;
 // FLOAT32/FLOAT64 = seconds (absolute or scan-relative — the SPAN is
 // epoch-invariant either way). One O(N) pass; only run when diag is enabled.
-inline double cloud_time_span_seconds(const sensor_msgs::msg::PointCloud2& cloud) {
+inline double cloud_time_span_seconds(const sensor_msgs::msg::PointCloud2& cloud,
+                                      bool float64_time_is_epoch_ns = false) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   int off = -1;
   uint8_t datatype = 0;
@@ -567,6 +584,17 @@ inline double cloud_time_span_seconds(const sensor_msgs::msg::PointCloud2& cloud
     }
     case sensor_msgs::msg::PointField::FLOAT64: {
       if (avail < 8) return nan;
+      if (float64_time_is_epoch_ns) {
+        uint64_t mn = std::numeric_limits<uint64_t>::max(), mx = 0;
+        for (size_t i = 0; i < n; i++) {
+          uint64_t v;
+          std::memcpy(&v, &cloud.data[i * step + off], sizeof(v));
+          if (v == 0) continue;
+          mn = std::min(mn, v);
+          mx = std::max(mx, v);
+        }
+        return (mn != std::numeric_limits<uint64_t>::max() && mx >= mn) ? (mx - mn) * 1e-9 : nan;
+      }
       double mn = std::numeric_limits<double>::infinity(), mx = -mn;
       for (size_t i = 0; i < n; i++) {
         double v;
@@ -598,9 +626,10 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   int* consec_fail = nullptr,
   bool abort_on_merge_failure = true,
   bool frame_diag_log = false,
-  double luminar_time_threshold = 0.010) {
+  double luminar_time_threshold = 0.010,
+  bool float64_time_is_epoch_ns = false) {
   const double t_primary = stamp_to_sec(primary->header.stamp);
-  const auto primary_luminar_range = luminar_timestamp_range(*primary);
+  const auto primary_luminar_range = luminar_timestamp_range(*primary, float64_time_is_epoch_ns);
   const uint32_t point_step = primary->point_step;
   size_t merged_aux_count = 0;
 
@@ -621,7 +650,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     }
     // Merged-sweep per-point time span (GICP scan_time_span_s parity); NaN =
     // no usable time field. Computed only when the diag line is enabled.
-    oss << " span=" << cloud_time_span_seconds(cloud) << "s total_pts=" << total_pts;
+    oss << " span=" << cloud_time_span_seconds(cloud, float64_time_is_epoch_ns) << "s total_pts=" << total_pts;
     // "{}" wrapper: never pass a runtime string as the fmt format string
     // (stray braces would throw fmt::format_error mid-mapping).
     spdlog::info("{}", oss.str());
@@ -721,6 +750,28 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
         point_range_delta_s = luminar_match->range_delta_s;
       }
     } else {
+      // [P2 FIX 2026-07-14] Primary point-time range is undecodable. Header-
+      // nearest is only safe for an aux that ALSO carries no absolute point
+      // time; an aux that DOES carry valid UINT8[8] ranges must NOT be header-
+      // matched — that is exactly the wrong-sweep / up-to-149 ms mode GICP
+      // forbids. Skip such an aux instead of appending a possibly-wrong sweep.
+      // (Reachable on the glim_rosbag streaming fallback, glim_pcap_rosbag and
+      // live paths; the two-pass staging path is already protected.)
+      bool aux_has_abs_time = false;
+      for (const auto& buffered : aux.buffer) {
+        if (buffered.luminar_range.valid) { aux_has_abs_time = true; break; }
+      }
+      if (aux_has_abs_time) {
+        static std::atomic<uint64_t> mismatch_warns{0};
+        if (mismatch_warns.fetch_add(1) < 3) {
+          spdlog::warn(
+            "lidar_concat: primary point-time range undecodable but aux {} carries absolute "
+            "UINT8[8] point time; refusing header-nearest matching (would risk a wrong sweep) "
+            "— dropping aux this scan (warning capped at 3)",
+            aux.topic);
+        }
+        continue;
+      }
       match = find_nearest(
         aux.buffer, t_primary, time_threshold, aux.match_time_offset);
     }
@@ -771,7 +822,7 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     if (find_time_field(*match, time_off, time_datatype, time_count)) {
       shift_cloud_timestamps(
         data, point_step, time_off, time_datatype, time_count,
-        raw_dt, aux.point_time_offset);
+        raw_dt, aux.point_time_offset, float64_time_is_epoch_ns);
       spdlog::debug(
         "lidar_concat: timestamp handling for {} raw_header_phase={:+.6f}s "
         "point_clock_offset={:+.6f}s point_range_delta={:.6f}s",
@@ -864,6 +915,9 @@ struct AuxConcatConfig {
   // the offline mapping tools — this is the map-side merge evidence the run
   // reports need; ~1 line / 100 ms costs a few MB per mapping run.
   bool frame_diag_log = true;
+  // Must match glim::extract_raw_points(): an explicitly opted-in FLOAT64
+  // field is raw uint64 PTP epoch nanoseconds, not IEEE-754 seconds.
+  bool float64_time_is_epoch_ns = false;
 };
 
 // Resolve a (possibly relative) urdf_path CWD-independently. parse_urdf_transforms
@@ -930,6 +984,8 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   out.abort_on_merge_failure = config_sensors.param<bool>("lidar_concat", "abort_on_merge_failure", true);
   out.max_consecutive_aux_merge_failures = config_sensors.param<int>("lidar_concat", "max_consecutive_aux_merge_failures", 10);
   out.frame_diag_log = config_sensors.param<bool>("lidar_concat", "frame_diag_log", true);
+  out.float64_time_is_epoch_ns =
+    config_sensors.param<bool>("sensors", "float64_time_is_epoch_ns", false);
 
   if (!out.enabled) {
     return out;

@@ -364,6 +364,30 @@ def build_adapter_params(args: argparse.Namespace, pcap_path: Path, summary_path
     return params
 
 
+def resolve_enu_origin(args: argparse.Namespace) -> Optional[str]:
+    """[P2 FIX 2026-07-14] Resolve the ENU datum the adapter actually uses, as
+    'lat,lon,alt', so run_glim can record it in the dump dir as the single source
+    of truth for the exporter/GICP. Mirrors the adapter's origin resolution
+    (inline value, TTL file, or the documented default)."""
+    if args.local_enu_origin:
+        return args.local_enu_origin.strip()
+    ttl_path = args.local_enu_origin_ttl_path
+    if ttl_path:
+        try:
+            for line in Path(ttl_path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cells = [c.strip() for c in line.split(",") if c.strip()]
+                if len(cells) >= 3:
+                    return f"{cells[-3]},{cells[-2]},{cells[-1]}"
+        except OSError:
+            return None
+        return None
+    # Neither set: the documented adapter default (see build_adapter_params).
+    return "39.58227391,-86.74232215,260.4"
+
+
 def normalize_bag(args: argparse.Namespace, input_path: Path, output_path: Path, work_dir: Path) -> None:
     require_ros_package("adapter")
     ensure_output_path(output_path, args.force, "normalized output bag")
@@ -842,24 +866,46 @@ def validate_rtk_anchor(dump_dir: Path, log_path: Path) -> None:
             f"{log_path} — gnss_global did not run its at_exit hook (module not "
             "loaded, or an old build without the audit summary)."
         )
-    match = re.search(
-        r"transformation_initialized=(\S+)\s+position_factors=(\d+)", summary_line
-    )
-    if not match:
-        die(f"RTK anchor validation FAILED: unparseable summary line: {summary_line}")
-    initialized = match.group(1) in ("true", "1", "True")
-    position_factors = int(match.group(2))
+    # [P1 FIX 2026-07-15] Extract each field independently by NAME. The former
+    # regex required transformation_initialized and position_factors to be
+    # adjacent, so adding any field between them (e.g. fit_rms_m) made every
+    # healthy run fail as "unparseable summary line". Named extraction is robust
+    # to field order and to new fields.
+    def _field(name: str, value_pattern: str) -> Optional[str]:
+        m = re.search(rf"\b{re.escape(name)}=({value_pattern})", summary_line)
+        return m.group(1) if m else None
+
+    init_raw = _field("transformation_initialized", r"\S+")
+    pf_raw = _field("position_factors", r"\d+")
+    if init_raw is None or pf_raw is None:
+        die(
+            "RTK anchor validation FAILED: could not find transformation_initialized "
+            f"and/or position_factors in summary line: {summary_line}"
+        )
+    initialized = init_raw in ("true", "1", "True")
+    position_factors = int(pf_raw)
+    # factors_undelivered is a newer field; absent on older builds -> treat as 0.
+    undelivered_raw = _field("factors_undelivered", r"\d+")
+    factors_undelivered = int(undelivered_raw) if undelivered_raw is not None else 0
     if not initialized or position_factors <= 0:
         die(
             "RTK anchor validation FAILED: "
-            f"transformation_initialized={match.group(1)}, "
+            f"transformation_initialized={init_raw}, "
             f"position_factors={position_factors} — the map is unanchored. "
             "Check RTK-FIXED availability and the normalized "
             "/gps_p1/filtered_odom_rtk_fixed topic, or pass --lidar-imu-only."
         )
+    if factors_undelivered > 0:
+        die(
+            "RTK anchor validation FAILED: "
+            f"factors_undelivered={factors_undelivered} — gnss_global emitted GNSS "
+            "prior factors that never reached the serialized graph (save() flushed "
+            "before delivery). The map is under-anchored vs the summary; re-run."
+        )
     print(
         "[prep_bag] RTK anchor validation OK: "
-        f"position_factors={position_factors}, T_world_utm={twu_path}"
+        f"position_factors={position_factors}, factors_undelivered={factors_undelivered}, "
+        f"T_world_utm={twu_path}"
     )
     print(f"[prep_bag]   {summary_line.strip()}")
 
@@ -868,7 +914,28 @@ def run_glim(args: argparse.Namespace, normalized_bag: Path, dump_dir: Path, wor
     require_ros_package("glim_ros")
     if dump_dir.exists() and args.force:
         shutil.rmtree(dump_dir)
+    elif dump_dir.exists() and any(dump_dir.iterdir()):
+        # [P3 FIX 2026-07-14] Refuse a dirty dump dir. GLIM appends its submaps
+        # here, and the exporter globs EVERY submap in the dir — stale submaps
+        # from a longer previous run would be composed with the NEW inverse
+        # transform into a manifest-valid but corrupt "ENU" map. Die instead of
+        # silently mixing runs.
+        die(f"dump dir already exists and is non-empty: {dump_dir} "
+            f"(stale submaps from a previous run would be globbed by the exporter and "
+            f"composed into a corrupt map). Pass --force to overwrite it, or choose a fresh --dump-dir.")
     dump_dir.mkdir(parents=True, exist_ok=True)
+
+    # [P2 FIX 2026-07-14] Record the resolved ENU datum as the single source of
+    # truth for the exporter (which reads it as its --enu-origin default) and,
+    # transitively, GICP's manifest datum check. Without this the datum lived
+    # only in the adapter params and had to be re-typed by hand at export time.
+    origin = resolve_enu_origin(args)
+    if origin:
+        (dump_dir / "enu_origin.txt").write_text(origin + "\n", encoding="utf-8")
+        print(f"[prep_bag] recorded ENU datum in {dump_dir / 'enu_origin.txt'}: {origin}")
+    else:
+        print("[prep_bag] WARNING: could not resolve the ENU datum; the exporter will need "
+              "--enu-origin passed explicitly.")
 
     log_path = dump_dir / "glim_rosbag.log"
     cmd = [

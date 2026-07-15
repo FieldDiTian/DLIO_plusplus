@@ -90,6 +90,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
+  // [P2 FIX 2026-07-15] Explicit Luminar-contract opt-in: when true, a FLOAT64
+  // per-point time field is decoded as raw uint64 PTP epoch nanoseconds (the
+  // documented Luminar driver variant) instead of IEEE-754 seconds. Default
+  // false so ordinary FLOAT64-seconds sensors (relative offsets, or Hesai
+  // absolute epoch seconds) are never misdecoded.
+  float64_time_is_epoch_ns = config_sensors.param<bool>("sensors", "float64_time_is_epoch_ns", false);
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
 
   // Multi-LiDAR concatenation. Live glim_ros must merge the auxiliary (left /
@@ -143,6 +149,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   // Preprocessing
   time_keeper.reset(new glim::TimeKeeper);
+  // [P3 FIX 2026-07-14] Hand the operator-configured points_time_offset to the
+  // TimeKeeper so it survives the absolute-time stamp overwrite. Previously the
+  // offset was added to raw_points->stamp before process(), but the
+  // absolute-time branch of replace_points_stamp overwrites the stamp with the
+  // raw min point time and silently discarded it for Luminar/absolute clouds.
+  time_keeper->point_time_offset = points_time_offset;
   preprocessor.reset(new glim::CloudPreprocessor);
 
   // Odometry estimation
@@ -251,15 +263,19 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
     // merged into the primary scan on arrival of a primary cloud.
     if (aux_concat.enabled) {
-      auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-      for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
-        const std::string aux_topic = aux_concat.aux_sensors[i].topic;
-        auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          aux_topic, aux_qos,
-          [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
-        aux_points_subs.push_back(sub);
-        spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
-      }
+      // [P2 FIX 2026-07-14] The live path (points_callback_live) merges aux at
+      // PRIMARY arrival and has NO future-sweep pending-queue release: the right
+      // sweep arriving +66..92 ms after the primary is structurally never
+      // buffered yet, so online concat mapping silently degrades to front+left
+      // (or throws under require_all_aux). The offline readers (glim_rosbag /
+      // glim_pcap_rosbag) have the future-aware release; concat maps must be
+      // built there. Refuse this unsupported combination loudly at startup
+      // rather than ship a quietly-wrong merge.
+      spdlog::critical(
+        "glim_ros: online mapping (enable_online_mapping=true) combined with lidar_concat is "
+        "unsupported — the live path has no future-sweep release and would drop the late aux "
+        "sweep. Build the concatenated map offline (glim_rosbag / glim_pcap_rosbag). Refusing to start.");
+      throw std::runtime_error("glim_ros: online mapping + lidar_concat is unsupported (no future-sweep release)");
     }
 #ifdef BUILD_WITH_CV_BRIDGE
     qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
@@ -381,7 +397,7 @@ void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr
     return;
   }
   auto& aux = aux_concat.aux_sensors[aux_index];
-  aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg));
+  aux.buffer.push_back(glim_ros::buffer_aux_cloud(msg, aux_concat.float64_time_is_epoch_ns));
   while (aux.buffer.size() > aux.buffer_size) {
     aux.buffer.pop_front();
   }
@@ -407,7 +423,8 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
                                       aux_concat.require_all_aux, aux_concat.max_consecutive_aux_merge_failures,
                                       &aux_concat.consecutive_merge_failures, aux_concat.abort_on_merge_failure,
                                       aux_concat.frame_diag_log,
-                                      aux_concat.luminar_time_threshold);
+                                      aux_concat.luminar_time_threshold,
+                                      aux_concat.float64_time_is_epoch_ns);
     }
     // nullptr = strict merge skipped this scan (require_all_aux); drop it.
     if (!merged) {
@@ -429,7 +446,7 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
   }
 
-  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count);
+  auto raw_points = glim::extract_raw_points(*msg, intensity_field, ring_field, epoch_anchor_count, float64_time_is_epoch_ns);
   if (raw_points == nullptr) {
     spdlog::warn("failed to extract points from message");
     return 0;
@@ -441,7 +458,9 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     }
   }
 
-  raw_points->stamp += points_time_offset;
+  // [P3 FIX 2026-07-14] points_time_offset is now applied inside TimeKeeper
+  // (see the constructor), AFTER any absolute-time stamp overwrite, so it is no
+  // longer silently discarded for Luminar/absolute clouds.
   if (!time_keeper->process(raw_points)) {
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
     return 0;

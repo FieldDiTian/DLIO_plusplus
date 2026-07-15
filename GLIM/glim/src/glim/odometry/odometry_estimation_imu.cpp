@@ -1,5 +1,7 @@
 #include <glim/odometry/odometry_estimation_imu.hpp>
 
+#include <stdexcept>
+
 #include <spdlog/spdlog.h>
 
 #include <gtsam/inference/Symbol.h>
@@ -87,7 +89,13 @@ OdometryEstimationIMU::OdometryEstimationIMU(std::unique_ptr<OdometryEstimationI
     auto init_estimation = new LooseInitialStateEstimation(params->T_lidar_imu, params->imu_bias);
     this->init_estimation.reset(init_estimation);
   } else {
+    // [P3 FIX 2026-07-14] Throw at construction instead of logging and leaving
+    // init_estimation null: the old behavior guaranteed a null-deref on the
+    // first frame (insert_imu / insert_frame / initial_pose all dereference it).
+    // Fail loud and early so a config typo is a startup error, not a crash mid-run.
     logger->error("unknown initialization mode {}", params->initialization_mode);
+    throw std::invalid_argument("OdometryEstimationIMU: unknown initialization_mode '" + params->initialization_mode +
+                                "' (expected NAIVE or LOOSE)");
   }
 
   imu_integration.reset(new IMUIntegration);

@@ -139,6 +139,15 @@ int main(int argc, char** argv) {
   std::unordered_set<std::string> aux_topic_set;
   for (const auto& s : aux_sensors) aux_topic_set.insert(s.topic);
 
+  // [P3 FIX 2026-07-14] Reject an aux topic that equals the primary points
+  // topic: the primary/aux classification would be ambiguous and zero scans
+  // would map. Fail loud at startup (parity with glim_rosbag / GICP).
+  if (aux_topic_set.count(primary_points_topic)) {
+    spdlog::critical("lidar_concat: aux_topics contains the primary points topic '{}' — "
+                     "refusing to start", primary_points_topic);
+    return 1;
+  }
+
   // PCAP source config — single source of truth for inactivity_sec.
   glim::Config config_pcap(glim::GlobalConfig::get_config_path("config_pcap"));
   IrisPcapConfig pcap_cfg = load_pcap_config_from_json(config_pcap);
@@ -541,9 +550,18 @@ int main(int argc, char** argv) {
         if (topic_name == aux.topic) {
           if (topic_type == "sensor_msgs/msg/PointCloud2") {
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
-            pc2_ser.deserialize_message(&serialized_msg, aux_msg.get());
-            aux.buffer.push_back(glim_ros::buffer_aux_cloud(aux_msg));
-            while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
+            // [P2 FIX 2026-07-14] Guard deserialize: an uncaught throw reached
+            // std::terminate (no glim->save()). Report + hard error + skip.
+            try {
+              pc2_ser.deserialize_message(&serialized_msg, aux_msg.get());
+              aux.buffer.push_back(glim_ros::buffer_aux_cloud(
+                aux_msg, concat_config.float64_time_is_epoch_ns));
+              while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
+            } catch (const std::exception& ex) {
+              hard_error = true;
+              spdlog::error("failed to deserialize aux PointCloud2 (topic={}): {} — skipping",
+                            topic_name, ex.what());
+            }
           } else {
             spdlog::error("topic_type mismatch on aux topic {}: {} (expected PointCloud2)", topic_name, topic_type);
             // [P2 FIX 2026-07-10j] Without this, the run quietly degraded to
@@ -558,9 +576,15 @@ int main(int argc, char** argv) {
     if (!is_aux) {
       if (topic_name == imu_topic && topic_type == "sensor_msgs/msg/Imu") {
         auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
-        imu_ser.deserialize_message(&serialized_msg, imu_msg.get());
-        glim->imu_callback(imu_msg);
-        cnt_imu++;
+        // [P2 FIX 2026-07-14] Guard deserialize (uncaught throw -> std::terminate).
+        try {
+          imu_ser.deserialize_message(&serialized_msg, imu_msg.get());
+          glim->imu_callback(imu_msg);
+          cnt_imu++;
+        } catch (const std::exception& ex) {
+          hard_error = true;
+          spdlog::error("failed to deserialize Imu (topic={}): {} — skipping", topic_name, ex.what());
+        }
       } else if (topic_name == imu_topic) {
         // [P3 FIX 2026-07-10] Known topic, wrong type: this previously
         // dropped the whole IMU stream with zero diagnostics.
@@ -572,9 +596,15 @@ int main(int argc, char** argv) {
         // glim_rosbag): required by the INS odometry frontend configs.
         if (topic_type == "nav_msgs/msg/Odometry") {
           auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
-          odom_ser.deserialize_message(&serialized_msg, odom_msg.get());
-          glim->external_odom_callback(odom_msg);
-          cnt_ext++;
+          // [P2 FIX 2026-07-14] Guard deserialize (uncaught throw -> std::terminate).
+          try {
+            odom_ser.deserialize_message(&serialized_msg, odom_msg.get());
+            glim->external_odom_callback(odom_msg);
+            cnt_ext++;
+          } catch (const std::exception& ex) {
+            hard_error = true;
+            spdlog::error("failed to deserialize Odometry (topic={}): {} — skipping", topic_name, ex.what());
+          }
         } else {
           spdlog::error("topic_type mismatch on external odom topic {}: {} (expected nav_msgs/msg/Odometry)",
                         topic_name, topic_type);
@@ -650,6 +680,10 @@ int main(int argc, char** argv) {
   struct PendingPrimaryScan {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
     double enqueue_stream_time_s = 0.0;
+    // [P3 FIX 2026-07-14] Cache the primary range + header time at enqueue so
+    // the readiness poll never re-walks ~10^5 points per event.
+    glim_ros::LuminarTimestampRangeNs range;
+    double header_s = 0.0;
   };
   std::deque<PendingPrimaryScan> pending_primary_scans;
   double latest_stream_time_s = 0.0;
@@ -664,7 +698,7 @@ int main(int argc, char** argv) {
       const auto& pending = pending_primary_scans.front();
       const auto& primary = pending.msg;
       if (!force && !glim_ros::aux_buffers_ready_for_primary(
-                      *primary, aux_sensors,
+                      pending.range, pending.header_s, aux_sensors,
                       concat_config.luminar_time_threshold)) {
         if (latest_stream_time_s - pending.enqueue_stream_time_s <
             concat_config.future_sweep_wait_timeout) {
@@ -683,14 +717,26 @@ int main(int argc, char** argv) {
 
       const int epoch_anchor_count =
         static_cast<int>(primary->width * primary->height);
-      const auto final_points = glim_ros::merge_clouds(
-        primary, aux_sensors, concat_time_threshold,
-        concat_config.require_all_aux,
-        concat_config.max_consecutive_aux_merge_failures,
-        &concat_config.consecutive_merge_failures,
-        concat_config.abort_on_merge_failure,
-        concat_config.frame_diag_log,
-        concat_config.luminar_time_threshold);
+      // [P3 FIX 2026-07-14] Convert the strict-merge abort throw into a
+      // controlled stop (partial dump kept, nonzero exit) instead of
+      // std::terminate — parity with glim_rosbag and GICP.
+      sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points;
+      try {
+        final_points = glim_ros::merge_clouds(
+          primary, aux_sensors, concat_time_threshold,
+          concat_config.require_all_aux,
+          concat_config.max_consecutive_aux_merge_failures,
+          &concat_config.consecutive_merge_failures,
+          concat_config.abort_on_merge_failure,
+          concat_config.frame_diag_log,
+          concat_config.luminar_time_threshold,
+          concat_config.float64_time_is_epoch_ns);
+      } catch (const std::exception& e) {
+        hard_error = true;
+        spdlog::error("lidar_concat: strict-merge abort: {} — stopping the run "
+                      "(partial dump kept, exiting nonzero)", e.what());
+        return false;
+      }
       const double primary_header_s =
         glim_ros::stamp_to_sec(primary->header.stamp);
       pending_primary_scans.pop_front();
@@ -778,8 +824,13 @@ int main(int argc, char** argv) {
           // Queue for the future-aware release (drained once per event below):
           // the point-coherent aux sweep can be later in stream time than the
           // primary, so merging at dispatch would systematically miss it.
-          pending_primary_scans.push_back(
-            {s.cloud, static_cast<double>(ev.t_ns) / 1e9});
+          PendingPrimaryScan scan;
+          scan.msg = s.cloud;
+          scan.enqueue_stream_time_s = static_cast<double>(ev.t_ns) / 1e9;
+          scan.range = glim_ros::luminar_timestamp_range(
+            *s.cloud, concat_config.float64_time_is_epoch_ns);  // decode once
+          scan.header_s = glim_ros::stamp_to_sec(s.cloud->header.stamp);
+          pending_primary_scans.push_back(std::move(scan));
           ++primary_received;
         } else {
           const size_t workload = glim->points_callback(s.cloud);
@@ -796,7 +847,8 @@ int main(int argc, char** argv) {
       } else if (aux_topic_set.count(s.topic)) {
         for (auto& aux : aux_sensors) {
           if (aux.topic == s.topic) {
-            aux.buffer.push_back(glim_ros::buffer_aux_cloud(s.cloud));
+            aux.buffer.push_back(glim_ros::buffer_aux_cloud(
+              s.cloud, concat_config.float64_time_is_epoch_ns));
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
             break;
           }
