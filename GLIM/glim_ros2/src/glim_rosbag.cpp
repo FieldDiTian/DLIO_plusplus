@@ -232,20 +232,38 @@ int main(int argc, char** argv) {
   // Keyboard handler for pause/resume
   KeyboardHandler keyboard;
 
-  // Offline future-aware join. The right Iris sweep whose absolute point range
-  // overlaps a front sweep can arrive later in bag order because its header has
-  // a different acquisition phase. Queue primaries until every aux either has
-  // a point-coherent match or its point-time watermark has advanced past the
-  // matching gate. This preserves primary order while allowing IMU messages to
-  // continue filling the estimator buffer during the short read-ahead.
-  std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> pending_primary_scans;
-  const auto drain_pending_primaries = [&](bool force) -> bool {
+  // Offline future-aware join. Read ahead for a bounded amount of BAG time,
+  // not wall time or sensor-header time. This allows later-arriving coherent
+  // aux sweeps to enter the buffers without ever retaining a final primary
+  // until EOF after the LiDAR stream stops.
+  struct PendingPrimary {
+    sensor_msgs::msg::PointCloud2::SharedPtr msg;
+    rcutils_time_point_value_t enqueue_bag_time_ns;
+  };
+  std::deque<PendingPrimary> pending_primary_scans;
+  uint64_t primary_received = 0;
+  uint64_t primary_forwarded = 0;
+  uint64_t primary_strict_skipped = 0;
+  uint64_t primary_deadline_released = 0;
+  uint64_t primary_eof_released = 0;
+  size_t max_pending_primaries = 0;
+  const auto drain_pending_primaries = [&] (
+      bool force, rcutils_time_point_value_t current_bag_time_ns) -> bool {
     while (!pending_primary_scans.empty()) {
-      const auto& primary = pending_primary_scans.front();
-      if (!force && !glim_ros::aux_buffers_ready_for_primary(
-                      *primary, aux_sensors,
-                      concat_config.luminar_time_threshold)) {
+      const auto& pending = pending_primary_scans.front();
+      const auto& primary = pending.msg;
+      const bool aux_ready = glim_ros::aux_buffers_ready_for_primary(
+        *primary, aux_sensors, concat_config.luminar_time_threshold);
+      const bool deadline_expired = !force && glim_ros::bag_time_wait_expired(
+        pending.enqueue_bag_time_ns, current_bag_time_ns,
+        concat_config.future_sweep_wait_timeout);
+      if (!force && !aux_ready && !deadline_expired) {
         break;
+      }
+      if (force) {
+        ++primary_eof_released;
+      } else if (deadline_expired && !aux_ready) {
+        ++primary_deadline_released;
       }
 
       const int epoch_anchor_count =
@@ -264,7 +282,10 @@ int main(int argc, char** argv) {
 
       size_t workload = 0;
       if (final_points) {
+        ++primary_forwarded;
         workload = glim->points_callback(final_points, epoch_anchor_count);
+      } else {
+        ++primary_strict_skipped;
       }
       if (primary_header_s > end_time) {
         spdlog::info("end_time reached");
@@ -278,6 +299,10 @@ int main(int argc, char** argv) {
     }
     return true;
   };
+
+  spdlog::info(
+    "lidar_concat: offline future-sweep wait is {:.3f}s in bag time",
+    concat_config.future_sweep_wait_timeout);
 
   // Bag read function
   const auto read_bag = [&](const std::string& bag_filename) {
@@ -428,9 +453,8 @@ int main(int argc, char** argv) {
       }
 
       if (is_aux_sensor) {
-        if (!drain_pending_primaries(false)) {
-          return false;
-        }
+        // Buffered above; the common drain below evaluates aux readiness and
+        // the bag-time deadline after every input message.
       } else if (msg->topic_name == imu_topic) {
         if (topic_type != "sensor_msgs/msg/Imu") {
           g_bag_hard_error = true;
@@ -450,10 +474,10 @@ int main(int argc, char** argv) {
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
 
         if (concat_enabled && !aux_sensors.empty()) {
-          pending_primary_scans.push_back(points_msg);
-          if (!drain_pending_primaries(false)) {
-            return false;
-          }
+          pending_primary_scans.push_back({points_msg, msg_time});
+          ++primary_received;
+          max_pending_primaries = std::max(
+            max_pending_primaries, pending_primary_scans.size());
         } else {
           const size_t workload = glim->points_callback(points_msg);
           if (glim_ros::stamp_to_sec(points_msg->header.stamp) > end_time) {
@@ -503,6 +527,13 @@ int main(int argc, char** argv) {
       }
 #endif
 
+      // Run after every selected bag message, including IMU/external pose.
+      // Therefore a final LiDAR frame expires while its contemporaneous INS
+      // samples are still retained, instead of waiting for EOF.
+      if (!drain_pending_primaries(false, msg_time)) {
+        return false;
+      }
+
       auto found = subscription_map.find(msg->topic_name);
       if (found != subscription_map.end()) {
         for (const auto& sub : found->second) {
@@ -551,7 +582,7 @@ int main(int argc, char** argv) {
     spdlog::info(
       "lidar_concat: flushing {} queued primary scan(s) at end of input",
       pending_primary_scans.size());
-    if (!drain_pending_primaries(true)) {
+    if (!drain_pending_primaries(true, 0)) {
       auto_quit = true;
     }
   }
@@ -561,6 +592,15 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
+  const uint64_t primary_imu_skipped = glim->ins_coverage_skip_count();
+  if (concat_enabled && !aux_sensors.empty()) {
+    spdlog::info(
+      "lidar_concat: primary summary received={} forwarded={} strict_skipped={} "
+      "imu_skipped={} deadline_released={} eof_released={} max_pending={}",
+      primary_received, primary_forwarded, primary_strict_skipped,
+      primary_imu_skipped, primary_deadline_released, primary_eof_released,
+      max_pending_primaries);
+  }
   glim->save(dump_path);
 
   // [P3 FIX 2026-07-10] partial dump is kept, but exit nonzero on hard errors.

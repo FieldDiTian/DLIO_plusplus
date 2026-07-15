@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -35,6 +36,10 @@ public:
    *        frames on the latest external pose timestamp, just like it does for IMU.
    */
   virtual bool requires_external_pose() const { return false; }
+
+  // Number of frames rejected because the configured INS/external-pose buffer
+  // did not cover their scan window. Non-INS estimators return zero.
+  virtual uint64_t ins_coverage_skip_count() const { return 0; }
 
 #ifdef GLIM_USE_OPENCV
   /**

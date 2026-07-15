@@ -80,4 +80,16 @@ TEST(LidarConcatPointTime, OfflineWatermarkWaitsForFutureSweep) {
     *primary, sensors, 0.010));
 }
 
+TEST(LidarConcatPointTime, OfflineBagTimeDeadlineIsBoundedAndMonotonic) {
+  constexpr int64_t enqueue_ns = 1'000'000'000LL;
+  EXPECT_FALSE(glim_ros::bag_time_wait_expired(
+    enqueue_ns, enqueue_ns + 149'999'999LL, 0.150));
+  EXPECT_TRUE(glim_ros::bag_time_wait_expired(
+    enqueue_ns, enqueue_ns + 150'000'000LL, 0.150));
+  EXPECT_FALSE(glim_ros::bag_time_wait_expired(
+    enqueue_ns, enqueue_ns - 1, 0.150));
+  EXPECT_TRUE(glim_ros::bag_time_wait_expired(
+    enqueue_ns, enqueue_ns, 0.0));
+}
+
 }  // namespace

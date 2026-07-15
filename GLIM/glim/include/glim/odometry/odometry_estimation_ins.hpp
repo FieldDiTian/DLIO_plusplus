@@ -75,6 +75,7 @@ public:
 
   bool requires_imu() const override { return true; }
   bool requires_external_pose() const override { return true; }
+  uint64_t ins_coverage_skip_count() const override { return ins_coverage_skips; }
 
   void insert_imu(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel) override;
   void insert_external_pose(const double stamp, const Eigen::Isometry3d& T_world_ins) override;
@@ -92,6 +93,7 @@ private:
   std::deque<std::tuple<double, Eigen::Vector3d, Eigen::Vector3d>> imu_buffer;
 
   long frame_id;
+  uint64_t ins_coverage_skips = 0;
   EstimationFrame::ConstPtr last_frame;
 
   std::shared_ptr<gtsam_points::iVox> target_ivox;

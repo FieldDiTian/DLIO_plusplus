@@ -15,6 +15,10 @@
     // Absolute UINT8[8] point-time endpoint gate. A header delta alone is
     // acquisition phase and does not enter this test.
     "luminar_time_threshold": 0.01,
+    // Offline rosbag read-ahead deadline in BAG time. Release the queued front
+    // scan after 150 ms with whichever aux sweeps are available (or front-only)
+    // instead of retaining it until EOF after LiDAR stops.
+    "future_sweep_wait_timeout": 0.15,
     // Header-only acquisition-phase offsets, used only by the generic fallback
     // and point-time tie-break. They never modify per-point timestamps.
     "aux_match_time_offsets": [0.0, 0.0],

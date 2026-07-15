@@ -55,6 +55,7 @@ public:
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
+  uint64_t ins_coverage_skip_count() const;
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 

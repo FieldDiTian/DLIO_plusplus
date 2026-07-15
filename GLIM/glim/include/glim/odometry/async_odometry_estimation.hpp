@@ -71,6 +71,9 @@ public:
    */
   int workload() const;
 
+  // Read after join(); delegated to the wrapped estimator.
+  uint64_t ins_coverage_skip_count() const;
+
   /**
    * @brief Get the estimation results
    * @param estimation_results    Estimation results

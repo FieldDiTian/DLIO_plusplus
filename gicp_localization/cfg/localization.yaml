@@ -207,11 +207,11 @@
                                                     # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
                                                     #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
     # Luminar UINT8[8] point times, not header proximity, select the sweep. The
-    # correct right sweep can arrive after the front callback because header
-    # phase and point acquisition phase differ. Wait up to 150 ms for it; the
-    # condition-variable wakeup returns as soon as all point-time matches exist.
+    # Never wait inside the primary callback: SensorDataQoS KeepLast(5) would
+    # overwrite front sweeps while GICP is blocked. Missing/late aux is dropped;
+    # the front sweep is still processed immediately.
     localization/lidar_concat/luminar_time_threshold: 0.010
-    localization/lidar_concat/future_sweep_wait_timeout: 0.150
+    localization/lidar_concat/future_sweep_wait_timeout: 0.0
     # True residual per-aux clock offsets (seconds, order = aux_topics), added
     # to header and absolute point times. A stable 80-90 ms HEADER delta alone
     # is acquisition phase, not a PTP-error measurement, so the default is zero.

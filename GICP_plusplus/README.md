@@ -289,7 +289,7 @@ localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_le
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
 localization/lidar_concat/time_threshold: 0.1     # generic-sensor header fallback
 localization/lidar_concat/luminar_time_threshold: 0.010  # max endpoint delta between absolute point-time ranges
-localization/lidar_concat/future_sweep_wait_timeout: 0.150  # bounded wait for a later-arriving aligned aux sweep
+localization/lidar_concat/future_sweep_wait_timeout: 0.0  # compatibility key; live primary callback never blocks
 localization/lidar_concat/aux_time_offsets: [0.0, 0.0]  # measured residual point-clock corrections only
 localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
 
@@ -302,10 +302,8 @@ localization/lidar_concat/max_consecutive_aux_merge_failures: 10
 For Luminar, absolute per-point PTP timestamps are the sweep-matching authority.
 A front/aux header delta can be a stable acquisition phase even when the point
 clocks agree, so it must not be copied into `aux_time_offsets` by itself. The
-front callback waits on the independent aux callback group until a point-time
-aligned sweep arrives (or the bounded timeout expires), preventing the
-header-nearest previous right sweep from expanding a nominal ~50 ms cloud to
-~150 ms before deskew.
+live primary callback selects only point-time-aligned aux sweeps already in the
+buffers and never blocks; a late aux is omitted while the front sweep continues.
 
 **Offline extrinsic resolution (no live `/tf_static` needed).** Aux extrinsics
 are resolved offline, in priority order: URDF (`av24.urdf` via
@@ -517,9 +515,9 @@ For Luminar, inspect `debug/merged_aux_count`, `debug/aux_*_points`, and
 `debug/scan_time_span_s` first. A ~150 ms span indicates a wrong sweep and must
 not be papered over by raising a header threshold; correct operation should use
 the point-time matcher and stay near the individual sweep span. If an aligned
-sweep genuinely arrives late, adjust `future_sweep_wait_timeout` only after
-checking callback/executor latency. (`time_threshold` applies to the generic
-non-Luminar header fallback.)
+sweep genuinely arrives late, it is omitted from that live frame so the front
+sweep is not held inside the callback. Offline GLIM can read ahead in bag time.
+(`time_threshold` applies to the generic non-Luminar header fallback.)
 
 ### GICP slides at corners
 

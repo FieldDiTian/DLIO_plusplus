@@ -144,14 +144,9 @@ private:
   bool loadUTMTransform(const std::string& path);
 
   // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
-  // buffers. The primary callback waits for future, point-time-aligned Luminar
-  // sweeps; mergeAuxClouds then transforms aux XYZ into the primary sensor
-  // frame and appends the coherent absolute-timestamped points.
+  // buffers. mergeAuxClouds selects point-time-coherent sweeps already present
+  // without blocking the primary callback.
   void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
-  void waitForFutureAuxSweeps(
-      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
-  bool auxBuffersReadyForPrimary(
-      const LuminarTimestampRangeNs& primary_range);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
@@ -248,8 +243,9 @@ private:
   double concat_luminar_time_threshold_;
   double concat_future_sweep_wait_s_;
   size_t concat_buffer_size_;
-  std::mutex concat_aux_wait_mtx_;
-  std::condition_variable concat_aux_cv_;
+  uint64_t concat_primary_received_ = 0;
+  uint64_t concat_primary_forwarded_ = 0;
+  uint64_t concat_primary_strict_skipped_ = 0;
   // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
   // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,
   // then a static per-aux matrix from yaml, then live TF as a last resort.

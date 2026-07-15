@@ -52,6 +52,10 @@ int AsyncOdometryEstimation::workload() const {
   return input_frame_queue.size() + internal_frame_queue_size;
 }
 
+uint64_t AsyncOdometryEstimation::ins_coverage_skip_count() const {
+  return odometry_estimation->ins_coverage_skip_count();
+}
+
 void AsyncOdometryEstimation::get_results(std::vector<EstimationFrame::ConstPtr>& estimation_results, std::vector<EstimationFrame::ConstPtr>& marginalized_frames) {
   estimation_results = output_estimation_results.get_all_and_clear();
   marginalized_frames = output_marginalized_frames.get_all_and_clear();

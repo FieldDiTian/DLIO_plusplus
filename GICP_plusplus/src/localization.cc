@@ -1405,7 +1405,13 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->applyInitialPoseFromParams();
 }
 
-gicp_plusplus::LocalizationNode::~LocalizationNode() {}
+gicp_plusplus::LocalizationNode::~LocalizationNode() {
+  RCLCPP_INFO(this->get_logger(),
+              "lidar_concat: primary summary received=%lu forwarded=%lu strict_skipped=%lu",
+              static_cast<unsigned long>(this->concat_primary_received_),
+              static_cast<unsigned long>(this->concat_primary_forwarded_),
+              static_cast<unsigned long>(this->concat_primary_strict_skipped_));
+}
 
 bool gicp_plusplus::LocalizationNode::loadUTMTransform(const std::string& path) {
   std::ifstream f(path);
@@ -1778,8 +1784,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/flip_y", false);
   this->get_parameter("localization/flip_y", this->flip_y_);
 
-  // Multi-LiDAR concatenation. Luminar uses absolute point-time alignment and a
-  // bounded future-sweep wait; generic sensors retain header-time matching.
+  // Multi-LiDAR concatenation. Luminar uses absolute point-time alignment;
+  // generic sensors retain header-time matching. The primary callback never
+  // blocks for an aux sweep because SensorDataQoS would overwrite front scans
+  // while this MutuallyExclusive callback is occupied.
   this->declare_parameter<bool>("localization/lidar_concat/enabled", false);
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
@@ -1797,10 +1805,9 @@ void gicp_plusplus::LocalizationNode::getParams() {
                                                std::vector<double>{});
   // Absolute point-time alignment is authoritative for Luminar sweep matching.
   this->declare_parameter<double>("localization/lidar_concat/luminar_time_threshold", 0.010);
-  // The point-time-aligned right sweep can arrive after the front callback due
-  // to acquisition phase. Aux callbacks run independently and wake this bounded
-  // wait; zero restores the old immediate-selection behavior.
-  this->declare_parameter<double>("localization/lidar_concat/future_sweep_wait_timeout", 0.150);
+  // Compatibility-only: older run bundles set 0.150. Any positive value is
+  // accepted but ignored; offline GLIM performs the bag-time read-ahead join.
+  this->declare_parameter<double>("localization/lidar_concat/future_sweep_wait_timeout", 0.0);
   // Offline aux-extrinsic resolution (mirrors GLIM; no live TF needed).
   this->declare_parameter<std::string>("localization/lidar_concat/primary_frame", "luminar_front");
   this->declare_parameter<std::string>("localization/lidar_concat/urdf_path", "");
@@ -1841,9 +1848,14 @@ void gicp_plusplus::LocalizationNode::getParams() {
   if (!std::isfinite(this->concat_future_sweep_wait_s_) ||
       this->concat_future_sweep_wait_s_ < 0.0) {
     RCLCPP_WARN(this->get_logger(),
-                "localization/lidar_concat/future_sweep_wait_timeout=%.3f invalid; using 0.150",
+                "localization/lidar_concat/future_sweep_wait_timeout=%.3f invalid; using 0.0",
                 this->concat_future_sweep_wait_s_);
-    this->concat_future_sweep_wait_s_ = 0.150;
+    this->concat_future_sweep_wait_s_ = 0.0;
+  } else if (this->concat_future_sweep_wait_s_ > 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "localization/lidar_concat/future_sweep_wait_timeout=%.3f is deprecated and ignored; "
+                "the primary callback never blocks for aux sweeps",
+                this->concat_future_sweep_wait_s_);
   }
   this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
   this->get_parameter("localization/lidar_concat/primary_frame", this->concat_primary_frame_);
@@ -1894,7 +1906,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
                   "lidar_concat enabled: %zu aux lidars, header_threshold=%.3fs, "
                   "luminar_point_threshold=%.3fs, future_wait=%.3fs, buffer_size=%zu",
                   this->aux_lidars_.size(), this->concat_time_threshold_,
-                  this->concat_luminar_time_threshold_, this->concat_future_sweep_wait_s_,
+                  this->concat_luminar_time_threshold_, 0.0,
                   this->concat_buffer_size_);
       if (this->concat_aux_time_offsets_.size() < this->aux_lidars_.size()) {
         RCLCPP_WARN(this->get_logger(),
@@ -2519,19 +2531,12 @@ void gicp_plusplus::LocalizationNode::callbackInitialPose(
 void gicp_plusplus::LocalizationNode::callbackPointCloud(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
 
+  ++this->concat_primary_received_;
+
   if (this->imu_only_mode_) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "IMU-only mode enabled: skipping pointcloud/GICP updates.");
     return;
-  }
-
-  // A correct Luminar aux sweep may arrive after the primary callback because
-  // header stamps describe acquisition phase, not necessarily point-time
-  // alignment. Let the independent aux callback group advance its buffers
-  // before selecting a sweep; the wait ends immediately when every aux has a
-  // per-point-time match (or a watermark proves no match can still arrive).
-  if (this->concat_enabled_) {
-    this->waitForFutureAuxSweeps(pc_in);
   }
 
   // Multi-LiDAR concatenation: merge time-aligned aux scans into the primary cloud
@@ -2546,8 +2551,10 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
   // incomplete scan so the degraded cloud is never registered. Drop this scan;
   // IMU/geometric propagation continues until a complete merged scan arrives.
   if (!pc) {
+    ++this->concat_primary_strict_skipped_;
     return;
   }
+  ++this->concat_primary_forwarded_;
 
   // Cache base_link -> lidar extrinsic from TF once. With
   // robot_state_publisher providing the URDF TF tree, this is the true
@@ -2841,87 +2848,6 @@ void gicp_plusplus::LocalizationNode::callbackAuxPointCloud(
     while (aux.buffer.size() > this->concat_buffer_size_) {
       aux.buffer.pop_front();
     }
-  }
-  this->concat_aux_cv_.notify_all();
-}
-
-bool gicp_plusplus::LocalizationNode::auxBuffersReadyForPrimary(
-    const LuminarTimestampRangeNs& primary_range) {
-  for (size_t aux_i = 0; aux_i < this->aux_lidars_.size(); ++aux_i) {
-    auto& aux = *this->aux_lidars_[aux_i];
-    const double clock_offset_s =
-        aux_i < this->concat_aux_time_offsets_.size()
-            ? this->concat_aux_time_offsets_[aux_i]
-            : 0.0;
-
-    std::vector<LuminarSweepCandidate> candidates;
-    LuminarTimestampRangeNs newest_range;
-    {
-      std::lock_guard<std::mutex> lk(aux.mtx);
-      if (aux.buffer.empty()) {
-        return false;
-      }
-      candidates.reserve(aux.buffer.size());
-      for (size_t i = 0; i < aux.buffer.size(); ++i) {
-        const auto& buffered = aux.buffer[i];
-        if (!buffered.luminar_range.valid) {
-          continue;
-        }
-        const LuminarTimestampRangeNs range =
-            shiftedRange(buffered.luminar_range, clock_offset_s);
-        candidates.push_back(LuminarSweepCandidate{i, range, 0.0});
-        if (!newest_range.valid || range.min_ns > newest_range.min_ns) {
-          newest_range = range;
-        }
-      }
-    }
-
-    if (candidates.empty()) {
-      continue;
-    }
-
-    const auto selection = selectClosestLuminarSweep(primary_range, candidates);
-    if (selection &&
-        selection->range_delta_s <= this->concat_luminar_time_threshold_) {
-      continue;
-    }
-    if (luminarWatermarkPassed(
-            primary_range, newest_range,
-            this->concat_luminar_time_threshold_)) {
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
-
-void gicp_plusplus::LocalizationNode::waitForFutureAuxSweeps(
-    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
-  if (this->sensor != dlio::SensorType::LUMINAR ||
-      this->concat_future_sweep_wait_s_ <= 0.0 || this->aux_lidars_.empty()) {
-    return;
-  }
-
-  const LuminarTimestampRangeNs primary_range =
-      luminarTimestampRangeFromCloud(*primary);
-  if (!primary_range.valid) {
-    return;
-  }
-
-  std::unique_lock<std::mutex> wait_lock(this->concat_aux_wait_mtx_);
-  const bool ready = this->concat_aux_cv_.wait_for(
-      wait_lock, std::chrono::duration<double>(this->concat_future_sweep_wait_s_),
-      [this, &primary_range]() {
-        return !rclcpp::ok() || this->auxBuffersReadyForPrimary(primary_range);
-      });
-  if (!ready) {
-    RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 5000,
-        "lidar_concat: timed out after %.3fs waiting for future timestamp-aligned "
-        "Luminar aux sweeps at primary header %.6f; merge will use only "
-        "per-point-aligned sweeps already buffered",
-        this->concat_future_sweep_wait_s_,
-        rclcpp::Time(primary->header.stamp).seconds());
   }
 }
 

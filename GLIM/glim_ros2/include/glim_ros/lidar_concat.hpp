@@ -123,6 +123,20 @@ inline bool luminar_watermark_passed(
   return newest_aux.min_ns > deadline_ns;
 }
 
+// Offline-only queue deadline. enqueue/current are rosbag record times, not
+// sensor header stamps, so a phase-shifted Iris header cannot extend the wait.
+inline bool bag_time_wait_expired(
+  int64_t enqueue_bag_time_ns,
+  int64_t current_bag_time_ns,
+  double wait_s) {
+  if (!std::isfinite(wait_s) || wait_s < 0.0 ||
+      current_bag_time_ns < enqueue_bag_time_ns) {
+    return false;
+  }
+  const int64_t wait_ns = seconds_to_nanoseconds(wait_s);
+  return current_bag_time_ns - enqueue_bag_time_ns >= wait_ns;
+}
+
 inline bool find_xyz_offsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
   x_off = y_off = z_off = -1;
   // [P3 FIX 2026-07-10] Validate datatype/width, not just presence: a
@@ -799,6 +813,9 @@ struct AuxConcatConfig {
   bool enabled = false;
   double time_threshold = 0.05;
   double luminar_time_threshold = 0.010;
+  // Offline rosbag read-ahead only. A queued primary is released once this
+  // much bag time has elapsed, even if no aux watermark ever arrives.
+  double future_sweep_wait_timeout = 0.150;
   int buffer_size = 200;
   std::vector<AuxLidarSensor> aux_sensors;
   // Strict merge guard (see merge_clouds). consecutive_merge_failures is mutable
@@ -844,6 +861,8 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
   out.time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
   out.luminar_time_threshold =
     config_sensors.param<double>("lidar_concat", "luminar_time_threshold", 0.010);
+  out.future_sweep_wait_timeout =
+    config_sensors.param<double>("lidar_concat", "future_sweep_wait_timeout", 0.150);
   out.buffer_size = config_sensors.param<int>("lidar_concat", "buffer_size", 200);
   // [P3 FIX 2026-07-10] Configuration validation, fail LOUD (same policy as
   // aux_time_offsets): a negative/NaN threshold silently disables every aux
@@ -857,6 +876,13 @@ inline AuxConcatConfig load_aux_sensors_from_config(const glim::Config& config_s
     throw std::runtime_error(
       "lidar_concat: luminar_time_threshold = " +
       std::to_string(out.luminar_time_threshold) +
+      " is invalid (must be finite and >= 0)");
+  }
+  if (!std::isfinite(out.future_sweep_wait_timeout) ||
+      out.future_sweep_wait_timeout < 0.0) {
+    throw std::runtime_error(
+      "lidar_concat: future_sweep_wait_timeout = " +
+      std::to_string(out.future_sweep_wait_timeout) +
       " is invalid (must be finite and >= 0)");
   }
   if (out.buffer_size <= 0) {

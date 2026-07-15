@@ -554,6 +554,10 @@ void GlimROS::wait(bool auto_quit) {
   }
 }
 
+uint64_t GlimROS::ins_coverage_skip_count() const {
+  return odometry_estimation->ins_coverage_skip_count();
+}
+
 void GlimROS::save(const std::string& path) {
   if (global_mapping) {
     // TODO(follow-up refactor): replace this needs_wait() quiescence-inference

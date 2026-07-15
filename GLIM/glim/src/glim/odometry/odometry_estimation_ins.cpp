@@ -203,6 +203,7 @@ EstimationFrame::ConstPtr OdometryEstimationINS::insert_frame(const Preprocessed
   const double t_end = std::max(raw_frame->scan_end_time, raw_frame->stamp);
 
   if (!wait_for_ins_coverage(t_start, t_end)) {
+    ++ins_coverage_skips;
     spdlog::warn("OdometryEstimationINS: INS data does not cover frame [{:.6f}, {:.6f}] (buffer: {} samples); skipping", t_start, t_end, ins_buffer.size());
     return nullptr;
   }
@@ -223,6 +224,7 @@ EstimationFrame::ConstPtr OdometryEstimationINS::insert_frame(const Preprocessed
   if (traj_times.size() < 2) {
     Eigen::Isometry3d T_world_ins_single;
     if (!interpolate_ins(t_start, T_world_ins_single)) {
+      ++ins_coverage_skips;
       spdlog::warn("OdometryEstimationINS: failed to interpolate INS at frame stamp {:.6f}; skipping", t_start);
       return nullptr;
     }
