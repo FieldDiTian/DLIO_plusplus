@@ -28,6 +28,38 @@ GLIM/GICP:   consume local ENU directly
 The adapter no longer publishes a map-frame bridge topic from a transform
 sidecar. `map` is the local ENU frame.
 
+## AV-24 LiDAR quality preflight
+
+Before launching GLIM or GICP, verify that the front, left, and right Luminar
+topics each provide at least 30 degrees of vertical scan coverage:
+
+```bash
+ros2 launch adapter av24_lidar_quality.launch.py
+```
+
+The check uses the Luminar `elevation` field for every commanded ray and
+fails closed if a topic is missing, the field is invalid, or any checked frame
+is below 30 degrees. For an offline bag audit:
+
+```bash
+ros2 run adapter lidar_fov_quality_check.py \
+  --bag <bag-or-mcap> --samples 30 --windows 10 \
+  --report-json lidar_fov_report.json
+```
+
+To start another command only after the live preflight passes:
+
+```bash
+ros2 run adapter lidar_fov_quality_check.py \
+  --exec -- ros2 launch gicp_plusplus localization_with_tf.launch.py \
+  map_path:=<local-enu-map.pcd>
+```
+
+Exit codes are 0 for pass, 2 for sensor-quality rejection, and 3 for
+topic/bag/access errors. See the
+[Putnam/Laguna audit](../docs/putnam_laguna_lidar_fov_audit.md) for measured
+results.
+
 ## Outputs
 
 - `/gnss` (`geometry_msgs/msg/PoseWithCovarianceStamped`): continuous Atlas INS

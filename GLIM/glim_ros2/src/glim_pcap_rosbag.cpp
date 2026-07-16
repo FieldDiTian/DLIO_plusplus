@@ -509,6 +509,9 @@ int main(int argc, char** argv) {
           if (topic_type == "sensor_msgs/msg/PointCloud2") {
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             pc2_ser.deserialize_message(&serialized_msg, aux_msg.get());
+            if (!glim->check_lidar_quality(aux_msg, topic_name)) {
+              return;
+            }
             aux.buffer.push_back(aux_msg);
             while (aux.buffer.size() > aux.buffer_size) aux.buffer.pop_front();
           } else {
@@ -632,6 +635,10 @@ int main(int argc, char** argv) {
     if (ev.source == Event::Source::PCAP_SCAN) {
       AssembledScan& s = ev.scan;
       if (s.topic == primary_points_topic) {
+        if (!glim->check_lidar_quality(s.cloud, s.topic)) {
+          stop = true;
+          break;
+        }
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
         int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
@@ -661,6 +668,10 @@ int main(int argc, char** argv) {
           std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         }
       } else if (aux_topic_set.count(s.topic)) {
+        if (!glim->check_lidar_quality(s.cloud, s.topic)) {
+          stop = true;
+          break;
+        }
         for (auto& aux : aux_sensors) {
           if (aux.topic == s.topic) {
             aux.buffer.push_back(s.cloud);
@@ -696,6 +707,10 @@ int main(int argc, char** argv) {
     if (ev.source == Event::Source::PCAP_SCAN) {
       AssembledScan& s = ev.scan;
       if (s.topic == primary_points_topic) {
+        if (!glim->check_lidar_quality(s.cloud, s.topic)) {
+          stop = true;
+          break;
+        }
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = s.cloud;
         int epoch_anchor_count = -1;
         if (concat_enabled && !aux_sensors.empty()) {
@@ -723,6 +738,11 @@ int main(int argc, char** argv) {
   // exited 0 — and after the first fix it still sat in rclcpp::spin()
   // forever in the default auto_quit=false mode, APPEARING hung instead of
   // failing closed. The guard must run BEFORE the spin.
+  if (glim->lidar_quality_failed()) {
+    spdlog::critical("GLIM stopped by LiDAR quality gate: {}", glim->lidar_quality_failure_reason());
+    return 2;
+  }
+
   if (total_pcap_primary == 0) {
     spdlog::critical("no primary pcap scans were dispatched — pcap/bag window mismatch or "
                      "packet filtering removed everything; NOT saving, exiting nonzero");
@@ -734,6 +754,10 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
+  if (glim->lidar_quality_failed()) {
+    spdlog::critical("GLIM stopped by LiDAR quality gate: {}", glim->lidar_quality_failure_reason());
+    return 2;
+  }
   glim->save(dump_path);
   return 0;
 }

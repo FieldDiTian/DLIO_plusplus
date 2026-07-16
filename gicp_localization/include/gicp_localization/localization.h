@@ -79,6 +79,7 @@ public:
   ~LocalizationNode();
 
   void start();
+  bool lidarQualityFailed() const { return lidar_quality_failed_.load(); }
 
 private:
 
@@ -89,6 +90,8 @@ private:
   void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  bool checkLidarQuality(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg,
+                         const std::string& source);
   // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
   bool getGtPoseAt(double stamp, GtSample& out);
   // P2#2: world-frame (map) velocity of the gt_body origin by central finite
@@ -476,6 +479,13 @@ private:
   std::deque<geometry_msgs::msg::PoseStamped> utm_path_buffer_;
 
   // Parameters
+  bool lidar_quality_enabled_ = true;
+  double lidar_quality_min_vertical_fov_deg_ = 30.0;
+  std::size_t lidar_quality_min_rays_ = 1000;
+  std::string lidar_quality_elevation_field_ = "elevation";
+  bool lidar_quality_elevation_in_radians_ = true;
+  bool lidar_quality_require_elevation_field_ = true;
+  std::atomic<bool> lidar_quality_failed_{false};
   std::string map_path_;
   double map_roll_deg_;
   double map_pitch_deg_;

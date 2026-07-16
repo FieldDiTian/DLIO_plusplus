@@ -51,6 +51,7 @@ install(TARGETS adapter_utils adapter
 
 install(PROGRAMS
   scripts/p1_imu_pcap_replay_node.py
+  scripts/lidar_fov_quality_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -66,5 +67,16 @@ install(FILES README.md
   DESTINATION share/${PROJECT_NAME}
   OPTIONAL
 )
+
+ament_export_include_directories(include)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_lidar_fov_quality test/test_lidar_fov_quality.cpp)
+  if(TARGET test_lidar_fov_quality)
+    target_include_directories(test_lidar_fov_quality PRIVATE include)
+    ament_target_dependencies(test_lidar_fov_quality sensor_msgs)
+  endif()
+endif()
 
 ament_package()

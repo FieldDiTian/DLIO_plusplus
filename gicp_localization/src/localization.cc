@@ -13,6 +13,7 @@
 #include "gicp_localization/localization.h"
 #include "gicp_localization/urdf_transforms.hpp"
 #include "dlio/utils.h"
+#include <adapter/lidar_fov_quality.hpp>
 
 #include <Eigen/Geometry>
 #include <Eigen/Eigenvalues>
@@ -1589,6 +1590,35 @@ void gicp_localization::LocalizationNode::getParams() {
               this->yaw_gate_max_corr_deg_, this->yaw_gate_fitness_ratio_);
 
   // Preprocessing parameters
+  this->declare_parameter<bool>("localization/lidar_quality/enabled", true);
+  this->declare_parameter<double>("localization/lidar_quality/min_vertical_fov_deg", 30.0);
+  this->declare_parameter<int>("localization/lidar_quality/min_rays", 1000);
+  this->declare_parameter<std::string>("localization/lidar_quality/elevation_field", "elevation");
+  this->declare_parameter<bool>("localization/lidar_quality/elevation_in_radians", true);
+  this->declare_parameter<bool>("localization/lidar_quality/require_elevation_field", true);
+  int lidar_quality_min_rays = 1000;
+  this->get_parameter("localization/lidar_quality/enabled", this->lidar_quality_enabled_);
+  this->get_parameter("localization/lidar_quality/min_vertical_fov_deg",
+                      this->lidar_quality_min_vertical_fov_deg_);
+  this->get_parameter("localization/lidar_quality/min_rays", lidar_quality_min_rays);
+  this->get_parameter("localization/lidar_quality/elevation_field",
+                      this->lidar_quality_elevation_field_);
+  this->get_parameter("localization/lidar_quality/elevation_in_radians",
+                      this->lidar_quality_elevation_in_radians_);
+  this->get_parameter("localization/lidar_quality/require_elevation_field",
+                      this->lidar_quality_require_elevation_field_);
+  this->lidar_quality_min_rays_ = static_cast<std::size_t>(std::max(1, lidar_quality_min_rays));
+  if (!std::isfinite(this->lidar_quality_min_vertical_fov_deg_) ||
+      this->lidar_quality_min_vertical_fov_deg_ <= 0.0) {
+    throw std::invalid_argument("localization/lidar_quality/min_vertical_fov_deg must be finite and > 0");
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "LiDAR quality gate: %s (min vertical FOV=%.3f deg, min rays=%zu, field='%s', require_field=%s)",
+              this->lidar_quality_enabled_ ? "ENABLED" : "disabled",
+              this->lidar_quality_min_vertical_fov_deg_, this->lidar_quality_min_rays_,
+              this->lidar_quality_elevation_field_.c_str(),
+              this->lidar_quality_require_elevation_field_ ? "true" : "false");
+
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
   this->declare_parameter<bool>("dlio/preprocessing/voxelFilter/use", true);
   this->declare_parameter<double>("dlio/preprocessing/voxelFilter/res", 0.3);
@@ -2216,6 +2246,10 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
     return;
   }
 
+  if (!this->checkLidarQuality(pc_in, "primary:" + pc_in->header.frame_id)) {
+    return;
+  }
+
   // Multi-LiDAR concatenation: merge nearest aux scans into the primary cloud
   // before any other processing. Downstream steps (TF cache, manual field
   // extraction, Luminar timestamp read, Y-flip, deskew, GICP) all run on the
@@ -2502,11 +2536,53 @@ void gicp_localization::LocalizationNode::callbackAuxPointCloud(
     return;
   }
   auto& aux = *this->aux_lidars_[aux_index];
+  if (!this->checkLidarQuality(msg, aux.topic)) {
+    return;
+  }
   std::lock_guard<std::mutex> lk(aux.mtx);
   aux.buffer.push_back(std::move(msg));
   while (aux.buffer.size() > this->concat_buffer_size_) {
     aux.buffer.pop_front();
   }
+}
+
+bool gicp_localization::LocalizationNode::checkLidarQuality(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const std::string& source) {
+  if (!this->lidar_quality_enabled_) {
+    return true;
+  }
+  if (this->lidar_quality_failed_.load()) {
+    return false;
+  }
+  const auto measurement = adapter::measure_vertical_fov(
+      *msg, this->lidar_quality_elevation_field_, this->lidar_quality_elevation_in_radians_,
+      this->lidar_quality_min_rays_, this->lidar_quality_require_elevation_field_);
+  if (!adapter::meets_vertical_fov(measurement, this->lidar_quality_min_vertical_fov_deg_)) {
+    this->lidar_quality_failed_.store(true);
+    if (measurement.valid) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "LiDAR QUALITY FAILURE: source='%s' vertical_fov=%.3f deg "
+                   "(elevation [%.3f, %.3f] deg, rays=%zu, field=%s) is below required %.3f deg. "
+                   "Stopping localization.",
+                   source.c_str(), measurement.vertical_fov_deg,
+                   measurement.min_elevation_deg, measurement.max_elevation_deg,
+                   measurement.sample_count, measurement.source.c_str(),
+                   this->lidar_quality_min_vertical_fov_deg_);
+    } else {
+      RCLCPP_FATAL(this->get_logger(),
+                   "LiDAR QUALITY FAILURE: source='%s' measurement invalid: %s. "
+                   "Required vertical FOV >= %.3f deg. Stopping localization.",
+                   source.c_str(), measurement.error.c_str(),
+                   this->lidar_quality_min_vertical_fov_deg_);
+    }
+    rclcpp::shutdown();
+    return false;
+  }
+  RCLCPP_INFO_ONCE(this->get_logger(),
+                   "LiDAR QUALITY PASS: first checked scan has vertical_fov=%.3f deg "
+                   "(required >= %.3f deg)",
+                   measurement.vertical_fov_deg, this->lidar_quality_min_vertical_fov_deg_);
+  return true;
 }
 
 // Resolve every aux LiDAR's T_primary_aux at startup WITHOUT live TF, so the
@@ -3352,6 +3428,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
           : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
   const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
   const double hessian_condition = hessianConditionProxy(final_hessian);
+  const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
+  const Eigen::Matrix4f candidate_pose = this->deskew_
+      ? (optimizer_solution * this->T_prior)
+      : (optimizer_solution * T_lidar_base);
+  const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
   // Marginal yaw stiffness (yaw-defect diagnostic): Schur complement of the
   // vehicle-re-centered hessian w.r.t. everything except yaw — the
@@ -3381,12 +3462,6 @@ void gicp_localization::LocalizationNode::performLocalization() {
       if (std::isfinite(schur)) yaw_marginal_stiffness = std::max(0.0, schur);
     }
   }
-
-  const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
-  const Eigen::Matrix4f candidate_pose = this->deskew_
-      ? (optimizer_solution * this->T_prior)
-      : (optimizer_solution * T_lidar_base);
-  const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
   // --- P1: per-map fitness baseline (rolling median of accepted-frame fitness).
   // Absolute fitness thresholds calibrated on a same-run map (floor 0.03-0.06)

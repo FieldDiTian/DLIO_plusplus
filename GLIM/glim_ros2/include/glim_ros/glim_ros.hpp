@@ -1,6 +1,7 @@
 #pragma once
 
 #include <any>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,14 @@ public:
   // Buffers an auxiliary LiDAR cloud for later time-matched merging.
   void aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index);
 
+  // Fail-closed Luminar scan-pattern gate shared by live and offline inputs.
+  // Returns false and requests ROS shutdown when the commanded-ray elevation
+  // span is below the configured minimum (30 deg on AV-24).
+  bool check_lidar_quality(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg,
+                           const std::string& source);
+  bool lidar_quality_failed() const { return lidar_quality_failed_.load(); }
+  std::string lidar_quality_failure_reason() const;
+
   void wait(bool auto_quit = false);
   void save(const std::string& path);
 
@@ -78,6 +87,17 @@ private:
 
   std::string intensity_field, ring_field;
   bool flip_points_y;
+
+  bool lidar_quality_enabled_ = true;
+  double lidar_quality_min_vertical_fov_deg_ = 30.0;
+  std::size_t lidar_quality_min_rays_ = 1000;
+  std::string lidar_quality_elevation_field_ = "elevation";
+  bool lidar_quality_elevation_in_radians_ = true;
+  bool lidar_quality_require_elevation_field_ = true;
+  std::atomic<bool> lidar_quality_failed_{false};
+  mutable std::mutex lidar_quality_mutex_;
+  std::string lidar_quality_failure_reason_;
+  std::vector<std::string> lidar_quality_passed_sources_;
 
   // Extension modulles
   std::vector<std::shared_ptr<ExtensionModule>> extension_modules;

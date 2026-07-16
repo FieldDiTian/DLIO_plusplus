@@ -38,6 +38,7 @@
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
 #include <glim/util/urdf_transforms.hpp>
+#include <adapter/lidar_fov_quality.hpp>
 
 namespace glim {
 
@@ -90,6 +91,26 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
+
+  lidar_quality_enabled_ = config_sensors.param<bool>("lidar_quality", "enabled", true);
+  lidar_quality_min_vertical_fov_deg_ =
+    config_sensors.param<double>("lidar_quality", "min_vertical_fov_deg", 30.0);
+  lidar_quality_min_rays_ = static_cast<std::size_t>(std::max(
+    1, config_sensors.param<int>("lidar_quality", "min_rays", 1000)));
+  lidar_quality_elevation_field_ =
+    config_sensors.param<std::string>("lidar_quality", "elevation_field", "elevation");
+  lidar_quality_elevation_in_radians_ =
+    config_sensors.param<bool>("lidar_quality", "elevation_in_radians", true);
+  lidar_quality_require_elevation_field_ =
+    config_sensors.param<bool>("lidar_quality", "require_elevation_field", true);
+  if (!std::isfinite(lidar_quality_min_vertical_fov_deg_) ||
+      lidar_quality_min_vertical_fov_deg_ <= 0.0) {
+    throw std::invalid_argument("lidar_quality/min_vertical_fov_deg must be finite and > 0");
+  }
+  spdlog::info(
+    "LiDAR quality gate: {} (min vertical FOV={:.3f} deg, min rays={}, field='{}', require_field={})",
+    lidar_quality_enabled_ ? "ENABLED" : "disabled", lidar_quality_min_vertical_fov_deg_,
+    lidar_quality_min_rays_, lidar_quality_elevation_field_, lidar_quality_require_elevation_field_);
 
   // Multi-LiDAR concatenation. Live glim_ros must merge the auxiliary (left /
   // right) Luminar clouds into the primary luminar_front frame just like the
@@ -358,6 +379,12 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 #endif
 
 void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
+  const std::string source = aux_index < aux_concat.aux_sensors.size()
+    ? aux_concat.aux_sensors[aux_index].topic
+    : msg->header.frame_id;
+  if (!check_lidar_quality(msg, source)) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(aux_buffers_mutex);
   if (aux_index >= aux_concat.aux_sensors.size()) {
     return;
@@ -370,6 +397,9 @@ void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr
 }
 
 void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  if (!check_lidar_quality(msg, "primary:" + msg->header.frame_id)) {
+    return;
+  }
   // Merge buffered auxiliary clouds into the primary scan (front + left + right
   // -> luminar_front frame), then hand the result to the estimator. The mutex
   // guards the aux buffers, which merge_clouds() reads via find_nearest().
@@ -401,6 +431,9 @@ void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSha
 }
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg, int epoch_anchor_count) {
+  if (!check_lidar_quality(msg, "estimator_input:" + msg->header.frame_id)) {
+    return 0;
+  }
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
@@ -448,6 +481,63 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   spdlog::debug("workload={} (odom={} sub={} global={})", workload, odometry_estimation->workload(), sub_wl, global_wl);
 
   return workload;
+}
+
+bool GlimROS::check_lidar_quality(
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg, const std::string& source) {
+  if (!lidar_quality_enabled_) {
+    return true;
+  }
+  if (lidar_quality_failed_.load()) {
+    return false;
+  }
+
+  const auto measurement = adapter::measure_vertical_fov(
+    *msg, lidar_quality_elevation_field_, lidar_quality_elevation_in_radians_,
+    lidar_quality_min_rays_, lidar_quality_require_elevation_field_);
+  if (!adapter::meets_vertical_fov(measurement, lidar_quality_min_vertical_fov_deg_)) {
+    std::string reason;
+    if (measurement.valid) {
+      reason = fmt::format(
+        "source='{}' vertical_fov={:.3f} deg (elevation [{:.3f}, {:.3f}] deg, rays={}, field={}) "
+        "is below required {:.3f} deg",
+        source, measurement.vertical_fov_deg, measurement.min_elevation_deg,
+        measurement.max_elevation_deg, measurement.sample_count, measurement.source,
+        lidar_quality_min_vertical_fov_deg_);
+    } else {
+      reason = fmt::format(
+        "source='{}' vertical-FOV measurement invalid: {} (required {:.3f} deg)",
+        source, measurement.error, lidar_quality_min_vertical_fov_deg_);
+    }
+    {
+      std::lock_guard<std::mutex> lock(lidar_quality_mutex_);
+      lidar_quality_failure_reason_ = reason;
+    }
+    lidar_quality_failed_.store(true);
+    spdlog::critical("LiDAR QUALITY FAILURE: {}. Stopping GLIM; no map will be saved.", reason);
+    rclcpp::shutdown();
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(lidar_quality_mutex_);
+    if (std::find(lidar_quality_passed_sources_.begin(), lidar_quality_passed_sources_.end(), source) ==
+        lidar_quality_passed_sources_.end()) {
+      lidar_quality_passed_sources_.push_back(source);
+      spdlog::info(
+        "LiDAR QUALITY PASS: source='{}' vertical_fov={:.3f} deg "
+        "(elevation [{:.3f}, {:.3f}] deg, rays={}, required >= {:.3f} deg)",
+        source, measurement.vertical_fov_deg, measurement.min_elevation_deg,
+        measurement.max_elevation_deg, measurement.sample_count,
+        lidar_quality_min_vertical_fov_deg_);
+    }
+  }
+  return true;
+}
+
+std::string GlimROS::lidar_quality_failure_reason() const {
+  std::lock_guard<std::mutex> lock(lidar_quality_mutex_);
+  return lidar_quality_failure_reason_;
 }
 
 void GlimROS::external_odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {

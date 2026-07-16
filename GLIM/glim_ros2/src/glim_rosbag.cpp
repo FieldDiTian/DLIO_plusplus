@@ -364,6 +364,9 @@ int main(int argc, char** argv) {
             }
             auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
             points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
+            if (!glim->check_lidar_quality(aux_msg, msg->topic_name)) {
+              return false;
+            }
             aux.buffer.push_back(aux_msg);
             while (aux.buffer.size() > aux.buffer_size) {
               aux.buffer.pop_front();
@@ -391,6 +394,9 @@ int main(int argc, char** argv) {
         }
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
+        if (!glim->check_lidar_quality(points_msg, msg->topic_name)) {
+          return false;
+        }
 
         // Merge auxiliary LiDAR clouds if concatenation is enabled
         sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = points_msg;
@@ -506,6 +512,10 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
+  if (glim->lidar_quality_failed()) {
+    spdlog::critical("GLIM stopped by LiDAR quality gate: {}", glim->lidar_quality_failure_reason());
+    return 2;
+  }
   glim->save(dump_path);
 
   return 0;

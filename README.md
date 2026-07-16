@@ -41,6 +41,26 @@ The `map` frame is a **local ENU** tangent frame anchored at a fixed geodetic **
 
 The one hard constraint is a **single shared datum**: the map, the seed (`/gps_p1/filtered_odom`), and GICP must all use the origin the adapter defines, or the frames silently disagree.
 
+### LiDAR vertical-FOV quality gate
+
+AV-24 GLIM and both GICP implementations fail closed when any primary or
+auxiliary Luminar scan covers less than **30 degrees vertically**, or when the
+required per-ray `elevation` field is missing/invalid. GLIM stops without
+saving a partial map; GICP shuts down localization. The shared measurement
+uses all commanded Luminar rays, including zero returns, instead of estimating
+coverage from scene-dependent XYZ returns.
+
+Run the AV-24 preflight after the three LiDAR drivers are publishing and before
+starting mapping/localization:
+
+```bash
+ros2 launch adapter av24_lidar_quality.launch.py
+```
+
+For a strict launch handoff, use `lidar_fov_quality_check.py --exec -- <launch
+command>`. The [Putnam/Laguna audit](docs/putnam_laguna_lidar_fov_audit.md)
+documents measured bags, commands, and the current Laguna data blocker.
+
 This **replaces the earlier UTM contract**. GLIM's `gnss_global` still aligns the map to the GNSS input frame via a 2D Umeyama fit and can export that SE(3) (the file/variable are still named `T_world_utm` for historical reasons), but when fed ENU input that transform is effectively world↔ENU. GICP's `utm`-frame publishing is now an **optional legacy layer**, active only if `localization/utm_transform_path` is set.
 
 ### Multi-LiDAR merge policy
@@ -262,6 +282,9 @@ python3 scripts/prep_bag.py --input <raw_bag> --output <normalized_bag> --p1-imu
 ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>" p1_imu_pcap_path:=/path/to/ins.pcap
 # ...or use the live Atlas IMU ROS topic instead:
 ros2 launch adapter adapter.launch.py local_enu_origin:="<lat,lon,alt>" use_p1_imu_pcap:=false
+
+# Verify all three AV-24 Luminar sensors cover >=30 degrees vertically.
+ros2 launch adapter av24_lidar_quality.launch.py
 
 # GLIM builds maps OFFLINE only. There is no live `glim_ros.launch.py` — the live
 # node intentionally exits when `enable_online_mapping=false` (config_ros.json).

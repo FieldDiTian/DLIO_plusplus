@@ -41,6 +41,18 @@
     // every 512 merges, warning when |mean| > 20 ms (missing/wrong correction).
     "frame_diag_log": true
   },
+  // AV-24 Luminar sensor-quality gate. The elevation field is present for
+  // every commanded ray, including zero-return rays, and is the authoritative
+  // scan-pattern measurement. Mapping stops before saving when a primary or
+  // auxiliary scan is invalid or covers less than 30 degrees vertically.
+  "lidar_quality": {
+    "enabled": true,
+    "min_vertical_fov_deg": 30.0,
+    "min_rays": 1000,
+    "elevation_field": "elevation",
+    "elevation_in_radians": true,
+    "require_elevation_field": true
+  },
   "sensors": {
     "T_lidar_camera": [
       -0.0032,

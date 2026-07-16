@@ -189,6 +189,17 @@
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
     localization/flip_y: false
 
+    # Fail-closed AV-24 Luminar scan-pattern gate. The elevation field records
+    # every commanded ray (including zero-return rays), so it directly exposes
+    # the firmware vertical scan coverage. Localization stops on the first
+    # invalid or <30 degree primary/aux scan.
+    localization/lidar_quality/enabled: true
+    localization/lidar_quality/min_vertical_fov_deg: 30.0
+    localization/lidar_quality/min_rays: 1000
+    localization/lidar_quality/elevation_field: "elevation"
+    localization/lidar_quality/elevation_in_radians: true
+    localization/lidar_quality/require_elevation_field: true
+
     # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
     # subscribes to each aux topic, buffers the latest scans, and on every primary
     # scan finds the nearest aux scan in time, transforms its XYZ into the primary

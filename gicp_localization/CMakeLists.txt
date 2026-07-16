@@ -29,6 +29,7 @@ find_package(PCL REQUIRED)
 find_package( Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
 find_package(LibXml2 REQUIRED)  # URDF parsing for offline aux-LiDAR extrinsics (lidar_concat)
+find_package(adapter REQUIRED)
 
 set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_STANDARD 17)
@@ -67,11 +68,11 @@ ament_target_dependencies(nano_gicp)
 add_executable(gicp_localization_node src/localization_node.cc src/localization.cc)
 target_include_directories(gicp_localization_node PRIVATE ${LIBXML2_INCLUDE_DIR})
 target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${LIBXML2_LIBRARIES})
-ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
+ament_target_dependencies(gicp_localization_node "adapter" "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs pcl_ros)
+ament_export_dependencies(adapter rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs pcl_ros)
 ament_package()
 
 # Binaries
