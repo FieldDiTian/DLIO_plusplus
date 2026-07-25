@@ -49,6 +49,8 @@ def generate_launch_description():
         default='')
     parent_frame = LaunchConfiguration('parent_frame', default='base_link')
     child_frame = LaunchConfiguration('child_frame', default='luminar_front')
+    config_path = LaunchConfiguration('config_path', default='')
+    expected_enu_origin = LaunchConfiguration('expected_enu_origin', default='')
 
     declare_rviz_arg = DeclareLaunchArgument(
         'rviz', default_value=rviz, description='Launch RViz')
@@ -88,6 +90,12 @@ def generate_launch_description():
     declare_map_path_arg = DeclareLaunchArgument(
         'map_path', default_value='',
         description='Path to PCD map file for localization (overrides localization.yaml when non-empty)')
+    declare_config_path_arg = DeclareLaunchArgument(
+        'config_path', default_value='',
+        description='Complete ROS parameter YAML. Empty uses the package localization.yaml.')
+    declare_expected_enu_origin_arg = DeclareLaunchArgument(
+        'expected_enu_origin', default_value='',
+        description='Expected local-ENU datum as lat,lon,alt; checked against the map manifest.')
 
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
 
@@ -131,16 +139,21 @@ def generate_launch_description():
     # GICP Localization Node
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
+        config_path_value = LaunchConfiguration('config_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         # Same av24.urdf the robot_state_publisher uses: hand the localization node
         # the resolved ABSOLUTE path so lidar_concat resolves aux extrinsics from the
         # URDF (single source of truth) instead of relying on CWD or the static fallback.
         urdf_file = resolve_urdf_path(context)
+        parameter_yaml = config_path_value if config_path_value else localization_yaml_path
+        if config_path_value and not os.path.isfile(config_path_value):
+            raise RuntimeError(f"GICP parameter file not found at '{config_path_value}'.")
         params = [
-            localization_yaml_path,
+            parameter_yaml,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
             {'localization/lidar_concat/urdf_path': urdf_file},
+            {'localization/expected_enu_origin': expected_enu_origin},
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
@@ -204,6 +217,8 @@ def generate_launch_description():
         declare_parent_frame_arg,
         declare_child_frame_arg,
         declare_map_path_arg,
+        declare_config_path_arg,
+        declare_expected_enu_origin_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
         OpaqueFunction(function=make_rviz_node),

@@ -154,7 +154,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // offset was added to raw_points->stamp before process(), but the
   // absolute-time branch of replace_points_stamp overwrites the stamp with the
   // raw min point time and silently discarded it for Luminar/absolute clouds.
-  time_keeper->point_time_offset = points_time_offset;
+  time_keeper->set_point_time_offset(points_time_offset);
   preprocessor.reset(new glim::CloudPreprocessor);
 
   // Odometry estimation

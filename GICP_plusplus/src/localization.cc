@@ -1144,20 +1144,32 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->gicp.setRotationEpsilon(this->gicp_rotation_epsilon_);
   this->gicp.setDebugPrint(this->debug_lm_print_);
 
-  // Set target (map)
-  this->gicp.setInputTarget(this->map_cloud);
-  if (!this->gicp.calculateTargetCovariances()) {
-    RCLCPP_ERROR(this->get_logger(), "Failed to calculate map covariances! GICP will not work correctly.");
-    throw std::runtime_error("Failed to calculate target covariances");
+  // Set the target immediately for the legacy whole-map path.  The local-map
+  // path defers target construction until the first scan, after GNSS has
+  // supplied the correct map-frame seed.
+  if (!this->local_map_enable_) {
+    this->gicp.setInputTarget(this->map_cloud);
+    if (!this->gicp.calculateTargetCovariances()) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to calculate map covariances! GICP will not work correctly.");
+      throw std::runtime_error("Failed to calculate target covariances");
+    }
+  } else {
+    RCLCPP_INFO(this->get_logger(),
+                "Local-map target enabled: target construction deferred until the first seeded scan");
   }
 
   // Setup subscribers
   this->pointcloud_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto pointcloud_sub_opt = rclcpp::SubscriptionOptions();
   pointcloud_sub_opt.callback_group = this->pointcloud_cb_group;
-  // Use sensor-data QoS so rosbag/sensor publishers with BEST_EFFORT are compatible.
+  // UCB's observer is a strict scan-to-scan state chain.  Preserve decoded
+  // Laguna scans in order instead of letting callback timing drop arbitrary
+  // states; IMU and GNSS have independent callback groups and remain fresh.
+  auto pointcloud_qos = rclcpp::QoS(rclcpp::KeepLast(1000));
+  pointcloud_qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
+  pointcloud_qos.durability(rclcpp::DurabilityPolicy::Volatile);
   this->pointcloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "pointcloud", rclcpp::SensorDataQoS(),
+      "pointcloud", pointcloud_qos,
       std::bind(&gicp_plusplus::LocalizationNode::callbackPointCloud, this, std::placeholders::_1),
       pointcloud_sub_opt);
 
@@ -1187,7 +1199,7 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
       const int idx = static_cast<int>(i);
       auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          this->aux_lidars_[i]->topic, rclcpp::SensorDataQoS(),
+          this->aux_lidars_[i]->topic, pointcloud_qos,
           [this, idx](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
             this->callbackAuxPointCloud(idx, std::move(msg));
           },
@@ -1442,7 +1454,12 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->tf_listener = std::make_shared<tf2_ros::TransformListener>(*this->tf_buffer);
 
   RCLCPP_INFO(this->get_logger(), "DLIO Localization Node Initialized");
-  RCLCPP_INFO(this->get_logger(), "Map loaded with %lu points", this->map_cloud->points.size());
+  const size_t loaded_map_points =
+      (this->local_map_enable_ && this->full_map_cloud_)
+          ? this->full_map_cloud_->size()
+          : this->map_cloud->size();
+  RCLCPP_INFO(this->get_logger(), "Map loaded with %lu points",
+              loaded_map_points);
 
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
@@ -1458,7 +1475,8 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   // would touch destroyed members. Callbacks cannot fire before spin, so no
   // front cloud can arrive between subscription creation and this point.
   if (this->concat_enabled_ && !this->aux_lidars_.empty() &&
-      this->sensor == dlio::SensorType::LUMINAR) {
+      this->sensor == dlio::SensorType::LUMINAR &&
+      !this->concat_luminar_use_header_time_) {
     this->sync_active_ = true;
     this->sync_worker_ =
         std::thread(&gicp_plusplus::LocalizationNode::syncWorkerLoop, this);
@@ -1477,6 +1495,9 @@ gicp_plusplus::LocalizationNode::~LocalizationNode() {
   // PROCESSED. Reaching this with a live worker means the run tail can only
   // be accounted (rclcpp::ok() is already false here on the normal path).
   this->drainFrontSync();
+  if (this->local_map_rebuild_thread_.joinable()) {
+    this->local_map_rebuild_thread_.join();
+  }
 }
 
 void gicp_plusplus::LocalizationNode::drainFrontSync() {
@@ -1630,6 +1651,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // scan voxel (dlio/preprocessing/voxelFilter/res).
   // 0.0 disables (use the full-resolution map).
   this->declare_parameter<double>("localization/map_voxel_size", 0.3);
+  this->declare_parameter<bool>("localization/local_map/enable", false);
+  this->declare_parameter<double>("localization/local_map/radius", 150.0);
   this->declare_parameter<double>("localization/map_rotation/roll_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/pitch_deg", 0.0);
   this->declare_parameter<double>("localization/map_rotation/yaw_deg", 0.0);
@@ -1647,6 +1670,15 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("localization/visualize_map", this->visualize_map_);
   this->get_parameter("localization/map_voxel_size_vis", this->map_voxel_size_vis_);
   this->get_parameter("localization/map_voxel_size", this->map_voxel_size_);
+  this->get_parameter("localization/local_map/enable", this->local_map_enable_);
+  this->get_parameter("localization/local_map/radius", this->local_map_radius_);
+  if (this->local_map_enable_) {
+    if (!(this->local_map_radius_ > 0.0)) {
+      throw std::runtime_error("local-map radius must be positive");
+    }
+    // perception-ws uses the crop radius as the coarse XY-grid cell size.
+    this->local_map_grid_size_ = this->local_map_radius_;
+  }
   this->get_parameter("localization/map_rotation/roll_deg", this->map_roll_deg_);
   this->get_parameter("localization/map_rotation/pitch_deg", this->map_pitch_deg_);
   this->get_parameter("localization/map_rotation/yaw_deg", this->map_yaw_deg_);
@@ -1717,9 +1749,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // Default matches cfg/localization.yaml (P2#3: raised from 1; per-frame
   // snapping masked dead-reckoning quality). Keep the two in sync.
   this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 5);
+  this->declare_parameter<double>("localization/gt_recovery/sanity_radius", 0.0);
   this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
   this->get_parameter("localization/gt_recovery/min_consecutive_failures",
                       this->gt_recovery_min_consecutive_failures_);
+  this->get_parameter("localization/gt_recovery/sanity_radius",
+                      this->gt_recovery_sanity_radius_);
   if (this->gt_recovery_enabled_ && !this->gt_odom_enabled_) {
     RCLCPP_WARN(this->get_logger(),
                 "localization/gt_recovery/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
@@ -1727,6 +1762,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
   }
   if (this->gt_recovery_min_consecutive_failures_ < 1) {
     this->gt_recovery_min_consecutive_failures_ = 1;
+  }
+  if (!std::isfinite(this->gt_recovery_sanity_radius_) ||
+      this->gt_recovery_sanity_radius_ < 0.0) {
+    this->gt_recovery_sanity_radius_ = 0.0;
   }
 
   this->get_parameter("localization/publish_tf", this->publish_tf_);
@@ -1934,10 +1973,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
 
   // Preprocessing parameters
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
+  this->declare_parameter<double>("localization/scan_min_range", 0.0);
   this->declare_parameter<bool>("dlio/preprocessing/voxelFilter/use", true);
   this->declare_parameter<double>("dlio/preprocessing/voxelFilter/res", 0.3);
 
   this->get_parameter("dlio/preprocessing/cropBoxFilter/size", this->crop_size_);
+  this->get_parameter("localization/scan_min_range", this->scan_min_range_);
   this->get_parameter("dlio/preprocessing/voxelFilter/use", this->vf_use_);
   this->get_parameter("dlio/preprocessing/voxelFilter/res", this->vf_res_);
 
@@ -1979,6 +2020,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // max(|min-min|,|max-max|) <= this. Header time is only a tie-break; the
   // 0.1 s header threshold stays solely for non-Luminar fallback matching.
   this->declare_parameter<double>("localization/lidar_concat/luminar_point_time_threshold_s", 0.010);
+  this->declare_parameter<bool>("localization/lidar_concat/luminar_use_header_time", false);
   // Arrival-time (steady clock) deadline for a pending front cloud in the
   // async synchronizer. Bounds live latency when an aux is lost/stalled; it is
   // not a point-clock correction and never alters timestamps.
@@ -2033,6 +2075,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   }
   this->get_parameter("localization/lidar_concat/luminar_point_time_threshold_s",
                       this->concat_luminar_point_threshold_);
+  this->get_parameter("localization/lidar_concat/luminar_use_header_time",
+                      this->concat_luminar_use_header_time_);
   this->get_parameter("localization/lidar_concat/future_aux_wait_timeout_s",
                       this->concat_future_aux_wait_s_);
   int primary_queue_size_int = 8;
@@ -2329,9 +2373,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
               this->gicp_hessian_rot_warn_deg_,
               this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: %s (min consecutive failures=%d)",
+              "GT recovery: %s (min consecutive failures=%d, wrong-lock radius=%.1fm)",
               this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
-              this->gt_recovery_min_consecutive_failures_);
+              this->gt_recovery_min_consecutive_failures_,
+              this->gt_recovery_sanity_radius_);
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -2339,6 +2384,244 @@ void gicp_plusplus::LocalizationNode::getParams() {
   RCLCPP_INFO(this->get_logger(), "Debug detail: verbose_scan_log=%s small_gicp_lm_debug=%s",
               this->debug_verbose_scan_log_ ? "ENABLED" : "DISABLED",
               this->debug_lm_print_ ? "ENABLED" : "DISABLED");
+}
+
+int64_t gicp_plusplus::LocalizationNode::localMapGridKey(int32_t ix, int32_t iy) {
+  const uint64_t ux = static_cast<uint32_t>(ix);
+  const uint64_t uy = static_cast<uint32_t>(iy);
+  return static_cast<int64_t>((ux << 32) | uy);
+}
+
+void gicp_plusplus::LocalizationNode::buildLocalMapGrid() {
+  this->local_map_grid_.clear();
+  if (!this->full_map_cloud_) return;
+  this->local_map_grid_.reserve(this->full_map_cloud_->size() / 8 + 16);
+
+  // The cell size is deliberately large (normally equal to the local radius):
+  // only a handful of buckets are visited per rebuild, while the exact
+  // circular radius test below prevents square-corner leakage.
+  for (uint32_t i = 0; i < this->full_map_cloud_->points.size(); ++i) {
+    const auto& p = this->full_map_cloud_->points[i];
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    const int32_t ix = static_cast<int32_t>(
+        std::floor(static_cast<double>(p.x) / this->local_map_grid_size_));
+    const int32_t iy = static_cast<int32_t>(
+        std::floor(static_cast<double>(p.y) / this->local_map_grid_size_));
+    this->local_map_grid_[localMapGridKey(ix, iy)].push_back(i);
+  }
+}
+
+bool gicp_plusplus::LocalizationNode::ensureLocalMapTarget(
+    const Eigen::Vector3f& center) {
+  if (!this->local_map_enable_) return true;
+  if (!center.allFinite()) return false;
+
+  if (!this->local_map_target_ready_) {
+    {
+      std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+      this->pending_local_map_target_.reset();
+    }
+    // perception-ws first builds a reduced crop synchronously, then replaces
+    // it with a full-radius target from the background worker.
+    if (!this->rebuildLocalMapTarget(
+            center, std::min(75.0, this->local_map_radius_))) {
+      return false;
+    }
+    this->launchLocalMapTargetBuild(center);
+    return true;
+  }
+  this->adoptPendingLocalMapTarget();
+
+  const double off_center =
+      (center - this->local_map_center_).cast<double>().norm();
+  if (off_center > 0.75 * this->local_map_radius_) return false;
+
+  // Start at 20% of the radius and lead by 1.5 s of velocity, capped at 35%.
+  // The old target remains active until the new KD-tree is complete.
+  if (off_center > 0.2 * this->local_map_radius_) {
+    Eigen::Vector3f lead;
+    {
+      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+      lead = this->prev_vel * 1.5f;
+    }
+    const double max_lead = 0.35 * this->local_map_radius_;
+    if (lead.norm() > max_lead) {
+      lead *= static_cast<float>(max_lead / lead.norm());
+    }
+    this->launchLocalMapTargetBuild(center + lead);
+  }
+  return true;
+}
+
+bool gicp_plusplus::LocalizationNode::rebuildLocalMapTarget(
+    const Eigen::Vector3f& center, double radius) {
+  if (!this->full_map_target_ || !this->full_map_cloud_ ||
+      this->full_map_cloud_->empty()) {
+    return false;
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  const double radius_eff = radius > 0.0 ? radius : this->local_map_radius_;
+  const double radius2 = radius_eff * radius_eff;
+  const int32_t ix0 = static_cast<int32_t>(
+      std::floor((static_cast<double>(center.x()) - radius_eff) /
+                 this->local_map_grid_size_));
+  const int32_t ix1 = static_cast<int32_t>(
+      std::floor((static_cast<double>(center.x()) + radius_eff) /
+                 this->local_map_grid_size_));
+  const int32_t iy0 = static_cast<int32_t>(
+      std::floor((static_cast<double>(center.y()) - radius_eff) /
+                 this->local_map_grid_size_));
+  const int32_t iy1 = static_cast<int32_t>(
+      std::floor((static_cast<double>(center.y()) + radius_eff) /
+                 this->local_map_grid_size_));
+
+  auto local = std::make_shared<pcl::PointCloud<PointType>>();
+  SmallGicpBackend<PointType, PointType>::CovarianceVector local_covariances;
+  size_t candidate_count = 0;
+  for (int32_t ix = ix0; ix <= ix1; ++ix) {
+    for (int32_t iy = iy0; iy <= iy1; ++iy) {
+      const auto it = this->local_map_grid_.find(localMapGridKey(ix, iy));
+      if (it == this->local_map_grid_.end()) continue;
+      candidate_count += it->second.size();
+    }
+  }
+  local->points.reserve(candidate_count);
+  local_covariances.reserve(candidate_count);
+  const auto& full_covariances = *this->full_map_target_->covariances;
+
+  for (int32_t ix = ix0; ix <= ix1; ++ix) {
+    for (int32_t iy = iy0; iy <= iy1; ++iy) {
+      const auto it = this->local_map_grid_.find(localMapGridKey(ix, iy));
+      if (it == this->local_map_grid_.end()) continue;
+      for (const uint32_t idx : it->second) {
+        const auto& p = this->full_map_cloud_->points[idx];
+        const double dx = static_cast<double>(p.x) - center.x();
+        const double dy = static_cast<double>(p.y) - center.y();
+        if (dx * dx + dy * dy <= radius2) {
+          local->points.push_back(p);
+          local_covariances.push_back(full_covariances[idx]);
+        }
+      }
+    }
+  }
+  local->width = static_cast<uint32_t>(local->points.size());
+  local->height = 1;
+  local->is_dense = true;
+
+  if (local->size() < 1000) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Local-map crop is too sparse at [%.2f, %.2f] radius=%.1fm "
+                 "(%lu points)",
+                 center.x(), center.y(), radius_eff, local->size());
+    return false;
+  }
+
+  auto prepared = this->gicp.prepareInputTarget(
+      local, std::move(local_covariances), 10, omp_get_max_threads());
+  if (!prepared) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to build local-map KD-tree");
+    return false;
+  }
+
+  this->active_local_map_target_ = prepared;
+  this->gicp.setInputTarget(prepared);
+  this->map_cloud = local;
+  this->local_map_center_ = center;
+  this->local_map_target_ready_ = true;
+  const double elapsed_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
+  RCLCPP_INFO(this->get_logger(),
+              "Local-map target rebuilt from cached covariances: "
+              "center=[%.2f,%.2f] candidates=%lu target=%lu "
+              "radius=%.1fm time=%.1fms",
+              center.x(), center.y(), candidate_count, local->points.size(),
+              radius_eff, elapsed_ms);
+  return true;
+}
+
+void gicp_plusplus::LocalizationNode::buildLocalMapTargetAsync(
+    Eigen::Vector3f center, uint64_t generation) {
+  const auto start = std::chrono::steady_clock::now();
+  if (!this->full_map_target_ || !this->full_map_cloud_) {
+    this->local_map_rebuild_busy_ = false;
+    return;
+  }
+
+  const double radius2 = this->local_map_radius_ * this->local_map_radius_;
+  const int32_t cx = static_cast<int32_t>(
+      std::floor(center.x() / this->local_map_grid_size_));
+  const int32_t cy = static_cast<int32_t>(
+      std::floor(center.y() / this->local_map_grid_size_));
+  auto local = std::make_shared<pcl::PointCloud<PointType>>();
+  SmallGicpBackend<PointType, PointType>::CovarianceVector local_covariances;
+  const auto& full_covariances = *this->full_map_target_->covariances;
+
+  for (int32_t dx = -1; dx <= 1; ++dx) {
+    for (int32_t dy = -1; dy <= 1; ++dy) {
+      const auto it =
+          this->local_map_grid_.find(localMapGridKey(cx + dx, cy + dy));
+      if (it == this->local_map_grid_.end()) continue;
+      for (const uint32_t idx : it->second) {
+        const auto& p = this->full_map_cloud_->points[idx];
+        const double ex = static_cast<double>(p.x) - center.x();
+        const double ey = static_cast<double>(p.y) - center.y();
+        if (ex * ex + ey * ey <= radius2) {
+          local->points.push_back(p);
+          local_covariances.push_back(full_covariances[idx]);
+        }
+      }
+    }
+  }
+  local->width = static_cast<uint32_t>(local->size());
+  local->height = 1;
+  local->is_dense = true;
+
+  PreparedGicpTargetPtr prepared;
+  if (local->size() >= 1000) {
+    prepared = this->gicp.prepareInputTarget(
+        local, std::move(local_covariances), 10,
+        std::max(2, omp_get_max_threads() / 2));
+  }
+  if (prepared && generation == this->local_map_generation_.load()) {
+    std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+    this->pending_local_map_target_ = prepared;
+    this->pending_local_map_center_ = center;
+  }
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+  RCLCPP_INFO(this->get_logger(),
+              "Async local-map crop: %lu points center=[%.1f,%.1f] time=%.1fms",
+              local->size(), center.x(), center.y(), elapsed_ms);
+  this->local_map_rebuild_busy_ = false;
+}
+
+void gicp_plusplus::LocalizationNode::launchLocalMapTargetBuild(
+    const Eigen::Vector3f& center) {
+  if (this->local_map_rebuild_busy_.exchange(true)) return;
+  if (this->local_map_rebuild_thread_.joinable()) {
+    this->local_map_rebuild_thread_.join();
+  }
+  const uint64_t generation = this->local_map_generation_.load();
+  this->local_map_rebuild_thread_ = std::thread(
+      &gicp_plusplus::LocalizationNode::buildLocalMapTargetAsync, this, center,
+      generation);
+}
+
+void gicp_plusplus::LocalizationNode::adoptPendingLocalMapTarget() {
+  std::lock_guard<std::mutex> lock(this->local_map_pending_mtx_);
+  if (!this->pending_local_map_target_) return;
+  this->active_local_map_target_ = this->pending_local_map_target_;
+  this->gicp.setInputTarget(this->active_local_map_target_);
+  this->map_cloud = this->active_local_map_target_->cloud;
+  this->local_map_center_ = this->pending_local_map_center_;
+  this->pending_local_map_target_.reset();
+  this->local_map_target_ready_ = true;
+  RCLCPP_INFO(this->get_logger(),
+              "Adopted async local-map target: %lu points center=[%.1f,%.1f]",
+              this->map_cloud->size(), this->local_map_center_.x(),
+              this->local_map_center_.y());
 }
 
 bool gicp_plusplus::LocalizationNode::loadMap() {
@@ -2488,6 +2771,36 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
   }
 
   RCLCPP_INFO(this->get_logger(), "Map loaded successfully with %lu points", this->map_cloud->points.size());
+
+  if (this->local_map_enable_) {
+    // Exact perception-ws map contract: downsample the FULL map and estimate
+    // its covariances once.  Every later crop copies these covariances and
+    // builds only a KD-tree.
+    const size_t raw_count = this->map_cloud->size();
+    const auto prep_start = std::chrono::steady_clock::now();
+    this->full_map_target_ = this->gicp.preprocessInputTarget(
+        *this->map_cloud, this->map_voxel_size_, 10, omp_get_max_threads());
+    if (!this->full_map_target_) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Failed to preprocess full map for local targets");
+      return false;
+    }
+    this->full_map_cloud_ = this->full_map_target_->cloud;
+    this->buildLocalMapGrid();
+    this->map_cloud = std::make_shared<pcl::PointCloud<PointType>>();
+    const double prep_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prep_start).count();
+    RCLCPP_INFO(this->get_logger(),
+                "Preprocessed full map once (perception-ws contract): "
+                "raw=%lu target=%lu voxel=%.2fm covariances=%lu cells=%lu "
+                "radius=%.1fm grid_size=%.1fm time=%.1fs",
+                raw_count,
+                this->full_map_cloud_->points.size(), this->map_voxel_size_,
+                this->full_map_target_->covariances->size(),
+                this->local_map_grid_.size(), this->local_map_radius_,
+                this->local_map_grid_size_, prep_s);
+    return true;
+  }
 
   // Downsample the GICP TARGET map (in place) before it becomes the kd-tree.
   // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
@@ -3820,7 +4133,8 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
                                      ? this->concat_aux_time_offsets_[aux_i] : 0.0;
     const bool use_luminar_time =
         this->sensor == dlio::SensorType::LUMINAR &&
-        primary_luminar_range.valid;
+        primary_luminar_range.valid &&
+        !this->concat_luminar_use_header_time_;
     double best_dt = std::numeric_limits<double>::max();
     double best_luminar_time_delta = std::numeric_limits<double>::max();
     {
@@ -4523,6 +4837,26 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
 // origin (clipping the whole scan far from origin).
 void gicp_plusplus::LocalizationNode::cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud) {
   if (!cloud || cloud->points.empty()) return;
+  if (this->scan_min_range_ > 0.0 && this->crop_size_ > 0.0) {
+    // Laguna perception-ws contract: radial lidar-frame range gate [3, 140]m.
+    const float rmin2 = static_cast<float>(
+        this->scan_min_range_ * this->scan_min_range_);
+    const float rmax2 =
+        static_cast<float>(this->crop_size_ * this->crop_size_);
+    auto& points = cloud->points;
+    points.erase(
+        std::remove_if(
+            points.begin(), points.end(),
+            [rmin2, rmax2](const PointType& p) {
+              const float r2 = p.x * p.x + p.y * p.y + p.z * p.z;
+              return !std::isfinite(r2) || r2 < rmin2 || r2 > rmax2;
+            }),
+        points.end());
+    cloud->width = static_cast<uint32_t>(points.size());
+    cloud->height = 1;
+    cloud->is_dense = true;
+    return;
+  }
   if (this->crop_size_ > 0.0 && this->crop_size_ < 1000.0) {  // Only apply if reasonable size
     const size_t original_size = cloud->points.size();
     pcl::CropBox<PointType> crop;
@@ -4579,6 +4913,22 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Acquiring mutex lock...");
   std::lock_guard<std::mutex> lock(this->pose_mutex);
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Mutex acquired");
+
+  const Eigen::Vector3f target_center = this->T_prior.block<3, 1>(0, 3);
+  if (!this->ensureLocalMapTarget(target_center)) {
+    // perception-ws fast-fails outside the active crop and arms GNSS recovery
+    // after two consecutive misses.  Do not run a far-query KD-tree solve.
+    ++this->consecutive_failures_;
+    if (this->consecutive_failures_ >= 2) {
+      this->maybeSnapPoseToGT("seed outside local crop", true);
+    }
+    RCLCPP_WARN(this->get_logger(),
+                "Local-map fast reject: prior [%.1f,%.1f] is outside the "
+                "active crop (streak=%d)",
+                target_center.x(), target_center.y(),
+                this->consecutive_failures_);
+    return;
+  }
 
   // Set source cloud
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Setting input source (%lu points)...",
@@ -5086,6 +5436,28 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     }
   }
 
+  // perception-ws wrong-lock guard.  Unlike the cm-level diagnostic above,
+  // this plausibility bound intentionally accepts any current fused-GNSS
+  // sample (RTK covariance is not required): GNSS never moves an accepted
+  // pose, it only prevents a high-inlier alias lock farther than the bound.
+  double gnss_sanity_err = -1.0;
+  if (this->gt_recovery_enabled_ && this->gt_recovery_sanity_radius_ > 0.0 &&
+      this->gt_odom_received_.load() && candidate_pose_valid) {
+    GtSample gt;
+    const double query_stamp =
+        (this->deskew_ && this->t_prior_stamp_ > 0.0)
+            ? this->t_prior_stamp_
+            : this->scan_stamp.seconds();
+    if (this->getGtPoseAt(query_stamp, gt)) {
+      Eigen::Vector3f gt_p;
+      Eigen::Quaternionf gt_q;
+      if (this->composeGtPoseInBase(gt, gt_p, gt_q)) {
+        gnss_sanity_err =
+            (final_candidate.block<3, 1>(0, 3) - gt_p).norm();
+      }
+    }
+  }
+
   if (this->debug_pub_enabled_) {
     auto publish_float = [](const rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr& pub, double value) {
       std_msgs::msg::Float64 msg;
@@ -5275,8 +5647,11 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
   bool gicp_rejected_support = false;
+  bool gicp_rejected_wrong_lock = false;
   if (effectively_converged && candidate_pose_valid) {
-    if (!analysis_hessian.allFinite()) {
+    if (gnss_sanity_err > this->gt_recovery_sanity_radius_) {
+      gicp_rejected_wrong_lock = true;
+    } else if (!analysis_hessian.allFinite()) {
       // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
       // returns +inf, but every Hessian gate below requires
       // std::isfinite(hessian_condition) — so these scans previously skipped
@@ -5354,13 +5729,19 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_hessian && !gicp_rejected_jump &&
-                             !gicp_rejected_yaw && !gicp_rejected_support;
+                             !gicp_rejected_yaw && !gicp_rejected_support &&
+                             !gicp_rejected_wrong_lock;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
   } else if (!effectively_converged) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("failed_to_converge").c_str());
+  } else if (gicp_rejected_wrong_lock) {
+    RCLCPP_WARN(this->get_logger(),
+                "WRONG-LOCK: candidate is %.2fm from fused GNSS (> %.2fm); "
+                "clearing state and re-seeding",
+                gnss_sanity_err, this->gt_recovery_sanity_radius_);
   } else if (gicp_rejected_fitness) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
@@ -5549,6 +5930,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
+                       : gicp_rejected_wrong_lock ? "wrong lock"
                        : gicp_rejected_support ? "insufficient correspondence support"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
@@ -5592,7 +5974,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // configured threshold, snap state.{pose,velocity} to the time-matched GT
     // sample (transformed into base_frame). The snap overrides the dead-reckoned
     // pose and resets the counter; logs its own warn line.
-    this->maybeSnapPoseToGT(reason);
+    this->maybeSnapPoseToGT(reason, gicp_rejected_wrong_lock);
   }
 }
 
@@ -6228,7 +6610,8 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
   return true;
 }
 
-bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
+bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(
+    const char* reason, bool force) {
   // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
   // [P3 FIX 2026-07-10] Demoted from unconditional INFO ("prove helper is
   // being called" diagnostic) — it fired on EVERY non-accepted scan, ~10
@@ -6245,7 +6628,11 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // streak builds up); the others log throttled info so a misconfiguration
   // doesn't silently disable recovery.
   if (!this->gt_recovery_enabled_) return false;
-  if (this->consecutive_failures_ < this->gt_recovery_min_consecutive_failures_) return false;
+  if (!force &&
+      this->consecutive_failures_ <
+          this->gt_recovery_min_consecutive_failures_) {
+    return false;
+  }
   if (!this->gt_odom_received_.load()) {
     RCLCPP_WARN(this->get_logger(),
                 "GT recovery: deferring snap — no GT odom received yet (streak=%d)",
@@ -6278,9 +6665,31 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // motion inside the correction delta (~3 m at 60 m/s with a 50 ms offset),
   // biasing the live observer on every snap. Query GT at t_prior_stamp_ and
   // retain that stamp for basePose/velocity backfills below.
+  // With point-level deskew disabled, the prior and candidate are defined at
+  // the PointCloud2 header stamp.  A long rejection streak can leave
+  // t_prior_stamp_ pinned to the last accepted scan; querying recovery at that
+  // stale time eventually falls outside the finite GT buffer and makes
+  // recovery permanently impossible.  Median-point time is only meaningful on
+  // the active deskew path.
   const double snap_stamp =
-      (this->t_prior_stamp_ > 0.0) ? this->t_prior_stamp_ : this->scan_stamp.seconds();
+      (this->deskew_ && this->t_prior_stamp_ > 0.0)
+          ? this->t_prior_stamp_
+          : this->scan_stamp.seconds();
   bool got = this->getGtPoseAt(snap_stamp, gt);
+  if (!got) {
+    // perception-ws relaxed recovery lookup: executor ordering can put the
+    // scan slightly ahead of /gnss.  Recovery alone may use the freshest
+    // sample when it is less than one second old; diagnostics remain strict.
+    std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+    if (!this->gt_odom_buffer_.empty()) {
+      const auto& newest = this->gt_odom_buffer_.back();
+      if (snap_stamp > newest.stamp + 0.1 &&
+          snap_stamp - newest.stamp < 1.0) {
+        gt = newest;
+        got = true;
+      }
+    }
+  }
   RCLCPP_INFO(this->get_logger(),
               "GT recovery: lookup snap_stamp=%.3f (median-time) got=%d buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
               snap_stamp, got, buf_size, buf_oldest, buf_newest, this->gt_odom_max_dt_);
@@ -6373,26 +6782,17 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // deadlock the entire scan callback. geo.mtx, however, is taken in narrow scopes
   // by performLocalization, never held across this call site, so locking it here
   // is correct.
-  // [P2 FIX 2026-07-10d] DELTA-FORM observer snap. The GT sample is at
-  // scan_stamp, but the observer has been IMU-propagated PAST it by
-  // callback/solver latency (deskew + align: 20-100+ ms). The old absolute
-  // overwrite REWOUND the live observer to the stale scan-time pose — metres
-  // backward at racing speed — and discarded every IMU measurement since the
-  // scan. Mirror updateState's delta form instead: measure the correction AT
-  // scan time against the scan chain's estimate (current_pose == T_prior on
-  // the reject path that calls us; the observer dead-reckons from the same
-  // anchor during a failure streak, so the deltas coincide), then apply that
-  // SE(3) delta to the CURRENT observer state — the scan-time error snaps
-  // away while the propagation since the scan is preserved.
-  const Eigen::Matrix4f T_est_scan = this->current_pose;
+  // Match the proven perception-ws recovery semantics: a catastrophic-loss
+  // recovery is a clean state reinitialization, not a delta applied to a
+  // potentially exploded observer.  Preserve calibrated IMU biases, seed pose
+  // and velocity absolutely from fused /gnss, and invalidate the local crop.
   Eigen::Matrix4f T_gt_scan = Eigen::Matrix4f::Identity();
   T_gt_scan.block<3, 3>(0, 0) = q_new.toRotationMatrix();
   T_gt_scan.block<3, 1>(0, 3) = p_new;
-  const bool snap_delta_ok = matrixFinite(T_est_scan);
-  const Eigen::Matrix4f T_corr =
-      snap_delta_ok ? Eigen::Matrix4f(T_gt_scan * T_est_scan.inverse()) : T_gt_scan;
 
-  this->current_pose = T_gt_scan;  // scan-chain pose stays a scan-time quantity
+  this->current_pose = T_gt_scan;
+  this->T_prior = T_gt_scan;
+  this->observer_prior_pose_ = T_gt_scan;
   Eigen::Vector3f v_base_world;
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
@@ -6403,44 +6803,25 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
       // Last resort: preserve the IMU-propagated velocity through the snap.
       v_base_body = this->state.q.conjugate() * this->state.v.lin.w;
     }
-    // Scan-time world velocity: seeds the NEXT scan's integration (prev_vel,
-    // paired with base_pose_stamp_ = scan_stamp below).
     v_base_world = q_new * v_base_body;
-
-    Eigen::Quaternionf q_state_new;
-    Eigen::Vector3f p_state_new;
-    if (snap_delta_ok) {
-      Eigen::Quaternionf q_corr(Eigen::Matrix3f(T_corr.block<3, 3>(0, 0)));
-      q_corr.normalize();
-      q_state_new = (q_corr * this->state.q).normalized();
-      p_state_new = T_corr.block<3, 3>(0, 0) * this->state.p + T_corr.block<3, 1>(0, 3);
-    } else {
-      // Degenerate pre-snap estimate: absolute overwrite (legacy behavior).
-      q_state_new = q_new;
-      p_state_new = p_new;
-    }
-    // Velocities: GT body rates re-expressed with the CORRECTED current
-    // attitude (body rates are ~constant over the latency window).
-    const Eigen::Vector3f v_world_now = q_state_new * v_base_body;
-    const Eigen::Vector3f omega_world_now = q_state_new * omega_base_body;
-    this->state.p = p_state_new;
-    this->state.q = q_state_new;
+    const Eigen::Vector3f omega_world = q_new * omega_base_body;
+    this->state.p = p_new;
+    this->state.q = q_new;
     this->state.v.lin.b = v_base_body;
-    this->state.v.lin.w = v_world_now;
+    this->state.v.lin.w = v_base_world;
     this->state.v.ang.b = omega_base_body;
-    this->state.v.ang.w = omega_world_now;
+    this->state.v.ang.w = omega_world;
     // state.b.gyro and state.b.accel intentionally preserved.
-    this->geo.prev_p = p_state_new;
-    this->geo.prev_q = q_state_new;
-    this->geo.prev_vel = v_world_now;
+    this->geo.prev_p = p_new;
+    this->geo.prev_q = q_new;
+    this->geo.prev_vel = v_base_world;
+    this->geo.first_opt_done = true;
     ++this->geo.update_seq;  // discard any in-flight propagateState computations
   }
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: delta-form snap — correction |t|=%.2f m |rot|=%.2f deg applied to the "
-              "LIVE observer state%s",
-              T_corr.block<3, 1>(0, 3).norm(),
-              rotationDistanceDeg(Eigen::Matrix4f::Identity(), T_corr),
-              snap_delta_ok ? "" : " (ABSOLUTE fallback: pre-snap estimate non-finite)");
+              "GT recovery: perception-ws-style absolute state reset at "
+              "[%.2f, %.2f, %.2f]",
+              p_new.x(), p_new.y(), p_new.z());
   {
     // [P2 FIX 2026-07-09] Seed writes under the owner lock (pose -> seed:
     // maybeSnapPoseToGT runs inside performLocalization's pose_mutex scope).
@@ -6451,7 +6832,18 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
     // (median point time) — matching the accept/reject stamps and the
     // estimate the delta was formed against.
     this->base_pose_stamp_ = snap_stamp;
+    this->t_prior_stamp_ = snap_stamp;
     this->prev_vel = v_base_world;
+  }
+
+  if (this->local_map_enable_) {
+    ++this->local_map_generation_;
+    this->local_map_target_ready_ = false;
+    this->active_local_map_target_.reset();
+    {
+      std::lock_guard<std::mutex> pending_lock(this->local_map_pending_mtx_);
+      this->pending_local_map_target_.reset();
+    }
   }
 
   RCLCPP_WARN(this->get_logger(),

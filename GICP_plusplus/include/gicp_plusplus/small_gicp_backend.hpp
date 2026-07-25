@@ -22,6 +22,7 @@
 #include <small_gicp/registration/registration.hpp>
 #include <small_gicp/registration/registration_result.hpp>
 #include <small_gicp/registration/termination_criteria.hpp>
+#include <small_gicp/util/downsampling_omp.hpp>
 #include <small_gicp/util/lie.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
 
@@ -229,7 +230,21 @@ class SmallGicpBackend {
   using PointCloudSource = pcl::PointCloud<PointSource>;
   using PointCloudSourceConstPtr = typename PointCloudSource::ConstPtr;
   using PointCloudTarget = pcl::PointCloud<PointTarget>;
+  using PointCloudTargetPtr = typename PointCloudTarget::Ptr;
   using PointCloudTargetConstPtr = typename PointCloudTarget::ConstPtr;
+  using TargetTree = small_gicp::KdTree<PointCloudTarget>;
+  using CovarianceVector = std::vector<Eigen::Matrix4d>;
+
+  // A target is immutable after construction.  Keeping the cloud, KD-tree and
+  // covariance vector together lets the local-map path swap a finished target
+  // atomically and, crucially, reuse covariances copied from the once-
+  // preprocessed full map (the proven perception-ws contract).
+  struct PreparedTarget {
+    PointCloudTargetPtr cloud;
+    std::shared_ptr<TargetTree> tree;
+    std::shared_ptr<CovarianceVector> covariances;
+  };
+  using PreparedTargetPtr = std::shared_ptr<PreparedTarget>;
 
   SmallGicpBackend()
   : num_threads_(1),
@@ -240,6 +255,7 @@ class SmallGicpBackend {
     rotation_epsilon_(0.1 * 3.14159265358979323846 / 180.0),
     debug_print_(false),
     has_rotation_prior_(false),
+    target_covs_(std::make_shared<CovarianceVector>()),
     final_transformation_(Eigen::Matrix4f::Identity()),
     final_fitness_(std::numeric_limits<double>::infinity()),
     num_correspondences(0) {
@@ -260,14 +276,77 @@ class SmallGicpBackend {
     if (target_ == cloud && target_tree_) {
       return;
     }
+    prepared_target_.reset();
     target_ = cloud;
-    target_covs_.clear();
+    target_covs_ = std::make_shared<CovarianceVector>();
     if (target_ && !target_->empty()) {
-      target_tree_ = std::make_shared<small_gicp::KdTree<PointCloudTarget>>(
+      target_tree_ = std::make_shared<TargetTree>(
           target_, small_gicp::KdTreeBuilderOMP(num_threads_));
     } else {
       target_tree_.reset();
     }
+  }
+
+  // perception-ws-compatible one-time full-map preprocessing:
+  // voxel downsample -> KD-tree -> covariance estimation, all performed once.
+  PreparedTargetPtr preprocessInputTarget(
+      const PointCloudTarget& cloud,
+      double downsampling_resolution,
+      int num_neighbors = 10,
+      int num_threads = 0) const {
+    const int threads = num_threads > 0 ? num_threads : num_threads_;
+    PointCloudTargetPtr downsampled;
+    if (downsampling_resolution > 0.0) {
+      downsampled =
+          small_gicp::voxelgrid_sampling_omp<PointCloudTarget, PointCloudTarget>(
+              cloud, downsampling_resolution, threads);
+    } else {
+      downsampled = std::make_shared<PointCloudTarget>(cloud);
+    }
+    return prepareInputTarget(downsampled, {}, num_neighbors, threads);
+  }
+
+  // Build a KD-tree around a crop whose covariances were copied from the
+  // preprocessed full map.  An empty vector requests covariance estimation;
+  // local-map callers always provide one and therefore never redo kNN work.
+  PreparedTargetPtr prepareInputTarget(
+      const PointCloudTargetPtr& cloud,
+      CovarianceVector covariances = {},
+      int num_neighbors = 10,
+      int num_threads = 0) const {
+    if (!cloud || cloud->empty()) {
+      return nullptr;
+    }
+    const int threads = num_threads > 0 ? num_threads : num_threads_;
+    auto prepared = std::make_shared<PreparedTarget>();
+    prepared->cloud = cloud;
+    prepared->tree = std::make_shared<TargetTree>(
+        cloud, small_gicp::KdTreeBuilderOMP(threads));
+    prepared->covariances =
+        std::make_shared<CovarianceVector>(std::move(covariances));
+    if (prepared->covariances->empty()) {
+      small_gicp::PointCloudProxy<PointTarget> proxy(
+          *prepared->cloud, *prepared->covariances);
+      small_gicp::estimate_covariances_omp(
+          proxy, *prepared->tree, std::max(5, num_neighbors), threads);
+    }
+    if (prepared->covariances->size() != prepared->cloud->size()) {
+      return nullptr;
+    }
+    return prepared;
+  }
+
+  void setInputTarget(const PreparedTargetPtr& prepared) {
+    prepared_target_ = prepared;
+    if (!prepared_target_) {
+      target_.reset();
+      target_tree_.reset();
+      target_covs_ = std::make_shared<CovarianceVector>();
+      return;
+    }
+    target_ = prepared_target_->cloud;
+    target_tree_ = prepared_target_->tree;
+    target_covs_ = prepared_target_->covariances;
   }
 
   void setInputSource(const PointCloudSourceConstPtr& cloud) {
@@ -285,11 +364,11 @@ class SmallGicpBackend {
     if (!target_ || target_->empty() || !target_tree_) {
       return false;
     }
-    target_covs_.clear();
-    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, target_covs_);
+    target_covs_->clear();
+    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, *target_covs_);
     small_gicp::estimate_covariances_omp(
         target_proxy, *target_tree_, k_correspondences_, num_threads_);
-    return target_covs_.size() == target_->size();
+    return target_covs_->size() == target_->size();
   }
 
   void setDoFMask(bool fix_roll, bool fix_pitch, bool fix_yaw) {
@@ -319,12 +398,12 @@ class SmallGicpBackend {
   // its covariances); returns false when evaluation is impossible.
   bool evaluateFitnessAt(const Eigen::Matrix4f& T, double* fitness, int* inliers) {
     if (!target_ || target_->empty() || !target_tree_ || !input_ || input_->empty() ||
-        source_covs_.size() != input_->size() || target_covs_.size() != target_->size() ||
+        source_covs_.size() != input_->size() || target_covs_->size() != target_->size() ||
         !T.allFinite()) {
       return false;
     }
     small_gicp::PointCloudProxy<PointSource> source_proxy(*input_, source_covs_);
-    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, target_covs_);
+    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, *target_covs_);
     std::vector<small_gicp::GICPFactor> factors(input_->size());
     small_gicp::ParallelReductionOMP reduction;
     reduction.num_threads = num_threads_;
@@ -362,7 +441,7 @@ class SmallGicpBackend {
     }
 
     small_gicp::PointCloudProxy<PointSource> source_proxy(*input_, source_covs_);
-    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, target_covs_);
+    small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, *target_covs_);
 
     if (!source_tree_) {
       source_tree_ = std::make_shared<small_gicp::KdTree<PointCloudSource>>(
@@ -372,7 +451,7 @@ class SmallGicpBackend {
       small_gicp::estimate_covariances_omp(
           source_proxy, *source_tree_, k_correspondences_, num_threads_);
     }
-    if (target_covs_.size() != target_->size()) {
+    if (target_covs_->size() != target_->size()) {
       small_gicp::estimate_covariances_omp(
           target_proxy, *target_tree_, k_correspondences_, num_threads_);
     }
@@ -447,9 +526,10 @@ class SmallGicpBackend {
   PointCloudSourceConstPtr input_;
   PointCloudTargetConstPtr target_;
   std::shared_ptr<small_gicp::KdTree<PointCloudSource>> source_tree_;
-  std::shared_ptr<small_gicp::KdTree<PointCloudTarget>> target_tree_;
+  std::shared_ptr<TargetTree> target_tree_;
+  PreparedTargetPtr prepared_target_;
   std::vector<Eigen::Matrix4d> source_covs_;
-  std::vector<Eigen::Matrix4d> target_covs_;
+  std::shared_ptr<CovarianceVector> target_covs_;
 
   Eigen::Array<double, 6, 1> dof_mask_;
   bool has_rotation_prior_;

@@ -42,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace gicp_plusplus {
@@ -131,7 +132,7 @@ private:
                             Eigen::Vector3f& v_ang_body_out) const;
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
-  bool maybeSnapPoseToGT(const char* reason);
+  bool maybeSnapPoseToGT(const char* reason, bool force = false);
   // [P3 FIX 2026-07-14] Optional world-frame linear velocity seed. When null
   // (RViz /initialpose, param pose) velocity is zeroed as before; the GT
   // odom-init path passes the message's own twist so a mid-run seed does not
@@ -155,6 +156,13 @@ private:
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
   // Sensor-frame crop box; must run BEFORE deskew (world-frame transform).
   void cropBoxFilterSensorFrame(pcl::PointCloud<PointType>::Ptr& cloud);
+  bool ensureLocalMapTarget(const Eigen::Vector3f& center);
+  bool rebuildLocalMapTarget(const Eigen::Vector3f& center, double radius = 0.0);
+  void buildLocalMapTargetAsync(Eigen::Vector3f center, uint64_t generation);
+  void launchLocalMapTargetBuild(const Eigen::Vector3f& center);
+  void adoptPendingLocalMapTarget();
+  void buildLocalMapGrid();
+  static int64_t localMapGridKey(int32_t ix, int32_t iy);
   void deskewPointcloud();
   // Correct basePose heading (and optionally position) toward the
   // time-matched, RTK-gated INS sample BEFORE IMU integration/deskew.
@@ -277,6 +285,7 @@ private:
   // base_frame ← gt_body TF once. Snap composes T_map_base = T_map_gtbody * inv(T_base_gtbody).
   bool gt_recovery_enabled_;
   int gt_recovery_min_consecutive_failures_;
+  double gt_recovery_sanity_radius_ = 0.0;
   int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
   // [P2 FIX 2026-07-09] atomic + written LAST inside gt_init_mtx_: the
   // scan/IMU threads read this flag lock-free and must never observe it true
@@ -317,6 +326,7 @@ private:
   // (max(|min-min|, |max-max|)). Header time is only a tie-break. The 0.1 s
   // header threshold above remains solely for non-Luminar fallback matching.
   double concat_luminar_point_threshold_ = 0.010;
+  bool concat_luminar_use_header_time_ = false;
   // Arrival-time (steady-clock) release deadline for a pending front cloud.
   // Protects live latency when an aux packet is lost or its callback stalls;
   // it is NOT a point-clock correction and never alters timestamps.
@@ -778,6 +788,7 @@ private:
 
   // Preprocessing parameters
   double crop_size_;
+  double scan_min_range_ = 0.0;
   bool vf_use_;
   double vf_res_;
 
@@ -851,6 +862,26 @@ private:
   bool visualize_map_;
   double map_voxel_size_vis_;
   double map_voxel_size_ = 0.3;  // GICP target-map voxel leaf (m); 0 disables
+  bool local_map_enable_ = false;
+  double local_map_radius_ = 150.0;
+  double local_map_grid_size_ = 150.0;
+  bool local_map_target_ready_ = false;
+  Eigen::Vector3f local_map_center_ =
+      Eigen::Vector3f::Constant(std::numeric_limits<float>::quiet_NaN());
+  using PreparedGicpTarget =
+      SmallGicpBackend<PointType, PointType>::PreparedTarget;
+  using PreparedGicpTargetPtr =
+      SmallGicpBackend<PointType, PointType>::PreparedTargetPtr;
+  PreparedGicpTargetPtr full_map_target_;
+  PreparedGicpTargetPtr active_local_map_target_;
+  PreparedGicpTargetPtr pending_local_map_target_;
+  Eigen::Vector3f pending_local_map_center_ = Eigen::Vector3f::Zero();
+  pcl::PointCloud<PointType>::Ptr full_map_cloud_;
+  std::unordered_map<int64_t, std::vector<uint32_t>> local_map_grid_;
+  std::atomic<bool> local_map_rebuild_busy_{false};
+  std::atomic<uint64_t> local_map_generation_{0};
+  std::mutex local_map_pending_mtx_;
+  std::thread local_map_rebuild_thread_;
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
   rclcpp::TimerBase::SharedPtr input_health_timer_;
 

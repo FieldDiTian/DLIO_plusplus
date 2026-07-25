@@ -20,6 +20,7 @@
 #include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
@@ -544,6 +545,7 @@ int main(int argc, char** argv) {
     rclcpp::Serialization<sensor_msgs::msg::Imu> imu_serialization;
     rclcpp::Serialization<sensor_msgs::msg::PointCloud2> points_serialization;
     rclcpp::Serialization<nav_msgs::msg::Odometry> odometry_serialization;
+    rclcpp::Serialization<geometry_msgs::msg::PoseWithCovarianceStamped> pose_cov_serialization;
 #ifdef BUILD_WITH_CV_BRIDGE
     rclcpp::Serialization<sensor_msgs::msg::Image> image_serialization;
     rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_image_serialization;
@@ -742,16 +744,25 @@ int main(int argc, char** argv) {
           }
         }
       } else if (!external_odom_topic.empty() && msg->topic_name == external_odom_topic) {
-        if (topic_type != "nav_msgs/msg/Odometry") {
+        if (topic_type != "nav_msgs/msg/Odometry" &&
+            topic_type != "geometry_msgs/msg/PoseWithCovarianceStamped") {
           g_bag_hard_error = true;
-        spdlog::error("topic_type mismatch: {} != nav_msgs/msg/Odometry (topic={})", topic_type, msg->topic_name);
+          spdlog::error("unsupported external odometry topic_type: {} (topic={})", topic_type, msg->topic_name);
           return false;
         }
         auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
         // [P2 FIX 2026-07-14] Guard deserialize (uncaught throw -> std::terminate).
         bool odom_deser_ok = true;
         try {
-          odometry_serialization.deserialize_message(&serialized_msg, odom_msg.get());
+          if (topic_type == "nav_msgs/msg/Odometry") {
+            odometry_serialization.deserialize_message(&serialized_msg, odom_msg.get());
+          } else {
+            geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
+            pose_cov_serialization.deserialize_message(&serialized_msg, &pose_msg);
+            odom_msg->header = pose_msg.header;
+            odom_msg->child_frame_id = "rear_axle_middle";
+            odom_msg->pose = pose_msg.pose;
+          }
         } catch (const std::exception& e) {
           odom_deser_ok = false;
           g_bag_hard_error = true;

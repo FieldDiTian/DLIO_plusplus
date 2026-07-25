@@ -55,8 +55,8 @@
     # and imu_frame. composeGtPoseInBase therefore also collapses to an
     # identity TF; no cross-vendor lever-arm work happens anywhere.
     localization/map_frame: "map"
-    localization/base_frame: "gps_antenna_top"
-    localization/imu_frame: "gps_antenna_top"
+    localization/base_frame: "rear_axle_middle"
+    localization/imu_frame: "rear_axle_middle"
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
     # Static base_frame<-lidar_frame lever arm (row-major 4x4, p_base = T * p_lidar),
@@ -66,9 +66,9 @@
     # Derived from av24.urdf (gps_antenna_top <- luminar_front); keep in sync with
     # the URDF if mounts change, or set lidar_concat/urdf_path. [] disables (URDF/TF only).
     localization/base_lidar_transform: [
-      1.0, 0.0, 0.0,  0.95065,
-      0.0, 1.0, 0.0,  0.00500,
-      0.0, 0.0, 1.0, -0.47194,
+       0.99913393,  0.03029027,  0.02852885, 2.22199976,
+      -0.03007627,  0.99951638, -0.00790078, 0.00499937,
+      -0.02875437,  0.00703589,  0.99956175, 0.44800074,
       0.0, 0.0, 0.0,  1.0
     ]
 
@@ -85,10 +85,14 @@
     # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
     # below — 0.3 m since the P4 density work; keep the two leaf sizes matched
     # when retuning). Set to 0.0 to disable and register against the full-res map.
-    localization/map_voxel_size: 0.3
+    # Applied after the 150 m local crop.  Unlike whole-track VoxelGrid, the
+    # local bounding grid stays inside PCL's int32 voxel-index limit.
+    localization/map_voxel_size: 0.25
+    localization/local_map/enable: true
+    localization/local_map/radius: 150.0
 
     # Map visualization (separate, coarser downsample used only for RViz publishing)
-    localization/visualize_map: true
+    localization/visualize_map: false
     localization/map_voxel_size_vis: 1.5  # Downsample map for visualization (increase for faster RViz)
 
     # TF publishing
@@ -118,7 +122,7 @@
     # identity. The composeGtPoseInBase helper still runs and caches the TF on
     # first GT message, but it returns identity in this configuration.
     localization/gt_odom/enable: true
-    localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
+    localization/gt_odom/buffer_size: 5000     # 250 s at the Laguna fused-GNSS 20 Hz rate
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
     # RTK quality gate, applied PER CONSUMER at consumption time — NOT a
@@ -168,7 +172,10 @@
     # sustained losing streak (~0.5 s at 10 Hz), not a per-frame crutch.
     # Validation runs should ALSO do one pass with enable=false to expose the
     # true dead-reckoning behavior (production has no GT topic).
-    localization/gt_recovery/min_consecutive_failures: 5
+    localization/gt_recovery/min_consecutive_failures: 6
+    # perception-ws wrong-lock guard: a geometrically accepted pose farther
+    # than this from the current fused /gnss seed is cleared and re-seeded.
+    localization/gt_recovery/sanity_radius: 10.0
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -191,7 +198,8 @@
     # near/far-field filter around the lidar regardless of deskew on/off. (It is
     # NOT applied after deskew, where the cloud is world-frame and a box would clip
     # around the map origin.)
-    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160 m cube around the sensor
+    dlio/preprocessing/cropBoxFilter/size: 140.0 # max radial range when scan_min_range > 0
+    localization/scan_min_range: 3.0
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
     # P4#1: 0.5 -> 0.3. At 0.5 m the median post-filter scan was only ~6.9k
     # points (front-only frames 1-2k), starving GICP of yaw-constraining
@@ -199,7 +207,7 @@
     # density. WATCHPOINT: gicp_ms (run-12 baseline: median 18 ms, p99 68 ms)
     # — if p99 approaches the 100 ms scan period, back off to 0.4. A/B ladder
     # worth running: 0.5 (old) / 0.3 (default) / 0.25 (dense).
-    dlio/preprocessing/voxelFilter/res: 0.3
+    dlio/preprocessing/voxelFilter/res: 0.15
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
@@ -211,7 +219,7 @@
     # sensor frame, rebases per-point timestamps onto the primary clock, and appends
     # the bytes to the primary PointCloud2. Downstream steps see a single cloud in
     # primary frame with one coherent timebase.
-    localization/lidar_concat/enabled: true
+    localization/lidar_concat/enabled: false
     localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
     localization/lidar_concat/time_threshold: 0.1   # seconds; NON-LUMINAR fallback matching + tie-break only.
@@ -222,6 +230,7 @@
     # max(|min-min|,|max-max|) must be <= this. Header distance is only a
     # tie-break between candidates with equal range error.
     localization/lidar_concat/luminar_point_time_threshold_s: 0.010
+    localization/lidar_concat/luminar_use_header_time: true
     # Async front/aux synchronizer (Luminar production path). The front
     # callback only validates + enqueues; a worker releases fronts in order
     # when every aux is matched or final (watermark), or at this arrival-time
@@ -240,7 +249,7 @@
     # header-delta extrema, while the geometric point-time regression measured
     # |offset| < 11 ms on both runs. Keep zero until a geometric point-time
     # measurement establishes a value; never copy header phase in here.
-    localization/lidar_concat/aux_time_offsets: []
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -255,7 +264,7 @@
     # max_consecutive_aux_merge_failures the node shuts down only if
     # abort_on_merge_failure=true (otherwise it keeps skipping non-fatally).
     # Keep in parity with GLIM lidar_concat/require_all_aux.
-    localization/lidar_concat/require_all_aux: false
+    localization/lidar_concat/require_all_aux: true
     # When require_all_aux=true and merges keep failing past the budget below:
     #   true  = abort the node (fail-fast; use for sync validation / bring-up)
     #   false = keep skipping incomplete scans non-fatally (robust long replays)
@@ -309,13 +318,18 @@
     # If the LUMINAR_TS_DIAG one-shot dump on first cloud ever reports a
     # different encoding (e.g. FLOAT64 seconds-since-scan-start), flip back
     # to false until copyPointTimeFromCloud's LUMINAR branch is updated.
-    dlio/deskew: true
+    # The perception-ws Laguna success treats each decoded Luminar sweep as a
+    # rigid cloud.  This decoded bag's timestamp bytes do not satisfy the
+    # UCB-ROAR per-point epoch-time contract, so point-level deskew would create
+    # a multi-billion-second scan span.  Keep IMU propagation enabled below,
+    # but do not use the invalid point times for deskew.
+    dlio/deskew: false
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
-    dlio/imu/bufferSize: 2000  # IMU buffer size
+    dlio/imu/bufferSize: 20000  # retain recovery/backpressure history (~160 s at 125 Hz)
     # Hard guard on IMU topic remap. When true, node startup fails unless the
     # resolved imu topic is in topic_allowlist (default: /gps_p1/imu).
     localization/imu/require_topic_allowlist: true
-    localization/imu/topic_allowlist: ["/gps_p1/imu"]
+    localization/imu/topic_allowlist: ["/novatel_a/imu_body"]
     # Reject IMU samples whose message frame_id does not match imu_frame.
     # Re-enabled now that imu_frame=gps_antenna_top matches the frame_id the
     # upstream pointonenav_interface / adapter stamps on /gps_p1/imu. This is
@@ -489,26 +503,28 @@
 
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)
-    gicp/maxIterations: 128
+    gicp/maxIterations: 50
 
     # Number of neighbors used to compute per-point covariances (typical: 20)
-    gicp/correspondenceRandomness: 20
+    gicp/correspondenceRandomness: 10
 
     # Maximum correspondence distance (meters)
     # Points further apart than this won't be considered correspondences
     # Tightened from 5.0 to cut spurious matches against the dense full map.
-    gicp/maxCorrespondenceDistance: 4.0
+    gicp/maxCorrespondenceDistance: 1.0
 
     # Convergence criteria — tightened now that downsampling is re-enabled
-    gicp/transformationEpsilon: 0.004
-    gicp/rotationEpsilon: 0.004
+    gicp/transformationEpsilon: 0.01
+    gicp/rotationEpsilon: 0.004363323
 
-    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
-    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
-    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
-    # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # Laguna/perception-ws parity: do not gate a registration on the absolute
+    # fitness magnitude.  That value changes with map density and local scene:
+    # the 32.5M-point master map produced correct 0.4–2.2 m GNSS-consistent
+    # solutions with fitness >1.0 in the first dynamic section.  The proven
+    # perception-ws path gates on correspondence ratio + physical step instead.
+    # Keep a finite high ceiling because the UCB implementation also uses this
+    # value for its bounded non-converged fallback; NaN/Inf still fail closed.
+    gicp/fitnessRejectThreshold: 1000000000.0
     # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
     # converged"). The fallback exists for max-iterations-at-speed scans whose
     # correction is small; unbounded, it also admitted wrong-basin results
@@ -518,8 +534,12 @@
     # classified failed_to_converge instead. <=0 disables a bound.
     # PR validation: nonconv accepts 1145->397; accepts with INS err >=50 m
     # 99->3; p90 INS err 21.6->12.7 m.
-    gicp/nonConvergedFitnessOkMaxTransM: 3.0
-    gicp/nonConvergedFitnessOkMaxRotDeg: 5.0
+    # perception-ws deliberately ignores small_gicp's converged flag and lets
+    # its quality/physical gates decide.  Disable UCB's extra correction-size
+    # bounds so a good high-speed solution is not rejected only because the
+    # optimizer exhausted its iteration budget.
+    gicp/nonConvergedFitnessOkMaxTransM: 0.0
+    gicp/nonConvergedFitnessOkMaxRotDeg: 0.0
 
     # Minimum correspondence-support gate (REVIEW FIX 2026-07-08). Mean
     # fitness over a handful of inliers can look excellent while the scan
@@ -530,8 +550,10 @@
     # it (status: rejected_support; SCAN DEBUG: support=[count,ratio,reeval]).
     # <=0 disables either bound. Re-baseline against a replay scorecard if the
     # scan preprocessing (voxel size, crop) changes materially.
-    gicp/minCorrespondences: 500
-    gicp/minCorrespondenceRatio: 0.2
+    # perception-ws uses min_inlier_ratio=0.30 and no independent absolute
+    # correspondence-count threshold.
+    gicp/minCorrespondences: 0
+    gicp/minCorrespondenceRatio: 0.3
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
 
     # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========
@@ -562,7 +584,10 @@
     #      (fitness_ratio > yawGate/fitnessRatio) keeps the IMU yaw instead.
     #      This is the wrong-basin ENTRY signature the jump gate can't see
     #      (bad accepts had jump medians of only 1.87 m / 1.38 deg).
-    gicp/fitnessBaseline/enable: true
+    # The successful perception-ws implementation has no rolling fitness-ratio
+    # rejection.  GNSS sanity (10 m), support, yaw and physical jump guards
+    # remain active to reject a genuinely wrong basin.
+    gicp/fitnessBaseline/enable: false
     gicp/fitnessBaseline/window: 201     # accepted-frame samples in the rolling median (~20 s @ 10 Hz)
     gicp/fitnessBaseline/minSamples: 50  # rolling median takes over after this many accepted frames
     # Warm-up seed (review fix): baseline used until minSamples accepted frames
@@ -572,7 +597,7 @@
     # (scripts/analyze_scan_debug_log.py; run-12 sparse cross-run map: 0.28).
     # RE-MEASURE after the dense-map rebuild. 0 = off (absolute-only warm-up).
     gicp/fitnessBaseline/seedBaseline: 0.28
-    gicp/fitnessRatioRejectThreshold: 2.0  # <=0 disables the wrong-basin ratio reject
+    gicp/fitnessRatioRejectThreshold: 0.0  # disabled for perception-ws parity
     gicp/degeneracy/partialUpdate: true    # false = restore legacy binary hessian gate below
     # Full 6D coupled solution remapping (default). The re-centered hessian's
     # rotation coordinates are scaled by couplingLengthM (the typical
@@ -660,7 +685,7 @@
     # misalignment would otherwise be forced into every prior. Watch
     # debug/ins_yaw_diff_deg (ins_dyaw= in SCAN DEBUG): a persistent nonzero
     # value MEASURES that misalignment — fix the map/frame, don't raise blend.
-    localization/ins_prior/enable: true
+    localization/ins_prior/enable: false
     localization/ins_prior/yaw_blend: 0.25          # fraction of INS-vs-prior yaw applied per scan
     localization/ins_prior/max_yaw_step_deg: 2.0    # per-scan cap (20 deg/s of pull at 10 Hz)
     localization/ins_prior/sanity_max_yaw_deg: 30.0 # above this: warn + do NOT apply (frame/INS fault)
