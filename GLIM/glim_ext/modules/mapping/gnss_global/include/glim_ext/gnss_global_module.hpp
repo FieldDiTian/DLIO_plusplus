@@ -44,6 +44,7 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/navigation/AttitudeFactor.h>
 #include <gtsam/slam/PoseRotationPrior.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/linear/NoiseModel.h>
@@ -108,6 +109,10 @@ public:
       std::max(1, config.param<int>("gnss", "anchor_abort_consecutive_updates", 1));
     enable_orientation_prior = config.param<bool>("gnss", "enable_orientation_prior", false);
     orientation_prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "orientation_prior_inf_scale", Eigen::Vector3d(1e2, 1e2, 1e2));
+    gravity_prior_sigma_deg = config.param<double>("gnss", "gravity_prior_sigma_deg", 0.0);
+    if (!std::isfinite(gravity_prior_sigma_deg) || gravity_prior_sigma_deg < 0.0) {
+      throw std::invalid_argument("gnss.gravity_prior_sigma_deg must be finite and non-negative");
+    }
     // P5#1: yaw-quality gate for the orientation prior. The RTK gate upstream
     // (adapter/rtk_fixed filter) qualifies POSITION quality only; a
     // position-FIXED sample can still carry a degraded/unsolved dual-antenna
@@ -238,8 +243,9 @@ public:
     // previously still reported success.
     const uint64_t pf = position_factor_count.load();
     const uint64_t of = orientation_factor_count.load();
+    const uint64_t gf = gravity_factor_count.load();
     const uint64_t delivered = factors_delivered_count.load();
-    const uint64_t emitted = pf + of;
+    const uint64_t emitted = pf + of + gf;
     const uint64_t undelivered = emitted > delivered ? emitted - delivered : 0;
     const uint64_t seen = submaps_seen.load();
     const uint64_t bc = bracket_count.load();
@@ -250,7 +256,7 @@ public:
     // coverage ratio instead of looking fully anchored.
     logger->info(
       "gnss_global summary: transformation_initialized={} fit_rms_m={:.3f} position_factors={} "
-      "orientation_factors={} factors_delivered={} factors_undelivered={} yaw_gate_skips={} "
+      "orientation_factors={} gravity_factors={} factors_delivered={} factors_undelivered={} yaw_gate_skips={} "
       "gap_unanchored={} submaps_seen={} submaps_dropped_pre_gnss={} submaps_dropped_no_bracket={} "
       "submaps_unanchored_pre_fit={} "
       "submap_anchor_coverage={:.3f} nonmonotonic_drops={} bracket_count={} bracket_max_s={:.3f} "
@@ -260,6 +266,7 @@ public:
       fit_rms_m.load(),
       pf,
       of,
+      gf,
       delivered,
       undelivered,
       yaw_gate_skip_count.load(),
@@ -820,6 +827,31 @@ public:
             logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
             warned_missing_orientation = true;
           }
+
+          // A long position-only pose graph can satisfy absolute position
+          // anchors by tilting the odometry chain in roll/pitch.  The Laguna
+          // Run1 failure amplified raw LIO roll error this way, while yaw
+          // remained mostly constrained by LiDAR and loop closures.
+          //
+          // Pose3AttitudeFactor constrains only the measured body-Z direction
+          // in the world. It supplies the missing gravity evidence without
+          // pinning GNSS yaw. This is opt-in because a generic pose publisher
+          // may use identity as an "orientation unavailable" placeholder.
+          if (gravity_prior_sigma_deg > 0.0 && gnss.has_orientation) {
+            const Eigen::Matrix3d R_world_gnss =
+              T_world_utm.linear() * gnss.orientation.toRotationMatrix();
+            const Eigen::Vector3d world_body_z =
+              R_world_gnss * Eigen::Vector3d::UnitZ();
+            const double gravity_sigma_rad =
+              gravity_prior_sigma_deg * M_PI / 180.0;
+            const auto gravity_model =
+              gtsam::noiseModel::Isotropic::Sigma(2, gravity_sigma_rad);
+            output_factors.push_back(
+              gtsam::NonlinearFactor::shared_ptr(
+                new gtsam::Pose3AttitudeFactor(
+                  X(submap->id), gtsam::Unit3(world_body_z), gravity_model)));
+            ++gravity_factor_count;
+          }
         }
         factored_submap_count = submaps.size();
       }
@@ -1006,6 +1038,7 @@ private:
   bool enable_orientation_prior;
   Eigen::Vector3d orientation_prior_inf_scale;
   double orientation_prior_max_yaw_sigma_deg;  // P5#1 yaw-quality gate (<=0 disables)
+  double gravity_prior_sigma_deg;               // body-Z sigma; <=0 disables
   double min_baseline;
   bool fit_recent_baseline_window;
   double max_interp_gap_sec;  // P1 fix: max GNSS bracket width for association (<=0 disables)
@@ -1020,6 +1053,7 @@ private:
   std::atomic<uint64_t> yaw_gate_skip_count{0};       // heading priors skipped by the gate
   std::atomic<uint64_t> position_factor_count{0};     // GNSS position priors emitted
   std::atomic<uint64_t> orientation_factor_count{0};  // heading priors emitted
+  std::atomic<uint64_t> gravity_factor_count{0};      // roll/pitch priors emitted
   std::atomic<uint64_t> factors_delivered_count{0};   // priors actually inserted into the graph
   std::atomic<uint64_t> gap_unanchored_count{0};      // submaps skipped: bracket > max_interp_gap
   std::atomic<uint64_t> nonmonotonic_drop_count{0};   // GNSS samples dropped: stamp regression

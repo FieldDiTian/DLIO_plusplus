@@ -13,9 +13,26 @@ through CLI arguments:
 * ``--gnss-fit-max-rms`` is the quality gate for that alignment; the generated
   high-quality profile fits the newest segment that still spans the baseline.
 * ``--keyframes-per-submap`` controls how many locally optimized scans are
-  grouped before one global pose-graph update. The one-scan perception-ws
-  setting remains the default; longer runs can inject a bounded group size to
-  avoid a global iSAM2 update for every LiDAR frame.
+  grouped into one rigid geometric submap. The one-scan perception-ws setting
+  remains the default.
+* ``--odom-rotation-stddev`` and ``--odom-translation-stddev`` keep the
+  between-submap odometry covariance honest enough for per-pose GNSS/INS
+  position and gravity factors to correct a long trajectory.
+* ``--global-update-interval`` independently batches global iSAM2 updates
+  without grouping scans into a rigid submap.
+* ``--optimizer-extra-loop-updates`` bounds forced-relinearization after loop
+  batches; refinement stops early once no graph variable relinearizes.
+* ``--loop-registration-interval`` independently samples loop-registration
+  sources/targets without removing geometric submaps or dense export points.
+* ``--max-loop-candidates-per-source`` deterministically bounds equivalent
+  loop constraints when a long recording repeats the same route many times.
+* ``--loop-max-translation-correction`` and
+  ``--loop-max-rotation-correction-deg`` reject high-overlap registrations that
+  converge to a repeated structure far from the pose-graph initial guess.
+* ``--loop-detection-sync-timeout`` keeps each global update from exposing a
+  timing-dependent partial loop-factor set to the GNSS health gate.
+* ``--gnss-gravity-prior-sigma-deg`` optionally injects a validated INS
+  gravity direction to constrain roll/pitch while leaving yaw to LiDAR/loops.
 * ``--urdf-path`` and repeated ``--aux-lidar TOPIC:FRAME`` entries describe
   multi-LiDAR concatenation.
 * ``--offload-dir`` is a unique, absolute per-run scratch path. Dense submap
@@ -92,6 +109,52 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--gnss-fit-max-rms must be finite")
     if args.keyframes_per_submap <= 0:
         raise ValueError("--keyframes-per-submap must be a positive integer")
+    if (
+        not math.isfinite(args.odom_rotation_stddev)
+        or args.odom_rotation_stddev <= 0.0
+    ):
+        raise ValueError("--odom-rotation-stddev must be finite and positive")
+    if (
+        not math.isfinite(args.odom_translation_stddev)
+        or args.odom_translation_stddev <= 0.0
+    ):
+        raise ValueError("--odom-translation-stddev must be finite and positive")
+    if args.global_update_interval <= 0:
+        raise ValueError("--global-update-interval must be a positive integer")
+    if args.optimizer_extra_loop_updates < 0:
+        raise ValueError("--optimizer-extra-loop-updates must be non-negative")
+    if args.loop_registration_interval <= 0:
+        raise ValueError("--loop-registration-interval must be a positive integer")
+    if args.max_loop_candidates_per_source < 0:
+        raise ValueError("--max-loop-candidates-per-source must be non-negative")
+    if (
+        not math.isfinite(args.loop_max_translation_correction)
+        or args.loop_max_translation_correction < 0.0
+    ):
+        raise ValueError(
+            "--loop-max-translation-correction must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.loop_max_rotation_correction_deg)
+        or args.loop_max_rotation_correction_deg < 0.0
+    ):
+        raise ValueError(
+            "--loop-max-rotation-correction-deg must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.loop_detection_sync_timeout)
+        or args.loop_detection_sync_timeout < 0.0
+    ):
+        raise ValueError(
+            "--loop-detection-sync-timeout must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.gnss_gravity_prior_sigma_deg)
+        or args.gnss_gravity_prior_sigma_deg < 0.0
+    ):
+        raise ValueError(
+            "--gnss-gravity-prior-sigma-deg must be finite and non-negative"
+        )
 
     t_lidar_imu = finite_vector(args.t_lidar_imu, "--t-lidar-imu")
     imu_input_rotation = finite_vector(
@@ -255,14 +318,25 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "subsample_rate": 0.1,
             "gicp_max_correspondence_dist": 2.0,
             "vgicp_voxel_resolution": 2.0,
+            # Keep the legacy scalar for older GLIM builds. This branch reads
+            # the explicit values below, whose units are radians and metres.
             "odom_factor_stddev": 1.0e-3,
+            "odom_rotation_stddev": args.odom_rotation_stddev,
+            "odom_translation_stddev": args.odom_translation_stddev,
             "loop_factor_stddev": 0.1,
             "loop_factor_robust_width": 1.0,
             "loop_candidate_buffer_size": 100,
             "loop_candidate_eval_per_thread": 2,
+            "max_loop_candidates_per_source": args.max_loop_candidates_per_source,
+            "loop_max_translation_correction": args.loop_max_translation_correction,
+            "loop_max_rotation_correction_deg": args.loop_max_rotation_correction_deg,
+            "loop_detection_sync_timeout_sec": args.loop_detection_sync_timeout,
+            "loop_registration_interval": args.loop_registration_interval,
             "use_isam2_dogleg": False,
             "isam2_relinearize_skip": 1,
             "isam2_relinearize_thresh": 0.1,
+            "optimizer_update_interval": args.global_update_interval,
+            "optimizer_extra_loop_updates": args.optimizer_extra_loop_updates,
             "offload_points_dir": str(offload_dir),
             "num_threads": args.loop_threads,
         }
@@ -315,6 +389,7 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "enable_orientation_prior": False,
             "orientation_prior_inf_scale": [0.0, 0.0, 0.0],
             "orientation_prior_max_yaw_sigma_deg": 3.0,
+            "gravity_prior_sigma_deg": args.gnss_gravity_prior_sigma_deg,
             "max_interp_gap_sec": 1.0,
             "fit_max_rms": args.gnss_fit_max_rms,
             "anchor_abort_median_m": 0.5,
@@ -342,7 +417,12 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     profile = {
-        "profile": f"perception-ws-high-quality-kf{args.keyframes_per_submap}",
+        "profile": (
+            f"perception-ws-high-quality-kf{args.keyframes_per_submap}"
+            f"-update{args.global_update_interval}"
+            f"-loop{args.loop_registration_interval}"
+            f"-loopcap{args.max_loop_candidates_per_source}"
+        ),
         "generated_config_path": str(args.output_dir.expanduser().resolve()),
         "offload_points_dir": str(offload_dir),
         "expected_export_voxel_m": 0.15,
@@ -354,6 +434,16 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "gnss_recent_fit_window": args.gnss_recent_fit_window,
             "gnss_fit_max_rms_m": args.gnss_fit_max_rms,
             "keyframes_per_submap": args.keyframes_per_submap,
+            "odom_rotation_stddev_rad": args.odom_rotation_stddev,
+            "odom_translation_stddev_m": args.odom_translation_stddev,
+            "global_update_interval": args.global_update_interval,
+            "optimizer_extra_loop_updates": args.optimizer_extra_loop_updates,
+            "loop_registration_interval": args.loop_registration_interval,
+            "max_loop_candidates_per_source": args.max_loop_candidates_per_source,
+            "loop_max_translation_correction_m": args.loop_max_translation_correction,
+            "loop_max_rotation_correction_deg": args.loop_max_rotation_correction_deg,
+            "loop_detection_sync_timeout_sec": args.loop_detection_sync_timeout,
+            "gnss_gravity_prior_sigma_deg": args.gnss_gravity_prior_sigma_deg,
             "preprocess_downsample_m": args.downsample,
             "preprocess_points_per_scan": args.points_per_scan,
             "submap_voxel_m": args.submap_voxel,
@@ -472,10 +562,96 @@ def parse_args() -> argparse.Namespace:
         "--keyframes-per-submap",
         type=int,
         default=1,
-        help="Locally optimized LiDAR keyframes grouped into each global "
-        "pose-graph submap. The perception-ws quality default is 1; inject a "
-        "bounded value such as 10 for long full-run maps so global iSAM2 does "
-        "not update once per scan.",
+        help="Locally optimized LiDAR keyframes grouped into each rigid global "
+        "pose-graph submap. The perception-ws quality default is 1.",
+    )
+    parser.add_argument(
+        "--odom-rotation-stddev",
+        type=float,
+        default=0.01,
+        help="Rotation sigma in radians for each between-submap odometry "
+        "factor. The high-quality default 0.01 rad lets validated per-pose "
+        "gravity evidence correct long-chain roll/pitch drift while retaining "
+        "smooth relative yaw.",
+    )
+    parser.add_argument(
+        "--odom-translation-stddev",
+        type=float,
+        default=0.05,
+        help="Translation sigma in metres for each between-submap odometry "
+        "factor. The high-quality default 0.05 m lets centimetre-level fused "
+        "GNSS anchors correct a long trajectory without pinning it to a "
+        "millimetre-confidence raw LIO chain.",
+    )
+    parser.add_argument(
+        "--global-update-interval",
+        type=int,
+        default=1,
+        help="Number of geometric submaps accumulated per global iSAM2 update. "
+        "Use this, rather than increasing --keyframes-per-submap, to amortize "
+        "solver cost without rigidly grouping multiple scans.",
+    )
+    parser.add_argument(
+        "--optimizer-extra-loop-updates",
+        type=int,
+        default=20,
+        help="Maximum no-new-factor iSAM2 forced-relinearization passes after "
+        "an update containing loop closures. Refinement stops early when no "
+        "variable relinearizes. The high-quality default 20 is a safety bound "
+        "(the validated Laguna smoke averaged 3.7 passes) while "
+        "letting long-loop nonlinear deltas settle before GNSS health checks; "
+        "0 restores legacy single-pass behavior.",
+    )
+    parser.add_argument(
+        "--loop-registration-interval",
+        type=int,
+        default=1,
+        help="Keep one loop-registration source/target per N geometric "
+        "submaps. Every submap remains in the pose graph and dense map. Use "
+        "10 with one-scan submaps for full-length scale parity with the "
+        "perception-ws ten-scan loop cadence.",
+    )
+    parser.add_argument(
+        "--max-loop-candidates-per-source",
+        type=int,
+        default=1,
+        help="Deterministically keep the closest N eligible loop candidates "
+        "for each source submap before GICP validation. The high-quality "
+        "default 1 prevents repeated laps from multiplying equivalent loop "
+        "factors; 0 restores legacy unlimited proposals.",
+    )
+    parser.add_argument(
+        "--loop-max-translation-correction",
+        type=float,
+        default=0.3,
+        help="Reject a loop registration when the optimized relative pose "
+        "moves farther than this many metres from its initial guess. The "
+        "high-quality 0.3 m default is the validated multi-lap admission "
+        "limit; 0 disables the gate.",
+    )
+    parser.add_argument(
+        "--loop-max-rotation-correction-deg",
+        type=float,
+        default=1.0,
+        help="Rotation counterpart of --loop-max-translation-correction in "
+        "degrees. The high-quality default is 1 degree; 0 disables.",
+    )
+    parser.add_argument(
+        "--loop-detection-sync-timeout",
+        type=float,
+        default=30.0,
+        help="Wait up to this many seconds at each global optimizer boundary "
+        "for all already-proposed loop registrations to finish. This keeps "
+        "GNSS health checks from seeing a partial factor set; 0 restores "
+        "legacy asynchronous updates.",
+    )
+    parser.add_argument(
+        "--gnss-gravity-prior-sigma-deg",
+        type=float,
+        default=0.0,
+        help="Optional 1-sigma body-Z angular uncertainty in degrees for a "
+        "validated GNSS/INS orientation stream. Constrains roll/pitch only; "
+        "0 disables the prior.",
     )
     parser.add_argument("--loop-registration-points", type=int, default=10_000)
     parser.add_argument("--preprocess-threads", type=int, default=1)

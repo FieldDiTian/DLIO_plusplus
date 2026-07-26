@@ -254,7 +254,17 @@ python3 scripts/generate_glim_mapping_config.py \
   --offload-dir /tmp/glim_offload_<unique-run-id> \
   --imu-topic /prepared/body_imu \
   --gnss-topic /gnss \
-  --keyframes-per-submap 10 \
+  --keyframes-per-submap 1 \
+  --odom-rotation-stddev 0.01 \
+  --odom-translation-stddev 0.05 \
+  --global-update-interval 10 \
+  --optimizer-extra-loop-updates 20 \
+  --loop-registration-interval 10 \
+  --max-loop-candidates-per-source 1 \
+  --loop-max-translation-correction 0.3 \
+  --loop-max-rotation-correction-deg 1.0 \
+  --loop-detection-sync-timeout 30 \
+  --gnss-gravity-prior-sigma-deg 0.5 \
   --t-lidar-imu X Y Z QX QY QZ QW \
   --imu-input-rotation QX QY QZ QW \
   --urdf-path /absolute/path/to/vehicle.urdf \
@@ -280,11 +290,62 @@ source), one scan per submap, explicit 5 m loop closure, global gauge damping
 weights, dense-point disk offload, and a live anchor-divergence rejection gate.
 `--keyframes-per-submap` is an explicit scale/quality control: its default
 `1` preserves the successful perception-ws one-scan submap profile, while a
-full-length run can inject a bounded value such as `10`. Every LiDAR frame
-still goes through local LIO and into a dense submap; only the number of global
-iSAM2 updates and pose-graph nodes is reduced. The generated
-`quality_profile.json` records the injected value, so a full-run map cannot be
-mistaken for a one-scan-submap experiment.
+full-length run can use `--global-update-interval 10` to amortize iSAM2 updates
+without combining ten scans into one rigid submap. Increasing
+`--keyframes-per-submap` remains available as an explicit geometric
+quality/scale tradeoff, but it is not the recommended long-run shortcut.
+`--optimizer-extra-loop-updates 20` bounds no-new-factor,
+forced-relinearization after a batch that contains loop closures. Refinement
+stops early as soon as iSAM2 reports that no graph variable relinearized. This
+lets the nonlinear loop correction settle before the GNSS health callback
+judges the trajectory; it does not add or weaken any factor. Laguna Run1
+showed why a fixed one-pass policy is insufficient: the live rolling anchor
+median still reached `0.90 m`, but the next optimizer update settled the same
+factor graph to `0.20 m`. In a 120 s convergence A/B, all 49 loop batches
+converged in an average of 3.7 passes, so `20` is only a safety ceiling. The
+base JSON keeps the legacy single-pass behavior with `0`.
+For a long per-scan run, `--loop-registration-interval 10` independently keeps
+one loop-registration source/target and KdTree per ten scans, matching the
+validated perception-ws loop-node cadence without removing any pose-graph
+nodes, GNSS/gravity factors, trajectory samples, or dense export points. The
+generated `quality_profile.json` records all three independent cadence values.
+The high-quality profile also separates the between-submap odometry covariance
+into `--odom-rotation-stddev 0.01` rad and
+`--odom-translation-stddev 0.05` m. The inherited isotropic `0.001` assigned
+millimetre and 0.057-degree confidence to every raw LIO step. Over a long
+multi-lap graph that made the chain about 76 times stiffer in roll/pitch than a
+0.5-degree gravity factor and prevented the per-pose fused-GNSS factors from
+correcting loop-induced deformation. The shared JSON retains `0.001/0.001` for
+compatibility; only a generated high-quality profile injects the honest
+anisotropic values.
+`--max-loop-candidates-per-source 1` then deterministically selects the closest
+eligible historical pose for GICP validation. This prevents a multi-lap bag
+from adding an increasing number of equivalent constraints for each new
+source, and removes the timing-dependent random candidate subset documented by
+the perception-ws Laguna experiments. Set it to `0` only to reproduce legacy
+unlimited proposals.
+The correction gates then reject a high-overlap GICP result if it moves more
+than `0.3 m` or `1 deg` from the pose-graph initial relative pose. The earlier
+perception-ws telemetry warning thresholds of `1 m/5 deg` were too loose as
+admission limits for the 25,096-frame Laguna Run1: 1,365 accepted factors could
+still pull the latest 100 GNSS anchors to a `0.692 m` median at frame 19,567.
+The stricter limits admit only closures consistent with the already
+centimetre-anchored trajectory. This closes the repeated-structure failure mode
+that an inlier-fraction-only test cannot detect; the base GLIM JSON keeps both
+gates disabled for compatibility, while the generated high-quality profile
+records the injected limits explicitly.
+`--loop-detection-sync-timeout 30` also waits at each optimizer boundary for
+the loop registrations already proposed at that boundary. This makes the
+factor set inspected by each update deterministic and prevents later-arriving
+loop factors from changing the interpretation of an earlier health sample.
+Run1 testing showed that synchronization and converged relinearization remove
+timing and partial-solve ambiguity, but do not make a geometrically bad loop
+valid; the odometry covariance and admission limits above are still required.
+The base JSON uses `0` to preserve legacy asynchronous behavior.
+`--gnss-gravity-prior-sigma-deg` is independently opt-in. It uses a validated
+GNSS/INS quaternion to constrain only the body-Z direction (roll/pitch), never
+yaw; leave it at `0` for position-only GNSS publishers or publishers that use
+an identity quaternion to mean "orientation unavailable".
 The baseline can be injected with `--gnss-min-baseline`; its default matches the
 successful perception-ws Laguna configuration. The high-quality profile fits
 the newest segment that still spans that baseline on both trajectories, so a

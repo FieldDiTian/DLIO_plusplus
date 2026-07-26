@@ -93,6 +93,13 @@
       1e-6,
       1e2
     ],
+    // Optional gravity-direction prior from the GNSS/INS orientation. This
+    // constrains body Z (roll/pitch) without constraining yaw. The value is the
+    // 1-sigma angular uncertainty in degrees; <= 0 disables it. Keep disabled
+    // in shared config because some generic pose publishers use an identity
+    // quaternion as an "orientation unavailable" placeholder. A run-local
+    // profile may enable it only for a validated fused-INS orientation stream.
+    "gravity_prior_sigma_deg": 0.0,
     // P5#1 yaw-quality gate. The RTK filter feeding gnss_topic qualifies
     // POSITION quality only; the dual-antenna HEADING can be degraded or
     // unsolved while position stays RTK-FIXED (secondary-antenna outage,

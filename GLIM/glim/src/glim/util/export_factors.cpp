@@ -11,6 +11,7 @@
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/navigation/AttitudeFactor.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam_points/factors/linear_damping_factor.hpp>
 #include <gtsam_points/factors/rotate_vector3_factor.hpp>
@@ -55,6 +56,7 @@ BOOST_CLASS_EXPORT_GUID(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>, "gts
 
 BOOST_CLASS_EXPORT_GUID(gtsam::PoseTranslationPrior<gtsam::Pose3>, "gtsam::PoseTranslationPrior<gtsam::Pose3>");
 BOOST_CLASS_EXPORT_GUID(gtsam::PoseRotationPrior<gtsam::Pose3>, "gtsam::PoseRotationPrior<gtsam::Pose3>");
+BOOST_CLASS_EXPORT_GUID(gtsam::Pose3AttitudeFactor, "gtsam::Pose3AttitudeFactor");
 
 BOOST_CLASS_EXPORT_GUID(gtsam::ImuFactor, "gtsam::ImuFactor");
 

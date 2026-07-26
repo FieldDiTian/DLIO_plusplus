@@ -70,6 +70,9 @@ Example (`libflat_earther.so`):
 ### GNSS constraints (libgnss_global.so, ROS2 only)
 - GNSS-based constraints for global optimization
 - Optional orientation priors from pose-bearing GNSS messages can be enabled with `enable_orientation_prior`.
+- An independent `gravity_prior_sigma_deg` option constrains the measured body-Z
+  direction (roll/pitch) without constraining yaw. It is disabled when `<= 0`
+  and should only be enabled for a validated GNSS/INS orientation stream.
 
 ### ScanContext Loop Detector (libscancontext_loop_detector.so)
 - Explicit loop detection based on ScanContext
