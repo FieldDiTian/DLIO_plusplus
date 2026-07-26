@@ -118,4 +118,28 @@ TEST(LidarConcatPointTime, OfflineWatermarkWaitsForFutureSweep) {
     *primary, sensors, 0.010));
 }
 
+TEST(LidarConcatPointTime, RelativeTimeHeaderFallbackWaitsForFutureSweep) {
+  auto primary = cloud(1'000'000'000ULL, 1'049'000'000ULL, 1.0);
+  // Make the primary's point-time range undecodable, as for an ordinary
+  // FLOAT64 relative-seconds cloud when the raw-epoch opt-in is disabled.
+  primary->fields.front().datatype = sensor_msgs::msg::PointField::FLOAT64;
+  primary->fields.front().count = 1;
+
+  glim_ros::AuxLidarSensor aux;
+  aux.buffer_size = 10;
+  auto past = cloud(900'000'000ULL, 949'000'000ULL, 0.94);
+  past->fields.front().datatype = sensor_msgs::msg::PointField::FLOAT64;
+  past->fields.front().count = 1;
+  aux.buffer.push_back(glim_ros::buffer_aux_cloud(past));
+  std::vector<glim_ros::AuxLidarSensor> sensors{aux};
+
+  EXPECT_FALSE(glim_ros::aux_buffers_ready_for_primary(*primary, sensors, 0.010));
+
+  auto future = cloud(1'010'000'001ULL, 1'059'000'001ULL, 1.02);
+  future->fields.front().datatype = sensor_msgs::msg::PointField::FLOAT64;
+  future->fields.front().count = 1;
+  sensors[0].buffer.push_back(glim_ros::buffer_aux_cloud(future));
+  EXPECT_TRUE(glim_ros::aux_buffers_ready_for_primary(*primary, sensors, 0.010));
+}
+
 }  // namespace

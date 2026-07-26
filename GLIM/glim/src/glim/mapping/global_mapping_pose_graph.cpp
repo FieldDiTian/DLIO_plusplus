@@ -1,5 +1,7 @@
 #include <glim/mapping/global_mapping_pose_graph.hpp>
 
+#include <algorithm>
+#include <stdexcept>
 #include <spdlog/spdlog.h>
 #include <boost/filesystem.hpp>
 
@@ -62,6 +64,7 @@ GlobalMappingPoseGraphParams::GlobalMappingPoseGraphParams() {
   isam2_relinearize_thresh = config.param<double>("global_mapping", "isam2_relinearize_thresh", 0.1);
 
   init_pose_damping_scale = config.param<double>("global_mapping", "init_pose_damping_scale", 1e10);
+  offload_points_dir = config.param<std::string>("global_mapping", "offload_points_dir", "");
 
   num_threads = config.param<int>("global_mapping", "num_threads", 2);
 }
@@ -69,6 +72,19 @@ GlobalMappingPoseGraphParams::GlobalMappingPoseGraphParams() {
 GlobalMappingPoseGraphParams::~GlobalMappingPoseGraphParams() {}
 
 GlobalMappingPoseGraph::GlobalMappingPoseGraph(const GlobalMappingPoseGraphParams& params) : params(params) {
+  if (!params.offload_points_dir.empty()) {
+    const boost::filesystem::path offload_dir(params.offload_points_dir);
+    if (!offload_dir.is_absolute()) {
+      throw std::invalid_argument("global_mapping.offload_points_dir must be an absolute path");
+    }
+    if (boost::filesystem::exists(offload_dir) && !boost::filesystem::is_empty(offload_dir)) {
+      throw std::runtime_error(
+        "global_mapping.offload_points_dir is not empty: " + offload_dir.string() + " (use a unique per-run directory so stale point payloads cannot enter a map)");
+    }
+    boost::filesystem::create_directories(offload_dir);
+    logger->info("dense submap point offload enabled: {}", offload_dir.string());
+  }
+
   new_values.reset(new gtsam::Values);
   new_factors.reset(new gtsam::NonlinearFactorGraph);
 
@@ -90,14 +106,34 @@ GlobalMappingPoseGraph::GlobalMappingPoseGraph(const GlobalMappingPoseGraphParam
   tbb_task_arena.reset(new tbb::task_arena(params.num_threads));
 #endif
 
-  kill_switch = false;
+  loop_detection_finalized = false;
+  loop_candidates_proposed = 0;
+  loop_candidates_evaluated = 0;
+  loop_candidates_dropped = 0;
+  loop_factors_accepted = 0;
   loop_detection_thread = std::thread([this] { loop_detection_task(); });
 }
 
 GlobalMappingPoseGraph::~GlobalMappingPoseGraph() {
-  kill_switch = true;
+  finish_loop_detection();
+}
+
+void GlobalMappingPoseGraph::finish_loop_detection() {
+  if (loop_detection_finalized.exchange(true)) {
+    return;
+  }
+
   loop_candidates.submit_end_of_data();
-  loop_detection_thread.join();
+  if (loop_detection_thread.joinable()) {
+    loop_detection_thread.join();
+  }
+
+  logger->info(
+    "loop closure summary: proposed={} evaluated={} accepted={} dropped={}",
+    loop_candidates_proposed.load(),
+    loop_candidates_evaluated.load(),
+    loop_factors_accepted.load(),
+    loop_candidates_dropped.load());
 }
 
 void GlobalMappingPoseGraph::insert_submap(const SubMap::Ptr& submap) {
@@ -194,6 +230,11 @@ void GlobalMappingPoseGraph::optimize() {
 }
 
 void GlobalMappingPoseGraph::save(const std::string& path) {
+  // Loop detection is asynchronous.  Taking the final graph snapshot before
+  // draining it silently loses every accepted factor still in the detector's
+  // local/worker queues.  This is especially damaging for per-scan submaps,
+  // where a lap boundary can enqueue many candidates near end-of-bag.
+  finish_loop_detection();
   optimize();
 
   boost::filesystem::create_directories(path);
@@ -209,6 +250,10 @@ void GlobalMappingPoseGraph::save(const std::string& path) {
   ofs << "num_all_frames: " << std::accumulate(submaps.begin(), submaps.end(), 0, [](int sum, const SubMap::ConstPtr& submap) { return sum + submap->frames.size(); }) << std::endl;
 
   ofs << "num_matching_cost_factors: " << 0 << std::endl;
+  ofs << "num_loop_candidates_proposed: " << loop_candidates_proposed.load() << std::endl;
+  ofs << "num_loop_candidates_evaluated: " << loop_candidates_evaluated.load() << std::endl;
+  ofs << "num_loop_candidates_dropped: " << loop_candidates_dropped.load() << std::endl;
+  ofs << "num_loop_closure_factors: " << loop_factors_accepted.load() << std::endl;
 
   std::ofstream odom_lidar_ofs(path + "/odom_lidar.txt");
   std::ofstream traj_lidar_ofs(path + "/traj_lidar.txt");
@@ -240,7 +285,9 @@ void GlobalMappingPoseGraph::save(const std::string& path) {
       write_tum_frame(traj_lidar_ofs, frame->stamp, T_world_lidar);
     }
 
-    submaps[i]->save((boost::format("%s/%06d") % path % i).str());
+    const std::string output_submap_dir = (boost::format("%s/%06d") % path % i).str();
+    submaps[i]->save(output_submap_dir);
+    restore_offloaded_points(i, output_submap_dir);
   }
 }
 
@@ -260,7 +307,8 @@ void GlobalMappingPoseGraph::insert_submap(int current, const SubMap::Ptr& subma
 
   // Subsample points for registration
   if (params.subsample_target > 0) {
-    target->subsampled = gtsam_points::random_sampling(submap->frame, static_cast<double>(params.subsample_target) / submap->frame->size(), mt);
+    const double sampling_rate = std::min(1.0, static_cast<double>(params.subsample_target) / submap->frame->size());
+    target->subsampled = sampling_rate < 1.0 ? gtsam_points::random_sampling(submap->frame, sampling_rate, mt) : submap->frame;
   } else {
     if (params.subsample_rate > 0.99) {
       target->subsampled = submap->frame;
@@ -269,12 +317,28 @@ void GlobalMappingPoseGraph::insert_submap(int current, const SubMap::Ptr& subma
     }
   }
 
+  // Dense per-scan submaps are the quality lever, but loop registration only
+  // needs the bounded sample above. Persist the dense compact payload before
+  // replacing the in-memory frame with that sample. save() restores the dense
+  // payload into the numbered dump directory.
+  if (!params.offload_points_dir.empty()) {
+    const std::string offload_submap_dir = (boost::format("%s/%06d") % params.offload_points_dir % current).str();
+    boost::filesystem::create_directories(offload_submap_dir);
+    submap->frame->save_compact(offload_submap_dir);
+    offloaded_point_dirs.push_back(offload_submap_dir);
+    target->registration_target = target->subsampled;
+    submap->frame = std::const_pointer_cast<gtsam_points::PointCloud>(target->registration_target);
+  } else {
+    offloaded_point_dirs.emplace_back();
+    target->registration_target = submap->frame;
+  }
+
   // Create nearest neighbor search
   if (params.registration_type == "GICP") {
-    target->tree = std::make_shared<gtsam_points::KdTree>(submap->frame->points, submap->frame->size());
+    target->tree = std::make_shared<gtsam_points::KdTree>(target->registration_target->points, target->registration_target->size());
   } else if (params.registration_type == "VGICP") {
     target->voxels = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(params.vgicp_voxel_resolution);
-    target->voxels->insert(*submap->frame);
+    target->voxels->insert(*target->registration_target);
   } else {
     logger->warn("unknown registration type: {}", params.registration_type);
   }
@@ -332,6 +396,7 @@ void GlobalMappingPoseGraph::find_loop_candidates(int current) {
     new_candidates.emplace_back(LoopCandidate{submap_targets[i], submap_targets[current], T_target_source});
   }
 
+  loop_candidates_proposed.fetch_add(new_candidates.size());
   loop_candidates.insert(new_candidates);
 }
 
@@ -344,24 +409,37 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMappingPoseGraph::collect_det
 }
 
 void GlobalMappingPoseGraph::loop_detection_task() {
-  std::mt19937 mt;
+  // Keep candidate selection reproducible and independent from registration
+  // point subsampling, which uses the class-level engine.
+  std::mt19937 loop_mt;
   std::deque<LoopCandidate> candidates_buffer;  // Local loop candidate buffer
 
-  while (!kill_switch) {
+  while (true) {
     logger->debug("wait for loop candidates");
     auto new_candidates = loop_candidates.get_all_and_clear_wait();
     candidates_buffer.insert(candidates_buffer.end(), new_candidates.begin(), new_candidates.end());
 
     logger->debug("|candidates_buffer|={}", candidates_buffer.size());
 
-    // Regulate the size of the candidate buffer.
-    while (candidates_buffer.size() > params.loop_candidate_buffer_size) {
-      std::shuffle(candidates_buffer.begin(), candidates_buffer.end(), mt);
-      candidates_buffer.resize(params.loop_candidate_buffer_size);
+    // An empty batch is only returned after submit_end_of_data().  Keep
+    // iterating while the local buffer is non-empty so EOF drains it instead
+    // of abandoning candidates during save/destruction.
+    if (new_candidates.empty() && candidates_buffer.empty()) {
+      break;
+    }
+
+    const size_t buffer_limit = static_cast<size_t>(std::max(1, params.loop_candidate_buffer_size));
+    if (candidates_buffer.size() > buffer_limit) {
+      // Uniform sampling preserves candidate diversity.  Retaining only the
+      // nearest poses over-constrained repeated views of the same Laguna
+      // surface and regressed the trusted-map A/B.
+      std::shuffle(candidates_buffer.begin(), candidates_buffer.end(), loop_mt);
+      loop_candidates_dropped.fetch_add(candidates_buffer.size() - buffer_limit);
+      candidates_buffer.resize(buffer_limit);
     }
 
     // Take a subset of the candidates to evaluate.
-    const int eval_count = params.loop_candidate_eval_per_thread * params.num_threads;
+    const int eval_count = std::max(1, params.loop_candidate_eval_per_thread * params.num_threads);
     std::vector<LoopCandidate> candidates;
     if (candidates_buffer.size() < eval_count) {
       candidates.assign(candidates_buffer.begin(), candidates_buffer.end());
@@ -370,15 +448,12 @@ void GlobalMappingPoseGraph::loop_detection_task() {
       candidates.assign(candidates_buffer.begin(), candidates_buffer.begin() + eval_count);
       candidates_buffer.erase(candidates_buffer.begin(), candidates_buffer.begin() + eval_count);
     }
+    loop_candidates_evaluated.fetch_add(candidates.size());
 
     std::vector<double> inlier_fractions(candidates.size(), 0.0);
     std::vector<gtsam::Pose3> T_target_source(candidates.size());
 
     const auto evaluate_candidate = [&](int i) {
-      if (kill_switch) {
-        return;
-      }
-
       const auto candidate = candidates[i];
       const auto target = candidates[i].target;
       const auto source = candidates[i].source;
@@ -390,7 +465,7 @@ void GlobalMappingPoseGraph::loop_detection_task() {
 
       if (params.registration_type == "GICP") {
         auto factor =
-          gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(gtsam::Pose3(), 0, candidate.target->submap->frame, candidate.source->subsampled, candidate.target->tree);
+          gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(gtsam::Pose3(), 0, candidate.target->registration_target, candidate.source->subsampled, candidate.target->tree);
         factor->set_max_correspondence_distance(params.gicp_max_correspondence_dist);
 
         gtsam::NonlinearFactorGraph graph;
@@ -468,6 +543,7 @@ void GlobalMappingPoseGraph::loop_detection_task() {
         gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(candidates[i].target->submap->id), X(candidates[i].source->submap->id), T_target_source[i], noise_model));
     }
 
+    loop_factors_accepted.fetch_add(factors.size());
     detected_loops.insert(factors);
   }
 }
@@ -475,6 +551,45 @@ void GlobalMappingPoseGraph::loop_detection_task() {
 void GlobalMappingPoseGraph::update_submaps() {
   for (int i = 0; i < submaps.size(); i++) {
     submaps[i]->T_world_origin = Eigen::Isometry3d(isam2->calculateEstimate<gtsam::Pose3>(X(i)).matrix());
+  }
+}
+
+void GlobalMappingPoseGraph::restore_offloaded_points(size_t index, const std::string& output_submap_dir) {
+  if (index >= offloaded_point_dirs.size() || offloaded_point_dirs[index].empty()) {
+    return;
+  }
+
+  const boost::filesystem::path source_dir(offloaded_point_dirs[index]);
+  const boost::filesystem::path destination_dir(output_submap_dir);
+  if (boost::filesystem::absolute(source_dir) == boost::filesystem::absolute(destination_dir)) {
+    return;
+  }
+
+  size_t restored_files = 0;
+  for (boost::filesystem::directory_iterator it(source_dir), end; it != end; ++it) {
+    if (!boost::filesystem::is_regular_file(it->path())) {
+      continue;
+    }
+    const std::string filename = it->path().filename().string();
+    if (filename.size() < 12 || filename.compare(filename.size() - 12, 12, "_compact.bin") != 0) {
+      continue;
+    }
+    boost::filesystem::copy_file(it->path(), destination_dir / it->path().filename(), boost::filesystem::copy_options::overwrite_existing);
+    ++restored_files;
+  }
+
+  if (restored_files == 0) {
+    throw std::runtime_error("dense point offload payload is missing for submap " + std::to_string(index) + ": " + source_dir.string());
+  }
+
+  logger->debug("restored {} dense compact point files for submap {} from {}", restored_files, index, source_dir.string());
+  offloaded_point_dirs[index] = destination_dir.string();
+
+  // The dense payload is now durable in the dump. Reclaim only the temporary
+  // per-run offload copy; never remove an earlier dump used as the source of a
+  // subsequent save.
+  if (source_dir.parent_path() == boost::filesystem::path(params.offload_points_dir)) {
+    boost::filesystem::remove_all(source_dir);
   }
 }
 

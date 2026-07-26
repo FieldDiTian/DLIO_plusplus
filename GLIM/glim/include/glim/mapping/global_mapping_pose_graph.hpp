@@ -62,6 +62,16 @@ public:
 
   double init_pose_damping_scale;
 
+  /**
+   * Optional directory used to spill the dense point payload of each submap.
+   *
+   * Pose-graph loop detection only needs the bounded registration sample.  The
+   * full-resolution cloud is restored when save() writes the final GLIM dump.
+   * Keeping these two representations separate makes per-scan submaps practical
+   * on development machines without reducing the exported map density.
+   */
+  std::string offload_points_dir;
+
   int num_threads;
 };
 
@@ -71,6 +81,7 @@ struct SubMapTarget {
   using ConstPtr = std::shared_ptr<const SubMapTarget>;
 
   SubMap::ConstPtr submap;
+  gtsam_points::PointCloud::ConstPtr registration_target;
   gtsam_points::PointCloud::ConstPtr subsampled;
   std::shared_ptr<gtsam_points::NearestNeighborSearch> tree;
   std::shared_ptr<gtsam_points::GaussianVoxelMap> voxels;
@@ -109,21 +120,34 @@ private:
 
   void update_submaps();
 
+  /**
+   * Stop accepting loop candidates, drain every candidate already queued, and
+   * join the detector thread.  save() must call this before its final optimize
+   * so accepted loops cannot arrive after the serialized graph snapshot.
+   */
+  void finish_loop_detection();
   void loop_detection_task();
+  void restore_offloaded_points(size_t index, const std::string& output_submap_dir);
 
 private:
   using Params = GlobalMappingPoseGraphParams;
   Params params;
 
+  // Default-seeded engine keeps registration subsampling reproducible.
   std::mt19937 mt;
 
-  std::atomic_bool kill_switch;
+  std::atomic_bool loop_detection_finalized;
   std::thread loop_detection_thread;
   ConcurrentVector<LoopCandidate> loop_candidates;
   ConcurrentVector<gtsam_points::shared_ptr<gtsam::NonlinearFactor>> detected_loops;
+  std::atomic_uint64_t loop_candidates_proposed;
+  std::atomic_uint64_t loop_candidates_evaluated;
+  std::atomic_uint64_t loop_candidates_dropped;
+  std::atomic_uint64_t loop_factors_accepted;
 
   std::vector<SubMap::Ptr> submaps;
   std::vector<SubMapTarget::Ptr> submap_targets;
+  std::vector<std::string> offloaded_point_dirs;
 
   std::unique_ptr<gtsam::Values> new_values;
   std::unique_ptr<gtsam::NonlinearFactorGraph> new_factors;

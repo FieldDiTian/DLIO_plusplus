@@ -29,6 +29,9 @@ public:
   TimeKeeper();
   ~TimeKeeper();
 
+  /// @brief Set the offset applied after absolute per-point time normalization.
+  void set_point_time_offset(double offset);
+
   /**
    * @brief  Replace frame and point timestamps
    * @note   Frame timestamp must be the one at the moment when the first point is acquired

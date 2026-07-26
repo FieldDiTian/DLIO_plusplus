@@ -3,6 +3,8 @@
   // --- General settings ---
   // enable_optimization            : If false, disable optimization
   // init_pose_damping_scale        : Damping scale for initial pose (to fix the gauge freedom)
+  // offload_points_dir             : Absolute, empty per-run directory used to
+  //                                   spill dense submap points. Empty disables.
   //
   // --- Loop detection settings ---
   // registration_type              : Registration type for loop detection (GICP or VGICP)
@@ -32,7 +34,11 @@
     "so_name": "libglobal_mapping_pose_graph.so",
     // General settings
     "enable_optimization": true,
+    // The dataset-independent high-quality profile overrides this with 1.0
+    // when robust GNSS anchors are enabled. Preserve the legacy default here
+    // because a graph without absolute factors still needs a strong gauge.
     "init_pose_damping_scale": 1e6,
+    "offload_points_dir": "",
     // Loop detection settings
     "registration_type": "VGICP",
     "min_travel_dist": 50.0,

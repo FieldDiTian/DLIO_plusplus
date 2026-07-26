@@ -11,6 +11,11 @@
     "gnss_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
+    // Preserve the legacy all-history world/GNSS initialization in shared
+    // config. The generated high-quality profile enables a compact recent
+    // suffix that rejects stationary/low-speed startup transients while still
+    // requiring min_baseline on both the estimate and GNSS trajectories.
+    "fit_recent_baseline_window": false,
     // Atlas attitude (dual-antenna HEADING) prior on each submap. Position
     // anchoring (prior_inf_scale) pins WHERE a submap is, but not its yaw --
     // the Atlas dual-antenna heading is a drift-free reference that LiDAR+IMU
@@ -55,6 +60,34 @@
       1e4,
       1e3
     ],
+    // Optional covariance-aware position precision =
+    // clamp(1 / variance, floor, cap). Negative vectors preserve the legacy
+    // fixed prior_inf_scale behavior. The generated high-quality mapping
+    // profile enables the proven floor/cap values per run.
+    "prior_inf_floor": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "prior_inf_cap": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    // Huber width in normalized residual units; <= 0 disables robust wrapping.
+    "position_prior_robust_width": 0.0,
+    // Rolling optimized GNSS-anchor rejection gate; <= 0 disables it. The
+    // residual is measured after the global iSAM2 update, not against the raw
+    // LIO pose before the GNSS factor has been applied. The run-local
+    // high-quality profile enables this only with its matching GNSS contract.
+    "anchor_abort_median_m": 0.0,
+    "anchor_residual_window": 100,
+    "anchor_residual_min_samples": 20,
+    // Require this many consecutive optimized global updates above the same
+    // median threshold before latching failure. One preserves the historical
+    // fail-fast behavior; run-local profiles can tolerate a short iSAM2
+    // convergence transient without relaxing anchor_abort_median_m.
+    "anchor_abort_consecutive_updates": 1,
     "orientation_prior_inf_scale": [
       1e-6,
       1e-6,

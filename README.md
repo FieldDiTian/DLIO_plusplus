@@ -241,6 +241,80 @@ If you ever switch sensors and the deskew looks wrong, use the one-shot diagnost
    The exporter defaults to `--frame enu`: it applies `inverse(T_world_utm)` so the PCD is genuinely in the Atlas local-ENU frame, fails closed when the transform is missing, and writes a `*.manifest.yaml` recording the frame and transform (check it before shipping a map). It reads the datum from `<dump>/enu_origin.txt` automatically (written by the all-in-one `prep_bag.py` route); for a **hand-run GLIM dump** that file does not exist, so pass the datum explicitly: `--enu-origin "<lat,lon,alt>"` (the same origin the adapter used).
 6. **Localize** online against that PCD with `gicp_localization`/`GICP_plusplus`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. Because the exported map is genuinely ENU, Atlas seeds/GT are frame-correct directly — and `localization/utm_transform_path` must stay **EMPTY** (it exists only for legacy world-frame maps and would double-transform an ENU map).
 
+### High-quality mapping profile
+
+For a localization map, generate a run-local configuration instead of editing
+the installed GLIM/GLIM-ext JSON files. This keeps topic, calibration, scratch,
+and dataset paths explicit and prevents one run's GNSS transform/config from
+leaking into another run:
+
+```bash
+python3 scripts/generate_glim_mapping_config.py \
+  --output-dir /path/to/DATASET_ROOT/maps/<run>/config \
+  --offload-dir /tmp/glim_offload_<unique-run-id> \
+  --imu-topic /prepared/body_imu \
+  --gnss-topic /gnss \
+  --keyframes-per-submap 10 \
+  --t-lidar-imu X Y Z QX QY QZ QW \
+  --imu-input-rotation QX QY QZ QW \
+  --urdf-path /absolute/path/to/vehicle.urdf \
+  --aux-lidar /left/points:left_frame \
+  --aux-lidar /right/points:right_frame
+
+ros2 run glim_ros glim_rosbag /path/to/prepared_bag --ros-args \
+  -p config_path:=/path/to/DATASET_ROOT/maps/<run>/config \
+  -p dump_path:=/path/to/DATASET_ROOT/maps/<run>/dump
+
+python3 scripts/export_glim_dump_to_pcd.py \
+  /path/to/DATASET_ROOT/maps/<run>/dump \
+  /path/to/DATASET_ROOT/maps/<run>/map.pcd \
+  --voxel-size 0.15 \
+  --gnss-enu-origin "INPUT_GNSS_LAT,LON,ALT" \
+  --enu-origin "OUTPUT_MAP_LAT,LON,ALT"
+```
+
+The generated profile follows the validated perception-ws recipe: CPU
+LiDAR+IMU odometry (GNSS is a robust global constraint, not the per-scan pose
+source), one scan per submap, explicit 5 m loop closure, global gauge damping
+`1.0`, a 10 m world/GNSS initialization baseline, bounded covariance-aware GNSS
+weights, dense-point disk offload, and a live anchor-divergence rejection gate.
+`--keyframes-per-submap` is an explicit scale/quality control: its default
+`1` preserves the successful perception-ws one-scan submap profile, while a
+full-length run can inject a bounded value such as `10`. Every LiDAR frame
+still goes through local LIO and into a dense submap; only the number of global
+iSAM2 updates and pose-graph nodes is reduced. The generated
+`quality_profile.json` records the injected value, so a full-run map cannot be
+mistaken for a one-scan-submap experiment.
+The baseline can be injected with `--gnss-min-baseline`; its default matches the
+successful perception-ws Laguna configuration. The high-quality profile fits
+the newest segment that still spans that baseline on both trajectories, so a
+stationary/low-speed startup does not dominate the one-shot alignment. Use
+`--no-gnss-recent-fit-window` for the legacy all-history behavior, and inject
+its acceptance gate with `--gnss-fit-max-rms` (default `0.25 m`).
+`--offload-dir` must be an absolute, empty, per-run directory; GLIM refuses
+stale contents.
+
+The anchor gate evaluates the updated global-map poses after iSAM2 has applied
+the GNSS factors. It deliberately does not compare GNSS with the raw LIO pose
+captured before optimization, because that would reject the normal correction
+that a global constraint is supposed to make.
+It requires five consecutive optimized global updates above the same `0.5 m`
+median threshold before rejecting a run. A value back inside the threshold
+clears the streak; this filters optimizer convergence transients without
+weakening the final geometry limit.
+
+`--imu-input-rotation` is identity by default. Use it only when the prepared
+IMU topic's vectors still contain a measured receiver-mount tilt. It rotates
+incoming acceleration and gyro into the calibrated frame used by
+`--t-lidar-imu`, so the IMU correction is explicit instead of being hidden in
+an unrelated LiDAR lever arm.
+
+The exporter distinguishes the GNSS input datum from the delivered map datum.
+When they differ, it computes the exact WGS84 ENU-to-ENU transform and records
+both origins and the matrix in the manifest. This is not an ICP alignment and
+does not hide map deformation. Omit `--gnss-enu-origin` only when input GNSS
+and output map intentionally use the same datum.
+
 ### Why the offline_viewer step is manual
 
 A reviewer reasonably asks: why not auto-merge the per-submap directories into a single PCD with a script? Because the viewer pass is the QA stage for the mapping output, and skipping it would silently push bad maps into the localizer:

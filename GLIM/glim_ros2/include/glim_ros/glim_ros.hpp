@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
@@ -33,6 +34,9 @@ public:
   ~GlimROS();
 
   bool needs_wait();
+  // False when any quality/safety extension (for example the GNSS anchor
+  // divergence gate) has rejected the run.
+  bool ok() const;
   void timer_callback();
 
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -77,6 +81,9 @@ private:
   double imu_time_offset;
   double points_time_offset;
   double acc_scale;
+  // Fixed input-vector calibration. Both acceleration and gyro are rotated
+  // into the IMU frame used by T_lidar_imu before entering any estimator.
+  Eigen::Quaterniond imu_input_rotation = Eigen::Quaterniond::Identity();
   bool dump_on_unload;
 
   std::string intensity_field, ring_field;

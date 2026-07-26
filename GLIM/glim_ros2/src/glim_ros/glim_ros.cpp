@@ -90,6 +90,19 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
+  imu_input_rotation = config_sensors.param<Eigen::Quaterniond>("sensors", "imu_input_rotation", Eigen::Quaterniond::Identity());
+  if (!imu_input_rotation.coeffs().allFinite() || imu_input_rotation.norm() < 1e-9) {
+    throw std::invalid_argument("sensors.imu_input_rotation must be a finite, non-zero quaternion [x,y,z,w]");
+  }
+  imu_input_rotation.normalize();
+  if (std::abs(imu_input_rotation.w() - 1.0) > 1e-12 || imu_input_rotation.vec().norm() > 1e-12) {
+    logger->info(
+      "IMU input calibration enabled: q_input_to_calibrated=[{:.9f}, {:.9f}, {:.9f}, {:.9f}]",
+      imu_input_rotation.x(),
+      imu_input_rotation.y(),
+      imu_input_rotation.z(),
+      imu_input_rotation.w());
+  }
   // [P2 FIX 2026-07-15] Explicit Luminar-contract opt-in: when true, a FLOAT64
   // per-point time field is decoded as raw uint64 PTP epoch nanoseconds (the
   // documented Luminar driver variant) instead of IEEE-754 seconds. Default
@@ -154,7 +167,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // offset was added to raw_points->stamp before process(), but the
   // absolute-time branch of replace_points_stamp overwrites the stamp with the
   // raw min point time and silently discarded it for Luminar/absolute clouds.
-  time_keeper->point_time_offset = points_time_offset;
+  time_keeper->set_point_time_offset(points_time_offset);
   preprocessor.reset(new glim::CloudPreprocessor);
 
   // Odometry estimation
@@ -345,8 +358,8 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   const double imu_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + imu_time_offset;
-  const Eigen::Vector3d linear_acc = acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
-  const Eigen::Vector3d angular_vel(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+  const Eigen::Vector3d linear_acc = imu_input_rotation * (acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z));
+  const Eigen::Vector3d angular_vel = imu_input_rotation * Eigen::Vector3d(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
 
   if (!time_keeper->validate_imu_stamp(imu_stamp)) {
     spdlog::warn("skip an invalid IMU data (stamp={})", imu_stamp);
@@ -519,11 +532,18 @@ bool GlimROS::needs_wait() {
   return false;
 }
 
-void GlimROS::timer_callback() {
+bool GlimROS::ok() const {
   for (const auto& ext_module : extension_modules) {
     if (!ext_module->ok()) {
-      rclcpp::shutdown();
+      return false;
     }
+  }
+  return true;
+}
+
+void GlimROS::timer_callback() {
+  if (!ok()) {
+    rclcpp::shutdown();
   }
 
   std::vector<glim::EstimationFrame::ConstPtr> estimation_frames;
