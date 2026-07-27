@@ -215,11 +215,15 @@ void GlobalMappingPoseGraph::update_optimizer() {
   const auto loop_factors = collect_detected_loops();
   const bool has_loop_factors = !loop_factors->empty();
   new_factors->add(*loop_factors);
+
+  // Extension modules can enqueue factors asynchronously after the final
+  // insertion batch.  Give them a chance to flush before deciding that there
+  // is no optimizer work at an explicit optimize/save boundary.
+  Callbacks::on_smoother_update(*isam2, *new_factors, *new_values);
   if (new_values->empty() && new_factors->empty()) {
     return;
   }
 
-  Callbacks::on_smoother_update(*isam2, *new_factors, *new_values);
   try {
     gtsam_points::ISAM2ResultExt result;
 #ifdef GTSAM_USE_TBB
