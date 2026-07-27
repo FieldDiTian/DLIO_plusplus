@@ -11,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -285,9 +286,9 @@ int main(int argc, char** argv) {
   // Plan identity is the per-topic BAG-RECORD ORDINAL (0-based count of
   // messages seen on that topic, in stream order), NOT header.stamp: duplicate
   // or zero header stamps would silently collapse map keys. Pass 1 and pass 2
-  // read the same bags in the same order, so ordinals align exactly — which is
-  // also why the planner refuses to run under start_offset (the pass-2 seek
-  // would desynchronize the counts; the streaming fallback handles that case).
+  // read the same bags in the same order, so ordinals align exactly. For a
+  // start_offset seek, the pass-1 bag times below initialize the pass-2 ordinal
+  // counters to the first record at/after the seek boundary.
   struct PlannedAux {
     bool selected = false;
     uint64_t aux_ordinal = 0;     // identity of the chosen sweep in the stream
@@ -312,6 +313,8 @@ int main(int argc, char** argv) {
   // exactly like pass 1 does).
   uint64_t primary_ordinal_next = 0;
   std::vector<uint64_t> aux_ordinal_next;
+  std::vector<double> indexed_primary_bag_times_s;
+  std::vector<std::vector<double>> indexed_aux_bag_times_s;
   struct PendingPrimaryScan {
     sensor_msgs::msg::PointCloud2::SharedPtr msg;
     double enqueue_bag_time_s = 0.0;
@@ -416,6 +419,23 @@ int main(int argc, char** argv) {
             glim_ros::stamp_to_sec(primary->header.stamp),
             concat_config.future_sweep_wait_timeout, primary_timed_release);
         }
+      } else if (
+        !two_pass_active && force && concat_config.require_all_aux &&
+        !glim_ros::aux_buffers_ready_for_primary(pending.range, pending.header_s, aux_sensors, concat_config.luminar_time_threshold)) {
+        // At a playback-duration/EOF boundary the future side sweep needed by
+        // a relative-time primary may be outside the selected window. Never
+        // append an older, merely in-header-threshold sweep just to make the
+        // final scan look complete: one deliberately skipped boundary scan is
+        // preferable to injecting a 180-200 ms warped cloud into a
+        // high-quality map.
+        spdlog::warn(
+          "lidar_concat: skipping final queued primary (stamp={:.6f}); input "
+          "ended before every relative-time aux topic reached its future "
+          "header watermark",
+          pending.header_s);
+        pending_primary_scans.pop_front();
+        ++primary_strict_skipped;
+        continue;
       }
 
       const int epoch_anchor_count =
@@ -572,7 +592,29 @@ int main(int argc, char** argv) {
 
       if (start_offset > 0.0) {
         spdlog::info("skipping msg for start_offset {}", start_offset);
-        reader.seek(bag_t0 + start_offset * 1e9);
+        const rcutils_time_point_value_t seek_time = bag_t0 + start_offset * 1e9;
+        reader.seek(seek_time);
+
+        if (two_pass_active) {
+          const double seek_time_s = seek_time / 1e9;
+          primary_ordinal_next =
+            std::distance(indexed_primary_bag_times_s.begin(), std::lower_bound(indexed_primary_bag_times_s.begin(), indexed_primary_bag_times_s.end(), seek_time_s));
+          for (size_t i = 0; i < aux_ordinal_next.size(); ++i) {
+            aux_ordinal_next[i] =
+              std::distance(indexed_aux_bag_times_s[i].begin(), std::lower_bound(indexed_aux_bag_times_s[i].begin(), indexed_aux_bag_times_s[i].end(), seek_time_s));
+          }
+          std::ostringstream aux_ordinals;
+          for (size_t i = 0; i < aux_ordinal_next.size(); ++i) {
+            if (i > 0) aux_ordinals << ",";
+            aux_ordinals << aux_ordinal_next[i];
+          }
+          spdlog::info(
+            "two-pass join seek alignment: seek_time={:.6f} "
+            "primary_ordinal={} aux_ordinals={}",
+            seek_time_s,
+            primary_ordinal_next,
+            aux_ordinals.str());
+        }
 
         start_offset = 0.0;
         bag_t0 = 0;
@@ -826,15 +868,7 @@ int main(int argc, char** argv) {
   };
 
   // ---------- Pass 1: point-time index + deterministic merge plan ----------
-  if (concat_enabled && !aux_sensors.empty() && concat_config.two_pass_point_time_join &&
-      start_offset > 0.0) {
-    spdlog::warn(
-      "two-pass join disabled: start_offset={} seeks the streaming pass, which "
-      "would desynchronize the per-topic ordinal plan keys; falling back to the "
-      "streaming future-sweep wait",
-      start_offset);
-  } else if (concat_enabled && !aux_sensors.empty() &&
-             concat_config.two_pass_point_time_join) {
+  if (concat_enabled && !aux_sensors.empty() && concat_config.two_pass_point_time_join) {
     // A scan's identity is its per-topic bag-record ORDINAL. Every message on
     // the topic gets an ordinal — including malformed ones (indexed with an
     // invalid range) — so the pass-2 counters, which see every message, stay
@@ -854,12 +888,59 @@ int main(int argc, char** argv) {
       lidar_filter.topics.push_back(aux.topic);
     }
 
+    // A bounded replay should not deserialize every point of a multi-thousand
+    // second bag merely to plan a few-minute mapping window. Probe the exact
+    // first timestamp seen by the streaming filter (the same value pass 2 uses
+    // as bag_t0), then index only a small pre-roll plus the requested range.
+    // Ordinals are local to that indexed slice; the seek-alignment code above
+    // initializes pass-2 counters from the indexed bag times.
+    double index_seek_time_s = -1.0;
+    double index_stop_time_s = std::numeric_limits<double>::infinity();
+    if (start_offset > 0.0 && !bag_filenames.empty()) {
+      try {
+        auto probe = open_bag_reader(bag_filenames.front());
+        probe->set_filter(filter);
+        if (probe->has_next()) {
+          const double stream_t0_s = get_msg_recv_timestamp(*probe->read_next()) / 1e9;
+          const double requested_start_s = stream_t0_s + start_offset;
+          const double safety_s = std::max(1.0, concat_config.future_sweep_wait_timeout + 0.5);
+          index_seek_time_s = requested_start_s - safety_s;
+          if (playback_duration > 0.0) {
+            index_stop_time_s = requested_start_s + playback_duration + safety_s;
+          } else if (playback_until > 0.0) {
+            index_stop_time_s = playback_until + safety_s;
+          }
+          spdlog::info(
+            "two-pass join: bounded index window [{:.6f}, {:.6f}] "
+            "(requested start {:.6f}, safety {:.3f}s)",
+            index_seek_time_s,
+            index_stop_time_s,
+            requested_start_s,
+            safety_s);
+        }
+      } catch (const std::exception& e) {
+        spdlog::warn(
+          "two-pass join: failed to probe bounded index window: {}; "
+          "falling back to full-bag indexing",
+          e.what());
+        index_seek_time_s = -1.0;
+        index_stop_time_s = std::numeric_limits<double>::infinity();
+      }
+    }
+
     spdlog::info("two-pass join: indexing LiDAR point-time ranges ({} bag(s))", bag_filenames.size());
     bool index_ok = true;
+    bool index_window_complete = false;
     for (const auto& bag_filename : bag_filenames) {
       try {
         auto reader_ = open_bag_reader(bag_filename);
         reader_->set_filter(lidar_filter);
+        if (index_seek_time_s > 0.0) {
+          reader_->seek(static_cast<rcutils_time_point_value_t>(index_seek_time_s * 1e9));
+          // The requested bounded window can only live in the first input
+          // stream reached after this seek; do not re-seek a later split bag.
+          index_seek_time_s = -1.0;
+        }
         while (reader_->has_next()) {
           if (!rclcpp::ok()) {
             index_ok = false;
@@ -868,6 +949,10 @@ int main(int argc, char** argv) {
           const auto msg = reader_->read_next();
           IndexedScan s;
           s.bag_time_s = get_msg_recv_timestamp(*msg) / 1e9;
+          if (s.bag_time_s > index_stop_time_s) {
+            index_window_complete = true;
+            break;
+          }
           auto pc = std::make_shared<sensor_msgs::msg::PointCloud2>();
           try {
             const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
@@ -897,6 +982,9 @@ int main(int argc, char** argv) {
       if (!index_ok) {
         break;
       }
+      if (index_window_complete) {
+        break;
+      }
     }
 
     size_t primary_valid = 0;
@@ -909,6 +997,17 @@ int main(int argc, char** argv) {
         "falling back to the streaming future-sweep wait",
         primary_valid, primary_index.size());
     } else {
+      indexed_primary_bag_times_s.reserve(primary_index.size());
+      for (const auto& scan : primary_index) {
+        indexed_primary_bag_times_s.push_back(scan.bag_time_s);
+      }
+      indexed_aux_bag_times_s.resize(aux_index.size());
+      for (size_t i = 0; i < aux_index.size(); ++i) {
+        indexed_aux_bag_times_s[i].reserve(aux_index[i].size());
+        for (const auto& scan : aux_index[i]) {
+          indexed_aux_bag_times_s[i].push_back(scan.bag_time_s);
+        }
+      }
       planned_aux_ordinals.assign(aux_sensors.size(), {});
       planned_aux_store.assign(aux_sensors.size(), {});
       aux_ordinal_next.assign(aux_sensors.size(), 0);
@@ -1089,7 +1188,12 @@ int main(int argc, char** argv) {
   }
 
   // Read all rosbags
-  bool auto_quit = false;
+  // glim_rosbag is an offline batch runner: reaching the true end of every
+  // input bag must drain, optimize, save, and return without an interactive
+  // Ctrl-C.  A bounded playback already forced this path through read_bag()'s
+  // stop condition, which hid the full-run-only hang.  Interactive inspection
+  // remains available by explicitly passing -p auto_quit:=false.
+  bool auto_quit = true;
   glim->declare_parameter<bool>("auto_quit", auto_quit);
   glim->get_parameter<bool>("auto_quit", auto_quit);
 
@@ -1135,6 +1239,11 @@ int main(int argc, char** argv) {
 
   glim->wait(auto_quit);
   glim->save(dump_path);
+
+  if (!glim->ok()) {
+    spdlog::error("run rejected by a mapping quality/safety extension — partial dump saved, exiting nonzero");
+    return 1;
+  }
 
   // [P3 FIX 2026-07-10] partial dump is kept, but exit nonzero on hard errors.
   if (g_bag_hard_error) {

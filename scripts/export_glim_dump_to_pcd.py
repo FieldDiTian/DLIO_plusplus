@@ -38,6 +38,8 @@ import numpy as np
 # kills both the false-accept on a typo'd free-text origin and the false-reject
 # on whitespace/precision differences.
 ENU_ORIGIN_FILENAME = "enu_origin.txt"
+WGS84_A_M = 6378137.0
+WGS84_F = 1.0 / 298.257223563
 
 
 def parse_enu_origin(text: str) -> tuple[float, float, float]:
@@ -57,6 +59,65 @@ def canonical_enu_origin(text: str) -> str:
     """Fixed-precision canonical form written to the manifest."""
     lat, lon, alt = parse_enu_origin(text)
     return f"{lat:.8f},{lon:.8f},{alt:.3f}"
+
+
+def lla_to_ecef(origin: tuple[float, float, float]) -> np.ndarray:
+    """Convert WGS84 latitude/longitude/altitude to ECEF metres."""
+    lat_deg, lon_deg, alt_m = origin
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    e2 = WGS84_F * (2.0 - WGS84_F)
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+    radius = WGS84_A_M / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    return np.asarray(
+        [
+            (radius + alt_m) * cos_lat * cos_lon,
+            (radius + alt_m) * cos_lat * sin_lon,
+            (radius * (1.0 - e2) + alt_m) * sin_lat,
+        ],
+        dtype=np.float64,
+    )
+
+
+def ecef_R_enu(origin: tuple[float, float, float]) -> np.ndarray:
+    """Return the rotation that maps local ENU vectors into ECEF."""
+    lat = math.radians(origin[0])
+    lon = math.radians(origin[1])
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+    return np.asarray(
+        [
+            [-sin_lon, -sin_lat * cos_lon, cos_lat * cos_lon],
+            [cos_lon, -sin_lat * sin_lon, cos_lat * sin_lon],
+            [0.0, cos_lat, sin_lat],
+        ],
+        dtype=np.float64,
+    )
+
+
+def enu_reanchor_transform(
+    input_origin: tuple[float, float, float],
+    output_origin: tuple[float, float, float],
+) -> np.ndarray:
+    """Return exact WGS84 ``T_output_enu_input_enu``.
+
+    This is a datum conversion, not a fitted alignment: the rotation and
+    translation are determined entirely by the two declared LLA origins.
+    """
+    input_ecef = lla_to_ecef(input_origin)
+    output_ecef = lla_to_ecef(output_origin)
+    R_ecef_input = ecef_R_enu(input_origin)
+    R_ecef_output = ecef_R_enu(output_origin)
+
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = R_ecef_output.T @ R_ecef_input
+    transform[:3, 3] = R_ecef_output.T @ (input_ecef - output_ecef)
+    return transform
 
 
 def parse_matrix(lines: list[str], key: str) -> np.ndarray:
@@ -203,10 +264,18 @@ def main() -> int:
         "--enu-origin",
         type=str,
         default="",
-        help="ENU datum 'lat_deg,lon_deg,alt_m' used by the adapter/prep_bag for this dataset. "
-        "REQUIRED for --frame enu (recorded in the map manifest): a map and a live adapter "
-        "using DIFFERENT origins are numerically valid but mutually incompatible, and nothing "
-        "else ties the datum to the map.",
+        help="OUTPUT map datum 'lat_deg,lon_deg,alt_m'. REQUIRED for --frame enu and recorded "
+        "in the map manifest. If this differs from the GNSS coordinates used during mapping, "
+        "also pass --gnss-enu-origin so the exporter performs an exact WGS84 ENU reanchor.",
+    )
+    parser.add_argument(
+        "--gnss-enu-origin",
+        type=str,
+        default="",
+        help="INPUT datum of the GNSS coordinates consumed by gnss_global. Defaults to "
+        "--enu-origin for backward compatibility. When the trusted localization map uses "
+        "another datum, this source origin plus --enu-origin determines the exact, non-fitted "
+        "T_output_enu_input_enu conversion.",
     )
     parser.add_argument(
         "--allow-missing-origin",
@@ -240,6 +309,13 @@ def main() -> int:
             args.enu_origin = canonical_enu_origin(args.enu_origin)
         except ValueError as exc:
             parser.error(f"--enu-origin invalid: {exc}")
+    if args.gnss_enu_origin:
+        try:
+            args.gnss_enu_origin = canonical_enu_origin(args.gnss_enu_origin)
+        except ValueError as exc:
+            parser.error(f"--gnss-enu-origin invalid: {exc}")
+    elif args.enu_origin:
+        args.gnss_enu_origin = args.enu_origin
 
     # [P3 FIX 2026-07-10] Provenance is ENFORCED, not just recorded: an ENU
     # map without its datum cannot be validated against the live adapter.
@@ -257,6 +333,7 @@ def main() -> int:
         raise SystemExit(f"no GLIM submap dirs found under {args.dump_dir}")
 
     pre_transform: Optional[np.ndarray] = None
+    enu_reanchor = np.eye(4, dtype=np.float64)
     if args.frame == "enu":
         tf_path = args.transform_file or (args.dump_dir / "T_world_utm.txt")
         if not tf_path.is_file():
@@ -269,7 +346,15 @@ def main() -> int:
                 "stay in GLIM's world frame."
             )
         T_world_utm = load_world_utm(tf_path)
-        pre_transform = invert_se3(T_world_utm)
+        if not args.gnss_enu_origin:
+            raise SystemExit(
+                "--frame enu needs the GNSS input datum. Pass --gnss-enu-origin, "
+                "or pass --enu-origin when input and output use the same datum."
+            )
+        input_origin = parse_enu_origin(args.gnss_enu_origin)
+        output_origin = parse_enu_origin(args.enu_origin)
+        enu_reanchor = enu_reanchor_transform(input_origin, output_origin)
+        pre_transform = enu_reanchor @ invert_se3(T_world_utm)
         yaw_deg = math.degrees(math.atan2(T_world_utm[1, 0], T_world_utm[0, 0]))
         print(
             f"[export_glim_dump_to_pcd] frame=enu: applying inverse T_world_utm from {tf_path} "
@@ -278,6 +363,17 @@ def main() -> int:
             "localization/utm_transform_path EMPTY for this map.",
             flush=True,
         )
+        if args.gnss_enu_origin != args.enu_origin:
+            t = enu_reanchor[:3, 3]
+            reanchor_yaw_deg = math.degrees(
+                math.atan2(enu_reanchor[1, 0], enu_reanchor[0, 0]))
+            print(
+                "[export_glim_dump_to_pcd] datum reanchor: "
+                f"input={args.gnss_enu_origin} output={args.enu_origin} "
+                f"t=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m "
+                f"yaw={reanchor_yaw_deg:.6f} deg",
+                flush=True,
+            )
     else:
         print(
             "[export_glim_dump_to_pcd] frame=world (legacy): PCD stays in GLIM's world frame — "
@@ -327,15 +423,20 @@ def main() -> int:
             mh.write(f"voxel_size: {args.voxel_size}\n")
             mh.write(f"stride: {args.stride}\n")
             if args.enu_origin:
-                mh.write(f"enu_origin: {args.enu_origin}\n")
+                mh.write(f"enu_origin: {args.enu_origin}  # output map datum\n")
+                mh.write(f"gnss_enu_origin: {args.gnss_enu_origin}  # mapping input datum\n")
             else:
                 mh.write("enu_origin: UNSPECIFIED  # WARNING: record the adapter's\n")
                 mh.write("#   local_enu_origin for this dataset — a live adapter with a\n")
                 mh.write("#   different datum is silently incompatible with this map\n")
             if pre_transform is not None:
-                mh.write("applied_transform: inverse(T_world_utm)  # PCD is Atlas local-ENU\n")
+                mh.write(
+                    "applied_transform: T_output_enu_input_enu * inverse(T_world_utm)\n")
                 mh.write("T_world_utm:\n")
                 for row in T_world_utm:
+                    mh.write("  - [" + ", ".join(f"{v:.10f}" for v in row) + "]\n")
+                mh.write("T_output_enu_input_enu:\n")
+                for row in enu_reanchor:
                     mh.write("  - [" + ", ".join(f"{v:.10f}" for v in row) + "]\n")
                 mh.write("gicp_note: leave localization/utm_transform_path EMPTY for this map\n")
             else:

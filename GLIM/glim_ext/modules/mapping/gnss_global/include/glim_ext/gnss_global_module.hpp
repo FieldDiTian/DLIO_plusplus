@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <stdexcept>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -43,8 +44,10 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/navigation/AttitudeFactor.h>
 #include <gtsam/slam/PoseRotationPrior.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
+#include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 
@@ -63,6 +66,9 @@ public:
 
   double stamp = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  // Position variances from pose.covariance[0,7,14]. Negative means the
+  // publisher did not provide a usable value.
+  Eigen::Vector3d position_var = Eigen::Vector3d::Constant(-1.0);
   Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
   bool has_orientation = false;
   // P5#1: reported yaw variance (rad^2) from pose.covariance[35].
@@ -89,8 +95,24 @@ public:
     gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/pose_with_cov");
     gnss_msg_type = config.param<std::string>("gnss", "gnss_msg_type", "geometry_msgs/msg/PoseWithCovarianceStamped");
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
+    prior_inf_floor = config.param<Eigen::Vector3d>("gnss", "prior_inf_floor", Eigen::Vector3d(-1.0, -1.0, -1.0));
+    prior_inf_cap = config.param<Eigen::Vector3d>("gnss", "prior_inf_cap", Eigen::Vector3d(-1.0, -1.0, -1.0));
+    adaptive_position_prior = prior_inf_floor.minCoeff() >= 0.0 && prior_inf_cap.minCoeff() >= 0.0;
+    if (adaptive_position_prior && (prior_inf_cap.array() < prior_inf_floor.array()).any()) {
+      throw std::invalid_argument("gnss.prior_inf_cap must be >= gnss.prior_inf_floor on every axis");
+    }
+    position_prior_robust_width = config.param<double>("gnss", "position_prior_robust_width", 0.0);
+    anchor_abort_median_m = config.param<double>("gnss", "anchor_abort_median_m", 0.0);
+    anchor_residual_window = std::max(1, config.param<int>("gnss", "anchor_residual_window", 100));
+    anchor_residual_min_samples = std::max(1, config.param<int>("gnss", "anchor_residual_min_samples", 20));
+    anchor_abort_consecutive_updates =
+      std::max(1, config.param<int>("gnss", "anchor_abort_consecutive_updates", 1));
     enable_orientation_prior = config.param<bool>("gnss", "enable_orientation_prior", false);
     orientation_prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "orientation_prior_inf_scale", Eigen::Vector3d(1e2, 1e2, 1e2));
+    gravity_prior_sigma_deg = config.param<double>("gnss", "gravity_prior_sigma_deg", 0.0);
+    if (!std::isfinite(gravity_prior_sigma_deg) || gravity_prior_sigma_deg < 0.0) {
+      throw std::invalid_argument("gnss.gravity_prior_sigma_deg must be finite and non-negative");
+    }
     // P5#1: yaw-quality gate for the orientation prior. The RTK gate upstream
     // (adapter/rtk_fixed filter) qualifies POSITION quality only; a
     // position-FIXED sample can still carry a degraded/unsolved dual-antenna
@@ -102,6 +124,14 @@ public:
     // yaw covariance pass (backwards compatible with covariance-less sources).
     orientation_prior_max_yaw_sigma_deg = config.param<double>("gnss", "orientation_prior_max_yaw_sigma_deg", 3.0);
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
+    // The legacy fit uses every associated submap from startup. That is
+    // appropriate when mapping begins in steady motion, but a stationary /
+    // low-speed launch can dominate the one-shot yaw fit even after the
+    // endpoint baseline becomes long enough. The high-quality run-local
+    // profile enables a compact suffix whose estimate-side and GNSS-side
+    // endpoint displacements both still exceed min_baseline. The default is
+    // false so shared configs retain their historical behavior.
+    fit_recent_baseline_window = config.param<bool>("gnss", "fit_recent_baseline_window", false);
     // [P1 FIX 2026-07-09] Maximum GNSS bracket width for submap association.
     // Without this bound, an RTK dropout leaves the queue with (last sample
     // before the gap, first sample after it) and every submap inside the gap
@@ -180,6 +210,7 @@ public:
     transformation_initialized = false;
     T_world_utm.setIdentity();
     warned_missing_orientation = false;
+    healthy_ = true;
 
     kill_switch = false;
     thread = std::thread([this] { backend_task(); });
@@ -189,6 +220,7 @@ public:
     using std::placeholders::_3;
     GlobalMappingCallbacks::on_insert_submap.add(std::bind(&GNSSGlobal::on_insert_submap, this, _1));
     GlobalMappingCallbacks::on_smoother_update.add(std::bind(&GNSSGlobal::on_smoother_update, this, _1, _2, _3));
+    GlobalMappingCallbacks::on_update_submaps.add(std::bind(&GNSSGlobal::on_update_submaps, this, _1));
   }
   ~GNSSGlobal() {
     kill_switch = true;
@@ -211,8 +243,9 @@ public:
     // previously still reported success.
     const uint64_t pf = position_factor_count.load();
     const uint64_t of = orientation_factor_count.load();
+    const uint64_t gf = gravity_factor_count.load();
     const uint64_t delivered = factors_delivered_count.load();
-    const uint64_t emitted = pf + of;
+    const uint64_t emitted = pf + of + gf;
     const uint64_t undelivered = emitted > delivered ? emitted - delivered : 0;
     const uint64_t seen = submaps_seen.load();
     const uint64_t bc = bracket_count.load();
@@ -223,16 +256,33 @@ public:
     // coverage ratio instead of looking fully anchored.
     logger->info(
       "gnss_global summary: transformation_initialized={} fit_rms_m={:.3f} position_factors={} "
-      "orientation_factors={} factors_delivered={} factors_undelivered={} yaw_gate_skips={} "
+      "orientation_factors={} gravity_factors={} factors_delivered={} factors_undelivered={} yaw_gate_skips={} "
       "gap_unanchored={} submaps_seen={} submaps_dropped_pre_gnss={} submaps_dropped_no_bracket={} "
+      "submaps_unanchored_pre_fit={} "
       "submap_anchor_coverage={:.3f} nonmonotonic_drops={} bracket_count={} bracket_max_s={:.3f} "
-      "bracket_mean_s={:.3f}",
-      transformation_initialized, fit_rms_m.load(), pf, of, delivered, undelivered,
-      yaw_gate_skip_count.load(), gap_unanchored_count.load(), seen,
-      submaps_dropped_pre_gnss.load(), submaps_dropped_no_bracket.load(),
+      "bracket_mean_s={:.3f} anchor_residual_median_m={:.3f} anchor_abort_streak={} "
+      "anchor_health_ok={}",
+      transformation_initialized,
+      fit_rms_m.load(),
+      pf,
+      of,
+      gf,
+      delivered,
+      undelivered,
+      yaw_gate_skip_count.load(),
+      gap_unanchored_count.load(),
+      seen,
+      submaps_dropped_pre_gnss.load(),
+      submaps_dropped_no_bracket.load(),
+      submaps_unanchored_pre_fit.load(),
       seen > 0 ? static_cast<double>(pf) / static_cast<double>(seen) : 0.0,
-      nonmonotonic_drop_count.load(), bc, bracket_max_s.load(),
-      bc > 0 ? bracket_sum_s.load() / static_cast<double>(bc) : 0.0);
+      nonmonotonic_drop_count.load(),
+      bc,
+      bracket_max_s.load(),
+      bc > 0 ? bracket_sum_s.load() / static_cast<double>(bc) : 0.0,
+      anchor_residual_median_m.load(),
+      anchor_abort_streak.load(),
+      healthy_.load());
     if (undelivered > 0) {
       logger->warn("gnss_global: {} GNSS prior factor(s) were EMITTED but never DELIVERED to the "
                    "graph (save() flushed before on_smoother_update drained them) — the serialized "
@@ -260,6 +310,8 @@ public:
            (!input_gnss_queue.empty() && submaps_waiting_);
   }
 
+  virtual bool ok() const override { return healthy_.load(); }
+
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
     if (gnss_msg_type == "nav_msgs/msg/Odometry") {
       const auto sub = std::make_shared<TopicSubscription<Odometry>>(gnss_topic, gnss_msg_type, [this](const OdometryConstPtr msg) { gnss_callback(msg); });
@@ -277,14 +329,38 @@ public:
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
     const double yaw_var = sanitize_yaw_var(gnss_msg->pose.covariance[35]);
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
+    push_gnss_data(
+      to_sec(gnss_msg->header.stamp),
+      pos.x,
+      pos.y,
+      pos.z,
+      ori.x,
+      ori.y,
+      ori.z,
+      ori.w,
+      gnss_msg->pose.covariance[0],
+      gnss_msg->pose.covariance[7],
+      gnss_msg->pose.covariance[14],
+      yaw_var);
   }
 
   void gnss_callback(const OdometryConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
     const auto& ori = gnss_msg->pose.pose.orientation;
     const double yaw_var = sanitize_yaw_var(gnss_msg->pose.covariance[35]);
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w, yaw_var);
+    push_gnss_data(
+      to_sec(gnss_msg->header.stamp),
+      pos.x,
+      pos.y,
+      pos.z,
+      ori.x,
+      ori.y,
+      ori.z,
+      ori.w,
+      gnss_msg->pose.covariance[0],
+      gnss_msg->pose.covariance[7],
+      gnss_msg->pose.covariance[14],
+      yaw_var);
   }
 
   // [P3 FIX 2026-07-10] Snapshot the submap ORIGIN TRANSLATION at insert
@@ -298,12 +374,27 @@ public:
     SubMap::ConstPtr submap;
     Eigen::Vector3d t_world_origin_snap;
   };
+  struct PendingPositionAnchor {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    size_t submap_id;
+    Eigen::Vector3d position;
+  };
+
   void on_insert_submap(const SubMap::ConstPtr& submap) {
     input_submap_queue.push_back({submap, submap->T_world_origin.translation()});
   }
 
   void on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
-    const auto factors = output_factors.get_all_and_clear();
+    std::vector<gtsam::NonlinearFactor::shared_ptr> factors;
+    std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>> delivered_anchors;
+    {
+      // Drain factors and their position-anchor metadata atomically. The
+      // health callback must never inspect an anchor that has not entered the
+      // same optimizer update yet.
+      std::lock_guard<std::mutex> lock(factor_delivery_mtx_);
+      factors = output_factors.get_all_and_clear();
+      delivered_anchors.swap(pending_position_anchors_);
+    }
     if (!factors.empty()) {
       logger->debug("insert {} GNSS prior factors", factors.size());
       new_factors.add(factors);
@@ -313,6 +404,87 @@ public:
       // emitted counts overstate what actually reached the graph. at_exit reports
       // factors_undelivered = emitted - delivered so prep_bag can gate on it.
       factors_delivered_count += factors.size();
+    }
+    if (!delivered_anchors.empty()) {
+      std::lock_guard<std::mutex> lock(delivered_anchor_mtx_);
+      for (const auto& anchor : delivered_anchors) {
+        if (delivered_anchor_positions_.size() <= anchor.submap_id) {
+          delivered_anchor_positions_.resize(
+            anchor.submap_id + 1,
+            Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
+        }
+        delivered_anchor_positions_[anchor.submap_id] = anchor.position;
+      }
+    }
+  }
+
+  void on_update_submaps(const std::vector<SubMap::Ptr>& updated_submaps) {
+    if (anchor_abort_median_m <= 0.0) {
+      return;
+    }
+
+    // This callback runs synchronously AFTER the global iSAM2 update and after
+    // T_world_origin has been refreshed from the optimized Values. The old
+    // gate ran in backend_task before the factors reached iSAM2 and therefore
+    // measured GNSS corrections against stale raw-LIO insertion snapshots.
+    // That rejected healthy maps precisely when GNSS was doing its job.
+    std::vector<double> ordered;
+    ordered.reserve(static_cast<size_t>(anchor_residual_window));
+    {
+      std::lock_guard<std::mutex> lock(delivered_anchor_mtx_);
+      for (auto it = updated_submaps.rbegin();
+           it != updated_submaps.rend() &&
+           ordered.size() < static_cast<size_t>(anchor_residual_window);
+           ++it) {
+        const auto& submap = *it;
+        if (submap->id < 0) {
+          continue;
+        }
+        const size_t submap_id = static_cast<size_t>(submap->id);
+        if (submap_id >= delivered_anchor_positions_.size()) {
+          continue;
+        }
+        const Eigen::Vector3d& anchor = delivered_anchor_positions_[submap_id];
+        if (!anchor.allFinite()) {
+          continue;
+        }
+        ordered.push_back((submap->T_world_origin.translation() - anchor).norm());
+      }
+    }
+
+    if (ordered.size() < static_cast<size_t>(anchor_residual_min_samples)) {
+      return;
+    }
+    const size_t middle = ordered.size() / 2;
+    std::nth_element(ordered.begin(), ordered.begin() + middle, ordered.end());
+    anchor_residual_median_m.store(ordered[middle]);
+    if (anchor_residual_median_m.load() > anchor_abort_median_m) {
+      const int streak = anchor_abort_streak.fetch_add(1) + 1;
+      if (streak == 1 && anchor_abort_consecutive_updates > 1) {
+        logger->warn(
+          "GNSS optimized-anchor residual is transiently high: rolling median {:.3f} m > "
+          "{:.3f} m over {} optimized submaps (streak 1/{})",
+          anchor_residual_median_m.load(),
+          anchor_abort_median_m,
+          ordered.size(),
+          anchor_abort_consecutive_updates);
+      }
+      if (streak >= anchor_abort_consecutive_updates) {
+        const bool was_healthy = healthy_.exchange(false);
+        if (!was_healthy) {
+          return;
+        }
+        logger->critical(
+          "GNSS optimized-anchor divergence gate FAILED: rolling median {:.3f} m > {:.3f} m "
+          "over {} optimized submaps for {} consecutive global updates; stopping before a "
+          "warped map is admitted",
+          anchor_residual_median_m.load(),
+          anchor_abort_median_m,
+          ordered.size(),
+          streak);
+      }
+    } else {
+      anchor_abort_streak.store(0);
     }
   }
 
@@ -470,22 +642,42 @@ public:
       if (!transformation_initialized && !submaps.empty() &&
           (submap_t_snap.back() - submap_t_snap.front()).norm() > min_baseline &&
           (submap_coords.back().position - submap_coords.front().position).norm() > min_baseline) {
+        // Keep the legacy all-history fit unless the run-local quality profile
+        // opts into startup-transient rejection. In recent-window mode, move
+        // the left edge forward as far as possible while BOTH endpoint
+        // displacements remain above min_baseline. This selects the newest
+        // well-observed segment without assuming a sensor rate or hard-coding
+        // a dataset-specific time/count window.
+        size_t fit_begin = 0;
+        if (fit_recent_baseline_window) {
+          while (fit_begin + 2 < submaps.size() &&
+                 (submap_t_snap.back() - submap_t_snap[fit_begin + 1]).norm() > min_baseline &&
+                 (submap_coords.back().position - submap_coords[fit_begin + 1].position).norm() > min_baseline) {
+            ++fit_begin;
+          }
+        }
+        const size_t fit_count = submaps.size() - fit_begin;
+        const double estimate_baseline =
+          (submap_t_snap.back() - submap_t_snap[fit_begin]).norm();
+        const double gnss_baseline =
+          (submap_coords.back().position - submap_coords[fit_begin].position).norm();
+
         Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
+        for (size_t i = fit_begin; i < submaps.size(); i++) {
           mean_est += submap_t_snap[i];
           mean_gnss += submap_coords[i].position;
         }
-        mean_est /= submaps.size();
-        mean_gnss /= submaps.size();
+        mean_est /= static_cast<double>(fit_count);
+        mean_gnss /= static_cast<double>(fit_count);
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
+        for (size_t i = fit_begin; i < submaps.size(); i++) {
           const Eigen::Vector3d centered_est = submap_t_snap[i] - mean_est;
           const Eigen::Vector3d centered_gnss = submap_coords[i].position - mean_gnss;
           cov += centered_gnss * centered_est.transpose();
         }
-        cov /= submaps.size();
+        cov /= static_cast<double>(fit_count);
 
         const Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov.block<2, 2>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
         const Eigen::Matrix2d U = svd.matrixU();
@@ -509,16 +701,23 @@ public:
         // RMS residual is too large — retry next cycle with more/better data
         // instead of latching a bad transform.
         double sum_sq = 0.0;
-        for (int i = 0; i < submaps.size(); i++) {
+        for (size_t i = fit_begin; i < submaps.size(); i++) {
           const Eigen::Vector3d pred = T_utm_world * submap_t_snap[i];  // world -> utm
           sum_sq += (pred - submap_coords[i].position).squaredNorm();
         }
-        const double rms = std::sqrt(sum_sq / static_cast<double>(submaps.size()));
+        const double rms = std::sqrt(sum_sq / static_cast<double>(fit_count));
         if (fit_max_rms > 0.0 && rms > fit_max_rms) {
           logger->warn(
             "T_world_utm one-shot fit REJECTED: RMS residual {:.3f} m > max {:.3f} m "
-            "(drifted/frozen GNSS or poor geometry) — not latching; will retry with more data",
-            rms, fit_max_rms);
+            "over fit window [{}..{}] ({} samples, estimate/GNSS baselines {:.3f}/{:.3f} m) "
+            "— not latching; will retry with more data",
+            rms,
+            fit_max_rms,
+            fit_begin,
+            submaps.size() - 1,
+            fit_count,
+            estimate_baseline,
+            gnss_baseline);
         } else {
           {
             std::lock_guard<std::mutex> lock(T_world_utm_mtx_);
@@ -526,15 +725,33 @@ public:
           }
           fit_rms_m.store(rms);
 
-          for (int i = 0; i < submaps.size(); i++) {
+          for (size_t i = fit_begin; i < submaps.size(); i++) {
             const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].position;
             logger->debug("submap={} gnss={}", convert_to_string(submap_t_snap[i]), convert_to_string(gnss));
           }
 
-          logger->info("T_world_utm={} (one-shot fit RMS residual {:.3f} m)", convert_to_string(T_world_utm), rms);
+          logger->info(
+            "T_world_utm={} (one-shot fit RMS residual {:.3f} m over window [{}..{}], "
+            "{} samples, estimate/GNSS baselines {:.3f}/{:.3f} m)",
+            convert_to_string(T_world_utm),
+            rms,
+            fit_begin,
+            submaps.size() - 1,
+            fit_count,
+            estimate_baseline,
+            gnss_baseline);
           {
             std::lock_guard<std::mutex> lock(T_world_utm_mtx_);
             transformation_initialized = true;  // published under the same lock as the matrix
+          }
+          // Do not backfill startup submaps that were deliberately excluded
+          // from the accepted fit. They remain connected by LiDAR+IMU odometry
+          // and later global constraints; forcing them through a transform
+          // whose fit rejected that transient would immediately recreate the
+          // map-warp condition the anchor health gate is intended to catch.
+          if (fit_recent_baseline_window) {
+            factored_submap_count = fit_begin;
+            submaps_unanchored_pre_fit.store(fit_begin);
           }
         }
       }
@@ -553,10 +770,33 @@ public:
           const Eigen::Vector3d xyz = T_world_utm * gnss.position;
           logger->debug("submap={} gnss={}", convert_to_string(submap_t_snap[i]), convert_to_string(xyz));
 
-          // note: should use a more accurate information matrix
-          const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
-          output_factors.push_back(
-            gtsam::NonlinearFactor::shared_ptr(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model)));
+          // Use the receiver/selector covariance, but keep it inside the
+          // proven mapping envelope. The lower bound avoids an effectively
+          // unanchored graph; the cap prevents millimetre covariance (or an
+          // overconfident source switch) from snapping the LIO chain.
+          Eigen::Vector3d position_precision = prior_inf_scale;
+          if (adaptive_position_prior) {
+            position_precision = prior_inf_floor;
+            for (int axis = 0; axis < 3; ++axis) {
+              const double variance = gnss.position_var[axis];
+              if (std::isfinite(variance) && variance > 0.0) {
+                position_precision[axis] = std::clamp(1.0 / variance, prior_inf_floor[axis], prior_inf_cap[axis]);
+              }
+            }
+          }
+          gtsam::SharedNoiseModel model = gtsam::noiseModel::Diagonal::Precisions(position_precision);
+          if (position_prior_robust_width > 0.0) {
+            model = gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(position_prior_robust_width), model);
+          }
+          const auto position_factor =
+            gtsam::NonlinearFactor::shared_ptr(
+              new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+          {
+            std::lock_guard<std::mutex> lock(factor_delivery_mtx_);
+            output_factors.push_back(position_factor);
+            pending_position_anchors_.push_back(
+              {static_cast<size_t>(submap->id), xyz});
+          }
           ++position_factor_count;
 
           // P5#1 yaw-quality gate: skip the heading prior when the publisher
@@ -586,6 +826,31 @@ public:
           } else if (enable_orientation_prior && !warned_missing_orientation) {
             logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
             warned_missing_orientation = true;
+          }
+
+          // A long position-only pose graph can satisfy absolute position
+          // anchors by tilting the odometry chain in roll/pitch.  The Laguna
+          // Run1 failure amplified raw LIO roll error this way, while yaw
+          // remained mostly constrained by LiDAR and loop closures.
+          //
+          // Pose3AttitudeFactor constrains only the measured body-Z direction
+          // in the world. It supplies the missing gravity evidence without
+          // pinning GNSS yaw. This is opt-in because a generic pose publisher
+          // may use identity as an "orientation unavailable" placeholder.
+          if (gravity_prior_sigma_deg > 0.0 && gnss.has_orientation) {
+            const Eigen::Matrix3d R_world_gnss =
+              T_world_utm.linear() * gnss.orientation.toRotationMatrix();
+            const Eigen::Vector3d world_body_z =
+              R_world_gnss * Eigen::Vector3d::UnitZ();
+            const double gravity_sigma_rad =
+              gravity_prior_sigma_deg * M_PI / 180.0;
+            const auto gravity_model =
+              gtsam::noiseModel::Isotropic::Sigma(2, gravity_sigma_rad);
+            output_factors.push_back(
+              gtsam::NonlinearFactor::shared_ptr(
+                new gtsam::Pose3AttitudeFactor(
+                  X(submap->id), gtsam::Unit3(world_body_z), gravity_model)));
+            ++gravity_factor_count;
           }
         }
         factored_submap_count = submaps.size();
@@ -642,7 +907,21 @@ private:
     return c35 > 0.0 ? c35 : -1.0;
   }
 
-  void push_gnss_data(double stamp, double x, double y, double z, double qx, double qy, double qz, double qw, double yaw_var = -1.0) {
+  static double sanitize_position_var(double variance) { return std::isfinite(variance) && variance > 0.0 ? variance : -1.0; }
+
+  void push_gnss_data(
+    double stamp,
+    double x,
+    double y,
+    double z,
+    double qx,
+    double qy,
+    double qz,
+    double qw,
+    double var_x = -1.0,
+    double var_y = -1.0,
+    double var_z = -1.0,
+    double yaw_var = -1.0) {
     // [P2 FIX 2026-07-09] Fail closed on non-finite input. A single NaN
     // position either poisons the one-shot T_world_utm fit (latched true
     // forever) or reaches iSAM2 as a NaN factor and destroys the graph.
@@ -658,6 +937,7 @@ private:
     GNSSData gnss_data;
     gnss_data.stamp = stamp;
     gnss_data.position << x, y, z;
+    gnss_data.position_var << sanitize_position_var(var_x), sanitize_position_var(var_y), sanitize_position_var(var_z);
     gnss_data.yaw_var = yaw_var;
 
     Eigen::Quaterniond orientation(qw, qx, qy, qz);
@@ -693,6 +973,9 @@ private:
     GNSSData interpolated;
     interpolated.stamp = stamp;
     interpolated.position = (1.0 - p) * left.position + p * right.position;
+    for (int axis = 0; axis < 3; ++axis) {
+      interpolated.position_var[axis] = left.position_var[axis] > 0.0 && right.position_var[axis] > 0.0 ? std::max(left.position_var[axis], right.position_var[axis]) : -1.0;
+    }
     interpolated.has_orientation = left.has_orientation && right.has_orientation;
     if (interpolated.has_orientation) {
       interpolated.orientation = left.orientation.slerp(p, right.orientation).normalized();
@@ -721,11 +1004,17 @@ private:
   // [P3 FIX 2026-07-10] guards T_world_utm/transformation_initialized between
   // the backend writer and at_exit (main thread) — see at_exit.
   std::mutex T_world_utm_mtx_;
+  std::mutex factor_delivery_mtx_;
+  std::mutex delivered_anchor_mtx_;
   std::thread thread;
 
   ConcurrentVector<GNSSData, Eigen::aligned_allocator<GNSSData>> input_gnss_queue;
   ConcurrentVector<QueuedSubmap> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
+  std::vector<PendingPositionAnchor, Eigen::aligned_allocator<PendingPositionAnchor>>
+    pending_position_anchors_;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>
+    delivered_anchor_positions_;
 
   std::vector<SubMap::ConstPtr> submaps;
   std::vector<GNSSData, Eigen::aligned_allocator<GNSSData>> submap_coords;
@@ -738,10 +1027,20 @@ private:
   std::string gnss_topic;
   std::string gnss_msg_type;
   Eigen::Vector3d prior_inf_scale;
+  Eigen::Vector3d prior_inf_floor;
+  Eigen::Vector3d prior_inf_cap;
+  bool adaptive_position_prior;
+  double position_prior_robust_width;
+  double anchor_abort_median_m;
+  int anchor_residual_window;
+  int anchor_residual_min_samples;
+  int anchor_abort_consecutive_updates;
   bool enable_orientation_prior;
   Eigen::Vector3d orientation_prior_inf_scale;
   double orientation_prior_max_yaw_sigma_deg;  // P5#1 yaw-quality gate (<=0 disables)
+  double gravity_prior_sigma_deg;               // body-Z sigma; <=0 disables
   double min_baseline;
+  bool fit_recent_baseline_window;
   double max_interp_gap_sec;  // P1 fix: max GNSS bracket width for association (<=0 disables)
   double fit_max_rms;         // [P3 FIX 2026-07-14] max post-fit RMS residual to latch (<=0 disables)
 
@@ -754,6 +1053,7 @@ private:
   std::atomic<uint64_t> yaw_gate_skip_count{0};       // heading priors skipped by the gate
   std::atomic<uint64_t> position_factor_count{0};     // GNSS position priors emitted
   std::atomic<uint64_t> orientation_factor_count{0};  // heading priors emitted
+  std::atomic<uint64_t> gravity_factor_count{0};      // roll/pitch priors emitted
   std::atomic<uint64_t> factors_delivered_count{0};   // priors actually inserted into the graph
   std::atomic<uint64_t> gap_unanchored_count{0};      // submaps skipped: bracket > max_interp_gap
   std::atomic<uint64_t> nonmonotonic_drop_count{0};   // GNSS samples dropped: stamp regression
@@ -766,7 +1066,11 @@ private:
   std::atomic<uint64_t> submaps_seen{0};                 // submaps received from sub-mapping
   std::atomic<uint64_t> submaps_dropped_pre_gnss{0};     // popped: created before the oldest GNSS
   std::atomic<uint64_t> submaps_dropped_no_bracket{0};   // popped: no valid GNSS bracket
+  std::atomic<uint64_t> submaps_unanchored_pre_fit{0};   // startup transient excluded by recent fit window
   std::atomic<double> fit_rms_m{-1.0};                   // post-fit RMS residual of the latched T_world_utm
+  std::atomic<double> anchor_residual_median_m{-1.0};
+  std::atomic<int> anchor_abort_streak{0};
+  std::atomic_bool healthy_{true};
 
   Eigen::Vector3d t_imu_gnss;
   bool warned_missing_orientation_for_lever_arm;

@@ -339,7 +339,30 @@ inline bool aux_buffers_ready_for_primary(
   double primary_header_s,
   const std::vector<AuxLidarSensor>& aux_sensors,
   double luminar_time_threshold) {
-  if (!primary_range.valid) return true;
+  if (!primary_range.valid) {
+    // Relative per-point time layouts (for example the Laguna decoder's
+    // FLOAT64 seconds-since-sweep-start field) cannot use the absolute
+    // point-range watermark below.  Do not release the primary immediately:
+    // that would always select the latest *past* side sweep simply because
+    // the next, closer sweep has not arrived yet.  This was the map-warping
+    // difference from perception-ws, whose merge holds front scans until a
+    // future side frame is available and then chooses the nearest corrected
+    // header stamp.
+    //
+    // Bag messages are ordered, so after each auxiliary topic has advanced to
+    // the primary header (including its scheduling-only match offset), the
+    // first future candidate is present and no later candidate can be closer
+    // than it without crossing another full scan period.  The caller's
+    // future_sweep_wait_timeout remains the fail-safe for a dead/gappy topic.
+    for (const auto& aux : aux_sensors) {
+      double newest_header_s = -std::numeric_limits<double>::infinity();
+      for (const auto& buffered : aux.buffer) {
+        newest_header_s = std::max(newest_header_s, stamp_to_sec(buffered.msg->header.stamp) + aux.match_time_offset);
+      }
+      if (newest_header_s < primary_header_s) return false;
+    }
+    return true;
+  }
   for (const auto& aux : aux_sensors) {
     if (aux.buffer.empty()) return false;
     const auto match = find_closest_luminar_sweep(

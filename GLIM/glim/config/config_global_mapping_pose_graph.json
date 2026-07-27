@@ -3,6 +3,15 @@
   // --- General settings ---
   // enable_optimization            : If false, disable optimization
   // init_pose_damping_scale        : Damping scale for initial pose (to fix the gauge freedom)
+  // optimizer_update_interval      : Number of inserted submaps per iSAM2
+  //                                   update. Does not change submap geometry;
+  //                                   optimize/save flush the final partial batch.
+  // optimizer_extra_loop_updates   : Maximum forced-relinearization iSAM2
+  //                                   passes after a batch with loop factors.
+  //                                   Stops early when no variable relinearizes;
+  //                                   0 preserves legacy single-pass updates.
+  // offload_points_dir             : Absolute, empty per-run directory used to
+  //                                   spill dense submap points. Empty disables.
   //
   // --- Loop detection settings ---
   // registration_type              : Registration type for loop detection (GICP or VGICP)
@@ -15,11 +24,29 @@
   // vgicp_voxel_resolution         : Voxel resolution for VGICP
   // 
   // --- Factor settings ---
-  // odom_factor_stddev             : Standard deviation for odometry factor
+  // odom_factor_stddev             : Legacy isotropic odometry standard
+  //                                   deviation, used as the fallback for the
+  //                                   two settings below
+  // odom_rotation_stddev           : Rotation standard deviation (radians)
+  // odom_translation_stddev        : Translation standard deviation (metres)
   // loop_factor_stddev             : Standard deviation for loop factor
   // loop_factor_robust_width       : Robust kernel width for loop factor
   // loop_candidate_buffer_size     : Buffer size for loop candidates
   // loop_candidate_eval_per_thread : Number of loop candidate evaluation per thread and per cycle
+  // max_loop_candidates_per_source : Deterministically keep the closest N
+  //                                   candidates per loop source. 0 preserves
+  //                                   legacy unlimited behavior.
+  // loop_max_translation_correction: Reject registrations whose optimized
+  //                                   relative pose translates farther than
+  //                                   this from the initial guess. 0 disables.
+  // loop_max_rotation_correction_deg: Equivalent rotation gate in degrees.
+  // loop_detection_sync_timeout_sec: Before each optimizer update, wait this
+  //                                   long for all already-proposed loop
+  //                                   registrations to finish. 0 preserves
+  //                                   legacy asynchronous behavior.
+  // loop_registration_interval     : Keep one loop-registration source/target
+  //                                   per N geometric submaps. Does not remove
+  //                                   pose-graph nodes or dense map points.
   // 
   // --- Optimizer settings (see https://gtsam.org/doxygen/4.0.0/a03679.html) ---
   // use_isam2_dogleg               : If true, use dogleg optimizer (robust but slow)
@@ -32,7 +59,13 @@
     "so_name": "libglobal_mapping_pose_graph.so",
     // General settings
     "enable_optimization": true,
+    // The dataset-independent high-quality profile overrides this with 1.0
+    // when robust GNSS anchors are enabled. Preserve the legacy default here
+    // because a graph without absolute factors still needs a strong gauge.
     "init_pose_damping_scale": 1e6,
+    "optimizer_update_interval": 1,
+    "optimizer_extra_loop_updates": 0,
+    "offload_points_dir": "",
     // Loop detection settings
     "registration_type": "VGICP",
     "min_travel_dist": 50.0,
@@ -44,10 +77,17 @@
     "vgicp_voxel_resolution": 2.0,
     // Factor settings
     "odom_factor_stddev": 1e-3,
+    "odom_rotation_stddev": 1e-3,
+    "odom_translation_stddev": 1e-3,
     "loop_factor_stddev": 0.1,
     "loop_factor_robust_width": 1.0,
     "loop_candidate_buffer_size": 100,
     "loop_candidate_eval_per_thread": 2,
+    "max_loop_candidates_per_source": 0,
+    "loop_max_translation_correction": 0.0,
+    "loop_max_rotation_correction_deg": 0.0,
+    "loop_detection_sync_timeout_sec": 0.0,
+    "loop_registration_interval": 1,
     // Optimizer settings
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,

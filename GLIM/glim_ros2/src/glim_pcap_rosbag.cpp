@@ -933,6 +933,10 @@ int main(int argc, char** argv) {
 
   glim->wait(auto_quit);
   glim->save(dump_path);
+  if (!glim->ok()) {
+    spdlog::error("run rejected by a mapping quality/safety extension — partial dump saved, exiting nonzero");
+    return 1;
+  }
   // [P3 FIX 2026-07-10] Mid-run schema/hard errors keep the partial dump (it
   // may still be useful for debugging) but MUST exit nonzero so pipelines do
   // not mistake it for a complete map.
