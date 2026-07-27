@@ -224,8 +224,8 @@ void GlobalMappingPoseGraph::update_optimizer() {
     return;
   }
 
+  gtsam_points::ISAM2ResultExt result;
   try {
-    gtsam_points::ISAM2ResultExt result;
 #ifdef GTSAM_USE_TBB
     auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
     arena->execute([&] {
@@ -279,9 +279,13 @@ void GlobalMappingPoseGraph::update_optimizer() {
       }
     }
 
-  } catch (std::exception& e) {
+  } catch (const std::exception& e) {
     logger->error("an exception was caught during global map optimization!!");
     logger->error(e.what());
+    // Extensions may have appended factors in on_smoother_update(). Tell them
+    // explicitly that this transaction did not complete; otherwise handoff
+    // accounting can claim factors that were discarded with new_factors below.
+    Callbacks::on_smoother_update_failure(*isam2, e.what());
   }
   new_values.reset(new gtsam::Values);
   new_factors.reset(new gtsam::NonlinearFactorGraph);

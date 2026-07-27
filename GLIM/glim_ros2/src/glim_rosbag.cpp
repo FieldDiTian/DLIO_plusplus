@@ -1240,6 +1240,14 @@ int main(int argc, char** argv) {
   glim->wait(auto_quit);
   glim->save(dump_path);
 
+  const size_t num_submaps = glim->num_submaps();
+  if (num_submaps == 0) {
+    spdlog::critical(
+      "mapping produced zero submaps — input was empty/filtered or odometry "
+      "never initialized; partial dump kept, exiting nonzero");
+    return 1;
+  }
+
   if (!glim->ok()) {
     spdlog::error("run rejected by a mapping quality/safety extension — partial dump saved, exiting nonzero");
     return 1;

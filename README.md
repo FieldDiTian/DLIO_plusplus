@@ -348,10 +348,14 @@ yaw; leave it at `0` for position-only GNSS publishers or publishers that use
 an identity quaternion to mean "orientation unavailable".
 The baseline can be injected with `--gnss-min-baseline`; its default matches the
 successful perception-ws Laguna configuration. The high-quality profile fits
-the newest segment that still spans that baseline on both trajectories, so a
-stationary/low-speed startup does not dominate the one-shot alignment. Use
-`--no-gnss-recent-fit-window` for the legacy all-history behavior, and inject
-its acceptance gate with `--gnss-fit-max-rms` (default `0.25 m`).
+the newest segment that still spans that baseline on both trajectories while
+retaining at least `--gnss-fit-min-samples 20`. It excludes the newest
+`--gnss-fit-validation-samples 10` from the fit and must predict that suffix
+within `--gnss-fit-max-rms 0.25 m`, in addition to passing the same in-sample
+RMS gate. This prevents a two-point/recent-window fit and catches growing
+estimate-side heading drift that a rigid in-sample alignment can absorb. Use
+`--no-gnss-recent-fit-window` for an all-history training prefix; held-out
+validation and the sample minimum still apply.
 `--offload-dir` must be an absolute, empty, per-run directory; GLIM refuses
 stale contents.
 
