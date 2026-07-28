@@ -290,26 +290,49 @@ If you ever switch sensors and the deskew looks wrong, use the one-shot diagnost
    every source range, datum, transform, and filter count.
 6. **Localize** online against that PCD with `gicp_localization`/`GICP_plusplus`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. Because the exported map is genuinely ENU, Atlas seeds/GT are frame-correct directly — and `localization/utm_transform_path` must stay **EMPTY** (it exists only for legacy world-frame maps and would double-transform an ENU map).
 
-7. **Audit the compressed map at real time** with the repository runner. It
+7. **Prepare a deterministic real-time replay input.** Topic filtering at
+   `ros2 bag play` time still makes the player scan unrelated messages in large
+   camera/multi-LiDAR bags. Build one compressed MCAP containing only the
+   online-localization input contract before the audit:
+   ```bash
+   python3 scripts/prepare_gicp_replay_bag.py \
+     --bag /path/to/DATASET_ROOT/<collection>/<run>/filtered/all \
+     --bag /path/to/DATASET_ROOT/<collection>/<run>/navigation_bag \
+     --out /path/to/DATASET_ROOT/prep_bag/<run>_front_atlas_gicp
+   ```
+   The helper refuses cross-dataset inputs and outputs, retains only the
+   `/luminar_front/points`, `/gps_p1/imu`, and `/gps_p1/filtered_odom`
+   streams with their full message counts, and records input/config hashes
+   plus `ros2 bag info`. This step
+   changes only the offline I/O envelope; live-car localization still consumes
+   those three topics directly.
+
+8. **Audit the compressed map at real time** with the repository runner. It
    derives `DATASET_ROOT` from `--map-dir`, refuses to overwrite an existing
    result, and writes the debug/reference bags, logs, resource samples,
    machine-readable run status and scan scorecard under that dataset's
-   `gicp_result/`:
+   `gicp_result/intermediate/`. Promote a run to `gicp_result/` only after
+   manual log, bag, status, and metric audit passes:
    ```bash
    scripts/run_gicp_replay_audit.sh \
      --map-dir /path/to/DATASET_ROOT/maps/<compressed-map> \
-     --bag /path/to/lidar-bag \
-     --bag /path/to/navigation-bag \
+     --bag /path/to/DATASET_ROOT/prep_bag/<run>_front_atlas_gicp \
      --run-name <run>_compressed_full_1x \
      --overlay /path/to/gicp/install/setup.bash \
+     --config-path GICP_plusplus/cfg/front_quality_replay.yaml \
      --start-offset 0 \
      --duration <full-overlap-seconds> \
      --rate 1.0 \
-     --primary-queue-size 8
+     --primary-queue-size 32
    ```
    The offline audit uses RELIABLE LiDAR publication/subscription on both
    sides so a large PointCloud2 cannot disappear in DDS without accounting.
-   Live sensors keep the default BEST_EFFORT profile and the same queue depth.
+   Its 50,000-message rosbag read-ahead queue keeps storage/decompression
+   latency out of the 10 Hz delivery schedule. A bounded 32-frame offline
+   compute queue absorbs rosbag delivery bursts without hiding registration
+   cost: the audit must independently report GICP P95/max below 100 ms and
+   zero overload drops. Live sensors keep BEST_EFFORT and the default
+   8-frame queue.
    The online localization contract remains front LiDAR only; the map itself
    is built from all configured LiDARs.
 
@@ -319,7 +342,7 @@ If you ever switch sensors and the deskew looks wrong, use the one-shot diagnost
    `--bridge-arg` for its explicit input topic, output topic, XYZ offset and
    frame. The runner never embeds a site-specific transform.
 
-8. **Render the audited result from above.** The plotting tool reads the
+9. **Render the audited result from above.** The plotting tool reads the
    runner's two output bags and map directly, writes a full-run image plus
    complete-lap images, and records the exact input hashes and lap boundaries
    in `trajectory_manifest.json`:

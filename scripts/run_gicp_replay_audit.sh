@@ -3,7 +3,8 @@
 #
 # The runner is dataset-independent. It derives DATASET_ROOT from --map-dir or
 # --map when possible and writes to DATASET_ROOT/gicp_result unless --out-root
-# is supplied. Multiple --bag arguments are passed to ros2 bag play as inputs.
+# is supplied. Unaudited runs default to DATASET_ROOT/gicp_result/intermediate.
+# Multiple --bag arguments are passed to ros2 bag play as inputs.
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -19,7 +20,7 @@ usage() {
     '  --duration SECONDS           playback duration' \
     '' \
     'Common options:' \
-    '  --out-root DIR               defaults to DATASET_ROOT/gicp_result' \
+    '  --out-root DIR               defaults to DATASET_ROOT/gicp_result/intermediate' \
     '  --start-offset SECONDS       default 0' \
     '  --rate RATE                  default 1.0' \
     '  --domain-id ID               default 177' \
@@ -28,6 +29,8 @@ usage() {
     '  --gt-topic TOPIC             default /gps_p1/filtered_odom' \
     '  --reference-topic TOPIC      defaults to --gt-topic' \
     '  --primary-queue-size N       default 8' \
+    '  --read-ahead-queue-size N    rosbag playback prefetch; default 50000' \
+    '  --config-path YAML           run-local overrides loaded after package defaults' \
     '  --qos-overrides YAML         optional publisher QoS override' \
     '  --play-topic TOPIC           repeat to replace the default topic set' \
     '  --bridge-script FILE         optional preprocessing/offset ROS node' \
@@ -49,6 +52,8 @@ IMU_TOPIC=/gps_p1/imu
 GT_TOPIC=/gps_p1/filtered_odom
 REFERENCE_TOPIC=
 PRIMARY_QUEUE_SIZE=8
+READ_AHEAD_QUEUE_SIZE=50000
+CONFIG_PATH=
 FUTURE_AUX_WAIT_TIMEOUT_S=0.150
 LIDAR_CONCAT_ENABLED=false
 REQUIRE_ALL_AUX=false
@@ -77,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --gt-topic) GT_TOPIC="${2:?missing value}"; shift 2 ;;
     --reference-topic) REFERENCE_TOPIC="${2:?missing value}"; shift 2 ;;
     --primary-queue-size) PRIMARY_QUEUE_SIZE="${2:?missing value}"; shift 2 ;;
+    --read-ahead-queue-size) READ_AHEAD_QUEUE_SIZE="${2:?missing value}"; shift 2 ;;
+    --config-path) CONFIG_PATH="${2:?missing value}"; shift 2 ;;
     --future-aux-wait-timeout) FUTURE_AUX_WAIT_TIMEOUT_S="${2:?missing value}"; shift 2 ;;
     --lidar-concat-enabled) LIDAR_CONCAT_ENABLED="${2:?missing value}"; shift 2 ;;
     --require-all-aux) REQUIRE_ALL_AUX="${2:?missing value}"; shift 2 ;;
@@ -106,6 +113,11 @@ if [[ ${#BAGS[@]} -eq 0 ]]; then
   printf 'At least one --bag is required\n' >&2
   exit 2
 fi
+if [[ ! "$PRIMARY_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ||
+      ! "$READ_AHEAD_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Queue sizes must be positive integers\n' >&2
+  exit 2
+fi
 
 MAP="$(realpath -e "$MAP")"
 OVERLAY="$(realpath -e "$OVERLAY")"
@@ -117,6 +129,9 @@ if [[ -n "$QOS_OVERRIDES" ]]; then
 fi
 if [[ -n "$BRIDGE_SCRIPT" ]]; then
   BRIDGE_SCRIPT="$(realpath -e "$BRIDGE_SCRIPT")"
+fi
+if [[ -n "$CONFIG_PATH" ]]; then
+  CONFIG_PATH="$(realpath -e "$CONFIG_PATH")"
 fi
 
 if [[ "$MAP" == */maps/* ]]; then
@@ -131,7 +146,7 @@ if [[ -z "$OUT_ROOT" ]]; then
     printf 'Could not derive DATASET_ROOT from map path; pass --out-root explicitly\n' >&2
     exit 2
   fi
-  OUT_ROOT="$DATASET_ROOT/gicp_result"
+  OUT_ROOT="$DATASET_ROOT/gicp_result/intermediate"
 fi
 OUT_ROOT="$(realpath -m "$OUT_ROOT")"
 RUN_DIR="$OUT_ROOT/$RUN_NAME"
@@ -232,6 +247,7 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
   lidar_reliable_qos:="$LIDAR_RELIABLE_QOS" \
   future_aux_wait_timeout_s:="$FUTURE_AUX_WAIT_TIMEOUT_S" \
   primary_queue_size:="$PRIMARY_QUEUE_SIZE" \
+  config_path:="$CONFIG_PATH" \
   >"$RUN_DIR/localization.log" 2>&1 &
 launch_pid=$!
 
@@ -276,6 +292,7 @@ for bag in "${BAGS[@]}"; do
   play_args+=(-i "$bag" "$STORAGE_ID")
 done
 play_args+=(
+  --read-ahead-queue-size "$READ_AHEAD_QUEUE_SIZE"
   --rate "$RATE"
   --start-offset "$START_OFFSET"
   --playback-duration "$DURATION"
@@ -332,6 +349,11 @@ play_wall_s="$(awk -v start="$play_start_ns" -v end="$play_end_ns" \
   printf 'lidar_reliable_qos=%s\n' "$LIDAR_RELIABLE_QOS"
   printf 'future_aux_wait_timeout_s=%s\n' "$FUTURE_AUX_WAIT_TIMEOUT_S"
   printf 'primary_queue_size=%s\n' "$PRIMARY_QUEUE_SIZE"
+  printf 'read_ahead_queue_size=%s\n' "$READ_AHEAD_QUEUE_SIZE"
+  printf 'config_path=%s\n' "$CONFIG_PATH"
+  if [[ -n "$CONFIG_PATH" ]]; then
+    printf 'config_sha256=%s\n' "$(sha256sum "$CONFIG_PATH" | awk '{print $1}')"
+  fi
   printf 'pointcloud_topic=%s\n' "$POINTCLOUD_TOPIC"
   printf 'imu_topic=%s\n' "$IMU_TOPIC"
   printf 'gt_topic=%s\n' "$GT_TOPIC"

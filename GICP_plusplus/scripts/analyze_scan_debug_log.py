@@ -41,14 +41,14 @@ ROW = re.compile(
     r"SCAN DEBUG \| status=(?P<status>\w+) stamp=(?P<stamp>[\d.]+)"
     r".*?guess=\{xyz=\[(?P<gx>[-\d.,]+)\] rpy_deg=\[(?P<grpy>[-\d.,]+)\]\}"
     r".*?gicp_ms=(?P<ms>[-\d.]+|n/a)"
-    r".*?fitness=(?P<fit>[-\d.eE+]+|n/a)"
-    r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a))?"
+    r".*?fitness=(?P<fit>[-\d.eE+]+|n/a|nan|inf)"
+    r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a|nan|inf))?"
     r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d)(?:,rp_clamp=(?P<rpc>\d))?,partial=(?P<pu>\d)\])?"
     r"(?:.*?yaw_innov=\[(?P<yi>-?[\d.]+|nan)deg,fin=(?P<yif>-?[\d.]+|nan)deg\])?"
     r"(?:.*?yaw_stiff=(?P<ys>-?[\d.]+|n/a))?"
     r"(?:.*?ins_dyaw=(?P<idy>-?(?:[\d.]+|nan(?:\(ind\))?))deg)?"
     r"(?:.*?concat=\[(?P<cn>-?\d+)/(?P<ct>\d+)(?P<cdetail>[^\]]*)\])?"
-    r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|inf)"
+    r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|nan|inf)"
     r"(?:.*?gt_err=\[(?P<gtp>[\d.]+)m,(?P<gtr>[\d.]+)deg)?"
 )
 

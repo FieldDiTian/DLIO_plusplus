@@ -527,6 +527,11 @@
     # Match the deployed perception-ws Laguna localizer. Fifty iterations
     # leaves ample convergence margin while bounding the 10 Hz CPU deadline.
     gicp/maxIterations: 50
+    # Optional iterative-optimizer wall-clock budget in milliseconds. Zero
+    # preserves the historical unbounded behavior; replay/site profiles may
+    # set a finite budget so a pathological basin fails closed at the INS
+    # prior instead of blocking the sensor pipeline.
+    gicp/maxOptimizationTimeMs: 0.0
 
     # Number of neighbors used to compute per-point covariances (typical: 20)
     gicp/correspondenceRandomness: 10
@@ -717,6 +722,12 @@
                                                     #  keeping scan-time and IMU-rate output consistent.
                                                     #  Numeric ins_prior params are sanitized at load:
                                                     #  out-of-range values warn and fall back to defaults.
+    # Atlas translation may optionally seed the GICP optimizer without
+    # shifting basePose/state/output. The point-cloud result must still pass
+    # support, jump, and wrong-basin gates. This keeps Atlas in the
+    # initialization/validation role instead of blending it into localization.
+    localization/ins_prior/gicp_position_seed_blend: 0.0
+    localization/ins_prior/gicp_position_seed_max_step_m: 20.0
     localization/ins_prior/require_rtk_fixed: true  # consume RTK-quality samples only
     # Heading-quality gate (REVIEW FIX 2026-07-08), mirroring GLIM gnss_global's
     # orientation_prior_max_yaw_sigma_deg. require_rtk_fixed above gates on

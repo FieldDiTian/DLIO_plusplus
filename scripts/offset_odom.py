@@ -104,6 +104,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception:
+        # SIGINT can invalidate the rclpy context while the executor is
+        # rebuilding its wait set, which Jazzy reports as RCLError rather than
+        # ExternalShutdownException. Suppress only that shutdown race.
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

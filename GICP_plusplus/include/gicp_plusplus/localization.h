@@ -740,6 +740,7 @@ private:
 
   // GICP parameters
   int gicp_max_iter_;
+  double gicp_max_optimization_time_ms_;
   int gicp_corr_randomness_;
   double gicp_max_corr_dist_;
   double gicp_transformation_epsilon_;
@@ -787,6 +788,8 @@ private:
   double ins_prior_max_yaw_step_deg_;     // hard cap on the per-scan yaw correction
   double ins_prior_sanity_max_yaw_deg_;   // above this, warn and do NOT apply (frame/INS fault)
   double ins_prior_pos_blend_;            // optional position pull toward INS (0 = off)
+  double ins_prior_gicp_position_seed_blend_;  // Atlas translation used only as GICP initial guess
+  double ins_prior_gicp_position_seed_max_step_m_;  // cap on that initial-guess translation
   bool ins_prior_require_rtk_;            // only consume RTK-quality samples
   double ins_prior_max_yaw_sigma_deg_;    // heading-quality gate on sqrt(cov[35]); <=0 disables
   double last_ins_yaw_diff_deg_ = std::numeric_limits<double>::quiet_NaN();  // diagnostic

@@ -50,6 +50,7 @@ def generate_launch_description():
     future_aux_wait_timeout_s = LaunchConfiguration(
         'future_aux_wait_timeout_s', default='0.150')
     primary_queue_size = LaunchConfiguration('primary_queue_size', default='8')
+    config_path = LaunchConfiguration('config_path', default='')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -100,8 +101,14 @@ def generate_launch_description():
                     'Front-only releases immediately; keep 0.150 s online for concat.')
     declare_primary_queue_size_arg = DeclareLaunchArgument(
         'primary_queue_size', default_value=primary_queue_size,
-        description='Bounded pending-primary queue. Keep 8 online; a lossless slowed '
-                    'offline audit may use a deeper queue.')
+        description='Bounded pending-primary compute queue. Keep 8 live; a lossless '
+                    'offline replay may use a larger bounded queue for rosbag bursts '
+                    'while separately auditing scan latency and overload drops.')
+    declare_config_path_arg = DeclareLaunchArgument(
+        'config_path', default_value=config_path,
+        description='Optional run-local YAML loaded after the package default. '
+                    'Use this for reproducible quality profiles without editing '
+                    'the installed localization.yaml.')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -158,6 +165,7 @@ def generate_launch_description():
     # GICP Localization Node
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
+        config_path_value = LaunchConfiguration('config_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         # Same av24.urdf the robot_state_publisher uses: hand the localization node
         # the resolved ABSOLUTE path so lidar_concat resolves aux extrinsics from the
@@ -165,6 +173,14 @@ def generate_launch_description():
         urdf_file = resolve_urdf_path(context)
         params = [
             localization_yaml_path,
+        ]
+        if config_path_value:
+            config_path_value = os.path.realpath(config_path_value)
+            if not os.path.isfile(config_path_value):
+                raise RuntimeError(
+                    f"Run-local GICP config not found at '{config_path_value}'.")
+            params.append(config_path_value)
+        params.extend([
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
             {'localization/lidar_concat/enabled':
@@ -177,7 +193,7 @@ def generate_launch_description():
             {'localization/lidar_concat/primary_queue_size':
                  LaunchConfiguration('primary_queue_size')},
             {'localization/lidar_concat/urdf_path': urdf_file},
-        ]
+        ])
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
 
@@ -241,6 +257,7 @@ def generate_launch_description():
         declare_lidar_reliable_qos_arg,
         declare_future_aux_wait_timeout_arg,
         declare_primary_queue_size_arg,
+        declare_config_path_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,

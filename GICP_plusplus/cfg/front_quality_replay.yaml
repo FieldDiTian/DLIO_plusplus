@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    # High-information front-only localization profile. Atlas translation is
+    # used only to place the GICP optimizer in the correct local basin; it is
+    # never blended into basePose, observer state, or published output.
+    localization/map_voxel_size: 0.25
+    dlio/preprocessing/cropBoxFilter/size: 100.0
+    dlio/preprocessing/voxelFilter/use: true
+    dlio/preprocessing/voxelFilter/res: 0.30
+    gicp/maxIterations: 32
+    gicp/maxOptimizationTimeMs: 80.0
+
+    # Keep the deployed Laguna motion-prediction chain.
+    dlio/deskew: true
+    localization/ins_prior/enable: true
+    localization/ins_prior/gicp_position_seed_blend: 1.0
+    localization/ins_prior/gicp_position_seed_max_step_m: 20.0
+
+    # Fail closed on a map match outside the quality-gated Atlas envelope.
+    localization/gt_odom/max_candidate_position_error_m: 5.0

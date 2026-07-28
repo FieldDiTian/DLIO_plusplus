@@ -1199,6 +1199,7 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->gicp.setCorrespondenceRandomness(this->gicp_corr_randomness_);
   this->gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
   this->gicp.setMaximumIterations(this->gicp_max_iter_);
+  this->gicp.setMaximumOptimizationTimeMs(this->gicp_max_optimization_time_ms_);
   this->gicp.setTransformationEpsilon(this->gicp_transformation_epsilon_);
   this->gicp.setRotationEpsilon(this->gicp_rotation_epsilon_);
   this->gicp.setDebugPrint(this->debug_lm_print_);
@@ -1833,6 +1834,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
 
   // GICP parameters
   this->declare_parameter<int>("gicp/maxIterations", 32);
+  // Optional wall-clock budget for the iterative optimizer. Zero preserves
+  // the unbounded historical behavior. A timed-out solve fails closed at the
+  // INS prior instead of blocking LiDAR reception on a pathological basin.
+  this->declare_parameter<double>("gicp/maxOptimizationTimeMs", 0.0);
   this->declare_parameter<int>("gicp/correspondenceRandomness", 20);
   this->declare_parameter<double>("gicp/maxCorrespondenceDistance", 1.0);
   this->declare_parameter<double>("gicp/transformationEpsilon", 0.0001);
@@ -1924,10 +1929,14 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/ins_prior/max_yaw_step_deg", 2.0);
   this->declare_parameter<double>("localization/ins_prior/sanity_max_yaw_deg", 30.0);
   this->declare_parameter<double>("localization/ins_prior/pos_blend", 0.0);
+  this->declare_parameter<double>("localization/ins_prior/gicp_position_seed_blend", 0.0);
+  this->declare_parameter<double>("localization/ins_prior/gicp_position_seed_max_step_m", 20.0);
   this->declare_parameter<bool>("localization/ins_prior/require_rtk_fixed", true);
   this->declare_parameter<double>("localization/ins_prior/max_yaw_sigma_deg", 3.0);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
+  this->get_parameter("gicp/maxOptimizationTimeMs",
+                      this->gicp_max_optimization_time_ms_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
   this->get_parameter("gicp/maxCorrespondenceDistance", this->gicp_max_corr_dist_);
   this->get_parameter("gicp/transformationEpsilon", this->gicp_transformation_epsilon_);
@@ -1967,6 +1976,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("localization/ins_prior/max_yaw_step_deg", this->ins_prior_max_yaw_step_deg_);
   this->get_parameter("localization/ins_prior/sanity_max_yaw_deg", this->ins_prior_sanity_max_yaw_deg_);
   this->get_parameter("localization/ins_prior/pos_blend", this->ins_prior_pos_blend_);
+  this->get_parameter("localization/ins_prior/gicp_position_seed_blend",
+                      this->ins_prior_gicp_position_seed_blend_);
+  this->get_parameter("localization/ins_prior/gicp_position_seed_max_step_m",
+                      this->ins_prior_gicp_position_seed_max_step_m_);
   this->get_parameter("localization/ins_prior/require_rtk_fixed", this->ins_prior_require_rtk_);
   this->get_parameter("localization/ins_prior/max_yaw_sigma_deg", this->ins_prior_max_yaw_sigma_deg_);
   // [REVIEW FIX 2026-07-08 P3] Sanitize: defaults are safe, but bad YAML values
@@ -1989,13 +2002,21 @@ void gicp_plusplus::LocalizationNode::getParams() {
     sanitize("max_yaw_step_deg", this->ins_prior_max_yaw_step_deg_, 0.0, 90.0, 2.0);
     sanitize("sanity_max_yaw_deg", this->ins_prior_sanity_max_yaw_deg_, 1e-3, 180.0, 30.0);
     sanitize("pos_blend", this->ins_prior_pos_blend_, 0.0, 1.0, 0.0);
+    sanitize("gicp_position_seed_blend",
+             this->ins_prior_gicp_position_seed_blend_, 0.0, 1.0, 0.0);
+    sanitize("gicp_position_seed_max_step_m",
+             this->ins_prior_gicp_position_seed_max_step_m_, 0.0, 1000.0, 20.0);
   }
   RCLCPP_INFO(this->get_logger(),
-              "INS prior: %s (yaw_blend=%.2f, max_step=%.1fdeg, sanity=%.1fdeg, pos_blend=%.2f, rtk_only=%s, max_yaw_sigma=%.1fdeg) — "
+              "INS prior: %s (yaw_blend=%.2f, max_step=%.1fdeg, sanity=%.1fdeg, "
+              "pos_blend=%.2f, gicp_pos_seed=[blend=%.2f,max=%.1fm], "
+              "rtk_only=%s, max_yaw_sigma=%.1fdeg) — "
               "IMU=/gps_p1/imu for propagation/deskew, filtered_odom for stable heading",
               this->ins_prior_enable_ ? "ENABLED" : "disabled",
               this->ins_prior_yaw_blend_, this->ins_prior_max_yaw_step_deg_,
               this->ins_prior_sanity_max_yaw_deg_, this->ins_prior_pos_blend_,
+              this->ins_prior_gicp_position_seed_blend_,
+              this->ins_prior_gicp_position_seed_max_step_m_,
               this->ins_prior_require_rtk_ ? "yes" : "no", this->ins_prior_max_yaw_sigma_deg_);
   if (this->gicp_dof_mode_ != "6dof" && this->gicp_dof_mode_ != "4dof" && this->gicp_dof_mode_ != "3dof") {
     RCLCPP_WARN(this->get_logger(), "gicp/dof/mode '%s' unknown; falling back to 6dof",
@@ -4815,6 +4836,44 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     initial_guess = this->T_prior * T_base_lidar;
   }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
+  bool gicp_position_seed_applied = false;
+  double gicp_position_seed_step_m = 0.0;
+
+  // Optional Atlas translation INITIAL GUESS for GICP. This deliberately
+  // does not modify basePose, observer state, T_prior or the published pose:
+  // point-cloud registration must still produce a supported candidate and
+  // pass the independent wrong-basin gate. It only places the optimizer in
+  // the correct local basin when dead-reckoned position has drifted.
+  if (this->ins_prior_gicp_position_seed_blend_ > 0.0 &&
+      this->gt_odom_enabled_ && this->gt_odom_received_.load()) {
+    const double seed_stamp =
+        (this->t_prior_stamp_ > 0.0) ? this->t_prior_stamp_ : this->scan_stamp.seconds();
+    GtSample ins_seed;
+    if (this->getGtPoseAt(seed_stamp, ins_seed) &&
+        (!this->ins_prior_require_rtk_ || this->gtSampleIsRtkFixed(ins_seed))) {
+      Eigen::Vector3f ins_p;
+      Eigen::Quaternionf ins_q;
+      if (this->composeGtPoseInBase(ins_seed, ins_p, ins_q)) {
+        Eigen::Vector3f seed_delta =
+            static_cast<float>(this->ins_prior_gicp_position_seed_blend_) *
+            (ins_p - this->T_prior.block<3, 1>(0, 3));
+        const double raw_step_m = static_cast<double>(seed_delta.norm());
+        if (this->ins_prior_gicp_position_seed_max_step_m_ > 0.0 &&
+            raw_step_m > this->ins_prior_gicp_position_seed_max_step_m_) {
+          seed_delta *= static_cast<float>(
+              this->ins_prior_gicp_position_seed_max_step_m_ / raw_step_m);
+        }
+        if (seed_delta.allFinite()) {
+          initial_guess.block<3, 1>(0, 3) += seed_delta;
+          gicp_position_seed_step_m = static_cast<double>(seed_delta.norm());
+          gicp_position_seed_applied = gicp_position_seed_step_m > 0.0;
+        }
+      }
+    }
+  }
+  guess_pose_map = this->scan_in_world_frame_
+      ? (initial_guess * this->T_prior)
+      : (initial_guess * T_lidar_base);
 
   double guess_from_last_trans = 0.0;
   double guess_from_last_rot_deg = 0.0;
@@ -4862,6 +4921,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   double elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
   double fitness_score = this->gicp.getFitnessScore();
+  const bool gicp_timed_out = this->gicp.hasTimedOut();
   bool converged_precheck = this->gicp.hasConverged();
   double fitness_score_final = fitness_score;
   if (!converged_precheck) {
@@ -5425,10 +5485,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " raw=" << this->last_raw_point_count_
         << " pre=" << this->last_preprocessed_point_count_
         << " guess={" << poseSummary(guess_pose_map) << "}"
+        << " pos_seed=[" << (gicp_position_seed_applied ? 1 : 0)
+        << ",step=" << scalarSummary(gicp_position_seed_step_m) << "m]"
         << " guess_from_last=[" << scalarSummary(guess_from_last_trans) << "m,"
         << scalarSummary(guess_from_last_rot_deg) << "deg]"
         << " gicp_ms=" << scalarSummary(elapsed_ms, 2)
         << " converged=" << (converged ? "true" : "false")
+        << " timed_out=" << (gicp_timed_out ? 1 : 0)
         << " fitness=" << scalarSummary(fitness_score, 6)
         << " fit_ratio=" << scalarSummary(fitness_ratio, 3)
         << " degen=[r" << degen.degen_rot_axes << ",t" << degen.degen_trans_axes
@@ -5578,6 +5641,12 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
+  } else if (gicp_timed_out) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "GICP REJECTED (optimization wall-clock budget %.1fms exceeded): %s",
+        this->gicp_max_optimization_time_ms_,
+        build_scan_debug_log("rejected_timeout").c_str());
   } else if (!effectively_converged) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("failed_to_converge").c_str());
   } else if (gicp_rejected_gt_sanity) {
@@ -5772,6 +5841,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // reality, fitness gets worse, and the optimizer never recovers.
     ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
+                       : gicp_timed_out ? "optimization timed out"
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_gt_sanity ? "RTK candidate sanity rejected (wrong basin)"
                        : gicp_rejected_support ? "insufficient correspondence support"

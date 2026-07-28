@@ -120,6 +120,8 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
 | `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
 | `lidar_concat_enabled` | `false` | Opt in to front+left+right online GICP for synchronization/diagnostic A/B tests. Production uses a three-LiDAR offline map with front-only online GICP to meet 10 Hz. |
+| `primary_queue_size` | `8` | Bounded front compute queue. Keep 8 for live operation. A lossless offline replay may use a larger bounded queue to absorb rosbag delivery bursts, but must separately prove sub-100 ms scan compute and zero overload drops. |
+| `config_path` | empty | Optional run-local YAML loaded after the package default, used for reproducible profiles such as `cfg/front_quality_replay.yaml`. |
 | `urdf_path` | (auto-found) | Path to the URDF (`av24.urdf`) used for offline extrinsic resolution. The launch resolves it by walking up from the launch dir; `av24.urdf` is also installed into `share/gicp_plusplus`. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | `child_frame` overrides `localization/lidar_frame` (the LiDAR link the node resolves extrinsics for); `parent_frame` is declared but currently unused (no static-TF helper is launched — `robot_state_publisher` provides the URDF tree). |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
@@ -319,6 +321,24 @@ default support and physical gates catch loss of overlap or impossible motion
 without assuming a particular map's fitness scale. Score a replay with
 `scripts/analyze_scan_debug_log.py`; it reports accepted fitness and support so
 optional ratio thresholds can still be evaluated in an explicit A/B.
+
+### Compressed-map quality profile
+
+`cfg/front_quality_replay.yaml` is the checked-in Laguna compressed-map
+profile used through the launch file's `config_path` argument. It leaves the
+production motion chain enabled, uses 0.25 m target and 0.30 m source voxels
+with a 100 m sensor-frame crop, 32 iterations, and an 80 ms optimizer budget.
+Atlas translation seeds only the GICP optimizer; it never modifies
+`basePose`, observer state, or published output. Every candidate must still
+pass correspondence, physical-jump, and the unchanged 5 m Atlas wrong-basin
+gate.
+
+Use the profile with the topic-reduced replay bag and the repository audit
+runner documented in the root workflow. A rate pass requires 1.0x playback,
+zero front overload drops, and measured scan-compute latency below the 10 Hz
+deadline. The live-car queue remains 8; a lossless offline audit may use a
+larger bounded queue only to absorb rosbag delivery bursts, and must report
+that queue separately.
 
 ### Multi-LiDAR concatenation
 
