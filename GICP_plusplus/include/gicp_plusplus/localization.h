@@ -253,6 +253,11 @@ private:
   bool gt_odom_enabled_;
   size_t gt_odom_buffer_size_;
   double gt_odom_max_dt_;  // seconds; reject lookups farther than this from scan stamp
+  // Optional production sanity gate: reject a GICP candidate that is farther
+  // than this from a time-matched, RTK-quality Atlas pose. This is not a
+  // per-frame position fusion term; it only prevents a repeated-geometry
+  // wrong basin from entering the observer. 0 disables.
+  double gt_max_candidate_pos_error_m_ = 0.0;
   double gt_interp_max_gap_ = 0.5;  // [P2 FIX 2026-07-14] max bracket width for GT interpolation
   std::deque<GtSample> gt_odom_buffer_;
   std::mutex gt_odom_mtx_;
@@ -311,6 +316,10 @@ private:
   std::vector<std::unique_ptr<AuxLidar>> aux_lidars_;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_subs_;
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
+  // Live sensors commonly publish BEST_EFFORT, while lossless offline audits
+  // need RELIABLE delivery for multi-megabyte PointCloud2 bursts. The default
+  // remains the live-compatible sensor profile; replay opts in explicitly.
+  bool lidar_reliable_qos_ = false;
   bool concat_enabled_;
   double concat_time_threshold_;
   // Luminar acceptance gate: absolute point-time endpoint-range error
@@ -330,8 +339,13 @@ private:
   // dropped, and never for aux reasons.
   size_t concat_primary_queue_size_ = 8;
   size_t concat_buffer_size_;
+  // Luminar FLOAT64 time fields are scan-relative seconds by default (the
+  // Laguna decoder contract). Some drivers mislabel raw uint64 epoch-ns bits
+  // as FLOAT64; those require an explicit opt-in so ordinary doubles are
+  // never reinterpreted as multi-billion-second timestamps.
+  bool concat_float64_time_is_epoch_ns_ = false;
 
-  // ---- Async front/aux synchronizer (Luminar production path) ----
+  // ---- Async Luminar front worker / aux synchronizer ----
   // Contract: every valid front cloud is released exactly once, in order,
   // with 0..N_aux auxiliaries. Aux state can only change the source set; it
   // can never cause a front drop (front_dropped_due_to_aux == 0 by
@@ -339,6 +353,7 @@ private:
   struct PendingPrimaryCloud {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg;
     LuminarTimestampRangeNs range;  // decoded ONCE in the front callback
+    bool relative_float64_time = false;
     std::chrono::steady_clock::time_point enqueued;
     std::chrono::steady_clock::time_point deadline;
     uint64_t arrival_seq = 0;
@@ -359,7 +374,7 @@ private:
     // RELEASE_ALL_MATCHED, which reported a broken-schema stream as healthy.
     RELEASE_PRIMARY_NO_ABSTIME = 5,
   };
-  bool sync_active_ = false;        // Luminar + concat: worker owns release order
+  bool sync_active_ = false;        // Luminar: worker owns bounded front processing
   std::deque<PendingPrimaryCloud> primary_queue_;  // guarded by sync_mtx_
   std::mutex sync_mtx_;
   std::condition_variable sync_cv_;
@@ -436,6 +451,7 @@ private:
   // path. See deskewPointcloud().
   uint64_t luminar_primary_min_ts_ns_ = 0;
   bool luminar_primary_min_ts_valid_ = false;
+  bool luminar_scan_time_is_epoch_ns_ = false;
 
   // Publishers
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
@@ -805,6 +821,7 @@ private:
   double geo_observer_dt_max_;     // s   — cap on dt used in updateState corrections
   double geo_max_pos_correction_;  // m   — clamp per-update position correction (0=off)
   double geo_max_vel_correction_;  // m/s — clamp per-update velocity correction (0=off)
+  double geo_max_state_speed_;      // m/s — hard physical bound on observer speed (0=off)
   double geo_max_yaw_correction_deg_;  // deg — clamp per-update yaw error before gain (0=off) — P1 yaw-safety
   double geo_max_rot_correction_deg_;  // deg — clamp per-update total rotation error (0=off)
 

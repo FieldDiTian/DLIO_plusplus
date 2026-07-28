@@ -214,7 +214,10 @@
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
     # runs 19/20 measured 80-90 ms offsets.
-    localization/lidar_concat/aux_time_offsets: []
+    # Keep an explicitly typed vector for ROS 2 parameter parsing. An empty
+    # YAML sequence has no element type and Jazzy rejects it before node
+    # startup; zeros preserve the intended "no measured correction" behavior.
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer

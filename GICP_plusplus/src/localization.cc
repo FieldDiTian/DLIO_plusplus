@@ -18,6 +18,7 @@
 #include <Eigen/Eigenvalues>
 #include <pcl/filters/crop_box.h>
 #include <pcl/common/transforms.h>
+#include <small_gicp/util/downsampling_tbb.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -672,15 +673,13 @@ inline void clearPointTimeUnion(PointType& pt) {
 }
 
 // Decode a Luminar per-point ABSOLUTE epoch timestamp (uint64 ns) directly from
-// PointCloud2 bytes. Single source of truth for which Luminar time encodings are
-// accepted, shared by copyPointTimeFromCloud() (the per-point reader) and the
-// multi-LiDAR deskew anchor capture in mergeAuxClouds(), so the two can never
-// diverge on accepted formats. Returns false for an unsupported datatype.
-//   * UINT8[8] / FLOAT64 -> raw uint64 epoch ns (8 bytes, little-endian)
+// PointCloud2 bytes. UINT8[8] is always raw epoch-ns; FLOAT64 is raw epoch-ns
+// only under the explicit driver contract. Ordinary FLOAT64 is handled
+// separately as scan-relative seconds.
 //
-// Only 8-byte carriers are accepted because the whole Luminar path treats these
-// times as ABSOLUTE epoch ns: mergeAuxClouds() leaves them unshifted and
-// deskewPointcloud() anchors on (ts - primary_min). A 32-bit field (UINT32)
+// Only 8-byte raw carriers are accepted on this absolute path because
+// mergeAuxClouds() leaves them unshifted and deskewPointcloud() anchors on
+// (ts - primary_min). A 32-bit field (UINT32)
 // cannot hold an absolute epoch (it wraps every ~4.29 s) -- it would be a
 // scan-relative counter, which this absolute path would silently misinterpret
 // (dropping the inter-scan offset between aux and primary). So UINT32 is
@@ -688,9 +687,36 @@ inline void clearPointTimeUnion(PointType& pt) {
 // and degrades to "no per-point time" (rigid transform) rather than corrupting
 // deskew. `bytes_avail` (the field's room within point_step) guards the 8-byte
 // read against a malformed/short time field.
-inline bool luminarRawTimestampNsFromBytes(const uint8_t* tp, uint8_t datatype, int count, size_t bytes_avail, uint64_t& out) {
-  if ((datatype == sensor_msgs::msg::PointField::FLOAT64 ||
-       (datatype == sensor_msgs::msg::PointField::UINT8 && count == 8)) &&
+inline bool luminarUsesRawEpochCarrier(
+    uint8_t datatype, int count, bool float64_time_is_epoch_ns) {
+  return (datatype == sensor_msgs::msg::PointField::UINT8 && count == 8) ||
+         (float64_time_is_epoch_ns &&
+          datatype == sensor_msgs::msg::PointField::FLOAT64 && count == 1);
+}
+
+inline bool luminarUsesRelativeFloat64Carrier(
+    uint8_t datatype, int count, bool float64_time_is_epoch_ns) {
+  return !float64_time_is_epoch_ns &&
+         datatype == sensor_msgs::msg::PointField::FLOAT64 && count == 1;
+}
+
+bool luminarCloudUsesRelativeFloat64(
+    const sensor_msgs::msg::PointCloud2& msg, bool float64_time_is_epoch_ns) {
+  int time_off = -1;
+  uint8_t datatype = 0;
+  int count = 0;
+  return findTimeField(msg, time_off, datatype, count) &&
+         time_off >= 0 &&
+         static_cast<uint32_t>(time_off) + sizeof(double) <= msg.point_step &&
+         luminarUsesRelativeFloat64Carrier(
+             datatype, count, float64_time_is_epoch_ns);
+}
+
+inline bool luminarRawTimestampNsFromBytes(
+    const uint8_t* tp, uint8_t datatype, int count, size_t bytes_avail,
+    bool float64_time_is_epoch_ns, uint64_t& out) {
+  if (luminarUsesRawEpochCarrier(
+          datatype, count, float64_time_is_epoch_ns) &&
       bytes_avail >= sizeof(uint64_t)) {
     std::memcpy(&out, tp, sizeof(uint64_t));
     return true;
@@ -703,7 +729,8 @@ inline bool luminarRawTimestampNsFromBytes(const uint8_t* tp, uint8_t datatype, 
 // is acquisition phase and must not gate the merge. Fails closed (invalid
 // range) on any malformed point, short buffer, or unsupported time encoding.
 gicp_plusplus::LuminarTimestampRangeNs luminarTimestampRangeFromCloud(
-    const sensor_msgs::msg::PointCloud2& msg) {
+    const sensor_msgs::msg::PointCloud2& msg,
+    bool float64_time_is_epoch_ns) {
   gicp_plusplus::LuminarTimestampRangeNs range;
 
   // The decode assumes little-endian payloads; a big-endian cloud would yield
@@ -733,7 +760,8 @@ gicp_plusplus::LuminarTimestampRangeNs luminarTimestampRangeFromCloud(
     uint64_t timestamp_ns = 0;
     if (!luminarRawTimestampNsFromBytes(
             msg.data.data() + i * msg.point_step + time_off,
-            time_datatype, time_count, bytes_avail, timestamp_ns)) {
+            time_datatype, time_count, bytes_avail,
+            float64_time_is_epoch_ns, timestamp_ns)) {
       return gicp_plusplus::LuminarTimestampRangeNs{};
     }
     // [P3 FIX 2026-07-14] A zero per-point timestamp is the "no valid time"
@@ -753,7 +781,8 @@ gicp_plusplus::LuminarTimestampRangeNs luminarTimestampRangeFromCloud(
 // Copy per-point time from PointCloud2 into the dlio::Point union for the configured sensor.
 // `point_step` bounds the field read so a malformed/short time field cannot read past the point.
 void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datatype, int time_count,
-                           uint32_t point_step, dlio::SensorType sensor, PointType& dst) {
+                           uint32_t point_step, dlio::SensorType sensor,
+                           bool float64_time_is_epoch_ns, PointType& dst) {
   if (time_off < 0 || static_cast<uint32_t>(time_off) >= point_step) {
     return;
   }
@@ -763,10 +792,21 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
   switch (sensor) {
     case dlio::SensorType::LUMINAR: {
       uint64_t ts_raw = 0;
-      if (!luminarRawTimestampNsFromBytes(tp, time_datatype, time_count, bytes_avail, ts_raw)) {
+      if (luminarRawTimestampNsFromBytes(
+              tp, time_datatype, time_count, bytes_avail,
+              float64_time_is_epoch_ns, ts_raw)) {
+        std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
         return;
       }
-      std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
+      if (luminarUsesRelativeFloat64Carrier(
+              time_datatype, time_count, float64_time_is_epoch_ns) &&
+          bytes_avail >= sizeof(double)) {
+        double relative_seconds = 0.0;
+        std::memcpy(&relative_seconds, tp, sizeof(double));
+        if (std::isfinite(relative_seconds)) {
+          dst.timestamp = relative_seconds;
+        }
+      }
       return;
     }
     case dlio::SensorType::OUSTER: {
@@ -853,8 +893,27 @@ void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datat
 }
 
 void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType>& cloud,
-                              size_t unique_ros_times) {
+                              size_t unique_ros_times, bool raw_epoch_ns) {
   if (cloud.points.empty()) {
+    return;
+  }
+  if (!raw_epoch_ns) {
+    double tmin = std::numeric_limits<double>::infinity();
+    double tmax = -std::numeric_limits<double>::infinity();
+    for (const auto& pt : cloud.points) {
+      if (!std::isfinite(pt.timestamp)) continue;
+      tmin = std::min(tmin, pt.timestamp);
+      tmax = std::max(tmax, pt.timestamp);
+    }
+    std::fprintf(
+        stderr,
+        "[LUMINAR_DBG] %zu pts, %zu unique_ros_times, relative FLOAT64 "
+        "span_s=%.9f (min=%.9f max=%.9f)\n",
+        num_points, unique_ros_times,
+        (std::isfinite(tmin) && std::isfinite(tmax)) ? tmax - tmin
+                                                     : -1.0,
+        tmin, tmax);
+    std::fflush(stderr);
     return;
   }
   uint64_t tmin = std::numeric_limits<uint64_t>::max();
@@ -1155,9 +1214,20 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->pointcloud_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto pointcloud_sub_opt = rclcpp::SubscriptionOptions();
   pointcloud_sub_opt.callback_group = this->pointcloud_cb_group;
-  // Use sensor-data QoS so rosbag/sensor publishers with BEST_EFFORT are compatible.
+  // Live default: sensor-data BEST_EFFORT. A lossless offline audit can opt
+  // into RELIABLE + a deeper queue, provided the rosbag publishers use the
+  // same reliable profile. This prevents silent DDS loss when three
+  // multi-megabyte clouds are published as one replay burst.
+  auto lidar_qos = rclcpp::SensorDataQoS();
+  if (this->lidar_reliable_qos_) {
+    lidar_qos.reliable();
+    lidar_qos.keep_last(20);
+    RCLCPP_INFO(this->get_logger(),
+                "LiDAR subscriptions use RELIABLE keep-last(20) QoS "
+                "(lossless offline replay mode)");
+  }
   this->pointcloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "pointcloud", rclcpp::SensorDataQoS(),
+      "pointcloud", lidar_qos,
       std::bind(&gicp_plusplus::LocalizationNode::callbackPointCloud, this, std::placeholders::_1),
       pointcloud_sub_opt);
 
@@ -1187,7 +1257,7 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
       const int idx = static_cast<int>(i);
       auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          this->aux_lidars_[i]->topic, rclcpp::SensorDataQoS(),
+          this->aux_lidars_[i]->topic, lidar_qos,
           [this, idx](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
             this->callbackAuxPointCloud(idx, std::move(msg));
           },
@@ -1448,23 +1518,25 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
 
   this->applyInitialPoseFromParams();
 
-  // Async front/aux synchronizer (Luminar production path). The front callback
-  // only validates + enqueues; this worker owns release order and runs the
-  // scan pipeline, so waiting for a future point-aligned aux sweep never
-  // blocks the subscription callback (and therefore never turns into QoS
-  // front-cloud drops). Non-Luminar sensors keep the legacy synchronous path.
+  // Async Luminar front worker. The subscription callback only validates and
+  // enqueues; this worker owns processing order. This is required even for the
+  // production front-only localizer: a single slow GICP iteration must not
+  // block the DDS callback long enough for keep-last history to discard later
+  // 10 Hz clouds silently. With aux LiDARs enabled, the same worker also owns
+  // the point-time synchronizer wait. Non-Luminar sensors keep the legacy
+  // synchronous path.
   // Started LAST, after every throwing constructor step: if the constructor
   // throws after a thread starts, the destructor never runs and the thread
   // would touch destroyed members. Callbacks cannot fire before spin, so no
   // front cloud can arrive between subscription creation and this point.
-  if (this->concat_enabled_ && !this->aux_lidars_.empty() &&
-      this->sensor == dlio::SensorType::LUMINAR) {
+  if (!this->imu_only_mode_ && this->sensor == dlio::SensorType::LUMINAR) {
     this->sync_active_ = true;
     this->sync_worker_ =
         std::thread(&gicp_plusplus::LocalizationNode::syncWorkerLoop, this);
     RCLCPP_INFO(this->get_logger(),
-                "front sync: async point-time synchronizer active "
-                "(point gate %.3fs, deadline %.3fs, primary queue %zu)",
+                "front sync: async Luminar worker active "
+                "(aux=%zu, point gate %.3fs, deadline %.3fs, primary queue %zu)",
+                this->aux_lidars_.size(),
                 this->concat_luminar_point_threshold_,
                 this->concat_future_aux_wait_s_,
                 this->concat_primary_queue_size_);
@@ -1668,6 +1740,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/gt_odom/enable", true);  // [P3 FIX 2026-07-10] yaml-aligned
   this->declare_parameter<int>("localization/gt_odom/buffer_size", 200);
   this->declare_parameter<double>("localization/gt_odom/max_dt", 0.1);
+  // Runtime GNSS/INS guard, not a scoring shortcut: an RTK-quality candidate
+  // outside this radius is rejected before it can inject a false correction
+  // into the geometric observer. Disabled in the C++ fallback; the Laguna
+  // production yaml enables it explicitly alongside GT recovery.
+  this->declare_parameter<double>(
+      "localization/gt_odom/max_candidate_position_error_m", 0.0);
   // [P2 FIX 2026-07-14] Bracket-width bound for GT interpolation (see
   // getGtPoseAt / getGtFiniteDiffVelWorld). Independent of max_dt, which only
   // bounds the nearer endpoint. Default 0.5 s: at nominal 10 Hz GT this is 5×
@@ -1678,6 +1756,9 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("localization/gt_odom/enable", gt_enable);
   this->get_parameter("localization/gt_odom/buffer_size", gt_buf);
   this->get_parameter("localization/gt_odom/max_dt", gt_max_dt);
+  this->get_parameter(
+      "localization/gt_odom/max_candidate_position_error_m",
+      this->gt_max_candidate_pos_error_m_);
   this->get_parameter("localization/gt_odom/interp_max_gap", gt_interp_gap);
   this->gt_odom_enabled_ = gt_enable;
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
@@ -1688,6 +1769,15 @@ void gicp_plusplus::LocalizationNode::getParams() {
     RCLCPP_WARN(this->get_logger(), "localization/gt_odom/max_dt=%.3f invalid; using 0.15",
                 this->gt_odom_max_dt_);
     this->gt_odom_max_dt_ = 0.15;
+  }
+  if (!std::isfinite(this->gt_max_candidate_pos_error_m_) ||
+      this->gt_max_candidate_pos_error_m_ < 0.0) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "localization/gt_odom/max_candidate_position_error_m=%.3f invalid; "
+        "disabling the candidate sanity gate",
+        this->gt_max_candidate_pos_error_m_);
+    this->gt_max_candidate_pos_error_m_ = 0.0;
   }
   this->gt_interp_max_gap_ = gt_interp_gap;
   if (!std::isfinite(this->gt_interp_max_gap_) || this->gt_interp_max_gap_ <= 0.0) {
@@ -1958,6 +2048,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // the primary sensor frame via TF (URDF), and per-point timestamps are rebased
   // by the inter-header dt so the merged sweep shares one clock.
   this->declare_parameter<bool>("localization/lidar_concat/enabled", false);
+  this->declare_parameter<bool>("localization/lidar_concat/reliable_qos", false);
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
   this->declare_parameter<double>("localization/lidar_concat/time_threshold", 0.05);
@@ -1975,6 +2066,12 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // missing entries = 0.
   this->declare_parameter<std::vector<double>>("localization/lidar_concat/aux_time_offsets",
                                                std::vector<double>{});
+  // Mirror GLIM's explicit driver contract. FLOAT64 normally carries
+  // scan-relative seconds (Laguna); only reinterpret its raw bytes as uint64
+  // epoch nanoseconds when this is true. UINT8[8] remains an absolute carrier
+  // regardless of this setting.
+  this->declare_parameter<bool>(
+      "localization/lidar_concat/float64_time_is_epoch_ns", false);
   // Luminar acceptance gate: absolute point-time endpoint-range error
   // max(|min-min|,|max-max|) <= this. Header time is only a tie-break; the
   // 0.1 s header threshold stays solely for non-Luminar fallback matching.
@@ -2001,19 +2098,24 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<int>("localization/lidar_concat/max_consecutive_aux_merge_failures", 10);
 
   this->get_parameter("localization/lidar_concat/enabled", this->concat_enabled_);
+  this->get_parameter(
+      "localization/lidar_concat/reliable_qos", this->lidar_reliable_qos_);
   std::vector<std::string> aux_topics_param, aux_frames_param;
   this->get_parameter("localization/lidar_concat/aux_topics", aux_topics_param);
   this->get_parameter("localization/lidar_concat/aux_frames", aux_frames_param);
   this->get_parameter("localization/lidar_concat/time_threshold", this->concat_time_threshold_);
   // [P3 FIX 2026-07-10] Negative threshold silently drops every aux merge.
   if (!std::isfinite(this->concat_time_threshold_) || this->concat_time_threshold_ < 0.0) {
-    RCLCPP_WARN(this->get_logger(), "localization/lidar_concat/time_threshold=%.3f invalid; using 0.1",
+    RCLCPP_WARN(this->get_logger(), "localization/lidar_concat/time_threshold=%.3f invalid; using 0.05",
                 this->concat_time_threshold_);
-    this->concat_time_threshold_ = 0.1;
+    this->concat_time_threshold_ = 0.05;
   }
   int concat_buffer_size_int = 20;
   this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
   this->get_parameter("localization/lidar_concat/aux_time_offsets", this->concat_aux_time_offsets_);
+  this->get_parameter(
+      "localization/lidar_concat/float64_time_is_epoch_ns",
+      this->concat_float64_time_is_epoch_ns_);
   // Fail LOUD on invalid offsets (GLIM config-loader policy): a NaN/inf or
   // extreme value would flow into point-range matching and the int64 ns
   // conversion in shiftCloudTimestamps (UB / corrupted absolute timestamps).
@@ -2099,8 +2201,13 @@ void gicp_plusplus::LocalizationNode::getParams() {
         this->aux_lidars_.push_back(std::move(aux));
       }
       RCLCPP_INFO(this->get_logger(),
-                  "lidar_concat enabled: %zu aux lidars, time_threshold=%.3fs, buffer_size=%zu",
-                  this->aux_lidars_.size(), this->concat_time_threshold_, this->concat_buffer_size_);
+                  "lidar_concat enabled: %zu aux lidars, time_threshold=%.3fs, "
+                  "buffer_size=%zu, FLOAT64 time=%s",
+                  this->aux_lidars_.size(), this->concat_time_threshold_,
+                  this->concat_buffer_size_,
+                  this->concat_float64_time_is_epoch_ns_
+                      ? "raw uint64 epoch-ns (explicit opt-in)"
+                      : "scan-relative seconds");
       if (this->concat_aux_time_offsets_.size() < this->aux_lidars_.size()) {
         RCLCPP_WARN(this->get_logger(),
                     "lidar_concat: aux_time_offsets has %zu/%zu entries; missing entries default to 0.0. "
@@ -2235,6 +2342,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<double>("odom/geo/observer_dt_max", 0.15);
   this->declare_parameter<double>("odom/geo/max_pos_correction", 0.0);
   this->declare_parameter<double>("odom/geo/max_vel_correction", 0.0);
+  this->declare_parameter<double>("odom/geo/max_state_speed", 0.0);
   // P1 yaw-safety fix #3: per-update ORIENTATION clamps (position/velocity
   // already had them). Yaw clamp ON by default — the failure mode it bounds
   // (one bad accepted scan yanking heading tens of degrees) is exactly the
@@ -2244,12 +2352,19 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("odom/geo/observer_dt_max", this->geo_observer_dt_max_);
   this->get_parameter("odom/geo/max_pos_correction", this->geo_max_pos_correction_);
   this->get_parameter("odom/geo/max_vel_correction", this->geo_max_vel_correction_);
+  this->get_parameter("odom/geo/max_state_speed", this->geo_max_state_speed_);
   this->get_parameter("odom/geo/max_yaw_correction_deg", this->geo_max_yaw_correction_deg_);
   this->get_parameter("odom/geo/max_rot_correction_deg", this->geo_max_rot_correction_deg_);
   if (this->geo_observer_dt_max_ <= 0.0) {
     this->geo_observer_dt_max_ = 0.15;  // guard against a non-positive cap disabling all corrections
   }
-
+  if (!std::isfinite(this->geo_max_state_speed_) ||
+      this->geo_max_state_speed_ < 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/geo/max_state_speed=%.3f invalid; disabling speed clamp",
+                this->geo_max_state_speed_);
+    this->geo_max_state_speed_ = 0.0;
+  }
   // Time/speed-based dead-reckoning covariance growth (P3).
   this->declare_parameter<double>("odom/geo/dr_cov_time_rate", 0.5);
   this->declare_parameter<double>("odom/geo/dr_cov_dist_frac", 0.05);
@@ -2332,6 +2447,18 @@ void gicp_plusplus::LocalizationNode::getParams() {
               "GT recovery: %s (min consecutive failures=%d)",
               this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
               this->gt_recovery_min_consecutive_failures_);
+  RCLCPP_INFO(
+      this->get_logger(),
+      "RTK candidate sanity: %s (max position error=%.2fm; quality-gated, no "
+      "per-frame position fusion)",
+      this->gt_max_candidate_pos_error_m_ > 0.0 ? "ENABLED" : "DISABLED",
+      this->gt_max_candidate_pos_error_m_);
+  RCLCPP_INFO(
+      this->get_logger(),
+      "Observer stability bounds: dt<=%.3fs pos_step<=%.2fm vel_step<=%.2fm/s "
+      "state_speed<=%.1fm/s",
+      this->geo_observer_dt_max_, this->geo_max_pos_correction_,
+      this->geo_max_vel_correction_, this->geo_max_state_speed_);
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -2491,30 +2618,30 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
 
   // Downsample the GICP TARGET map (in place) before it becomes the kd-tree.
   // A dense map (e.g. a ~49M-point GLIM export) otherwise builds a multi-GB
-  // kd-tree that exhausts RAM/swap and stalls registration for seconds. Voxel
-  // downsampling to ~0.3 m cuts the point count (and kd-tree memory) by ~10x
-  // with negligible accuracy impact at the matching 0.3 m scan voxel
-  // (dlio/preprocessing/voxelFilter/res). The dense cloud is
-  // released as soon as the filter swaps in the downsampled result.
+  // kd-tree that exhausts RAM/swap and stalls registration for seconds. Do
+  // not use pcl::VoxelGrid here: its dense bounding-box cell-count guard uses
+  // a 32-bit product and silently leaves sparse, large-extent Laguna maps
+  // unchanged ("integer indices would overflow"). small_gicp's sparse 64-bit
+  // voxel keys depend on occupied points instead of the bounding-box volume.
+  // Downsampling to ~0.3 m cuts the point count (and kd-tree memory) with
+  // negligible accuracy impact at the matching 0.3 m scan voxel. The dense
+  // cloud is released as soon as the filter swaps in the downsampled result.
   if (this->map_voxel_size_ > 0.0) {
     const size_t before = this->map_cloud->points.size();
-    auto map_ds = std::make_shared<pcl::PointCloud<PointType>>();
-    pcl::VoxelGrid<PointType> vg;
-    vg.setLeafSize(static_cast<float>(this->map_voxel_size_),
-                   static_cast<float>(this->map_voxel_size_),
-                   static_cast<float>(this->map_voxel_size_));
-    vg.setInputCloud(this->map_cloud);
-    vg.filter(*map_ds);
+    auto map_ds = small_gicp::voxelgrid_sampling_tbb(
+      *this->map_cloud, this->map_voxel_size_);
     if (map_ds->points.empty()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "map_voxel_size=%.3f produced an empty map; keeping the full-resolution map",
-                  this->map_voxel_size_);
-    } else {
-      this->map_cloud = map_ds;  // releases the dense cloud
-      RCLCPP_INFO(this->get_logger(),
-                  "Downsampled GICP target map: %lu -> %lu points (voxel=%.3f m)",
-                  before, this->map_cloud->points.size(), this->map_voxel_size_);
+      RCLCPP_ERROR(this->get_logger(),
+                   "sparse map voxelization at %.3f m produced an empty map; "
+                   "refusing to build a full-resolution target",
+                   this->map_voxel_size_);
+      return false;
     }
+    this->map_cloud = map_ds;  // releases the dense cloud
+    RCLCPP_INFO(this->get_logger(),
+                "Downsampled GICP target map with sparse 64-bit voxel keys: "
+                "%lu -> %lu points (voxel=%.3f m)",
+                before, this->map_cloud->points.size(), this->map_voxel_size_);
   }
 
   // Downsample map for visualization if needed
@@ -2924,15 +3051,15 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
   }
 
   if (this->sync_active_) {
-    // Luminar production path: validate + enqueue only. The synchronizer
-    // worker owns release order and runs the pipeline; this callback must
-    // never block on aux state (a 100-150 ms wait exceeds the 20 Hz front
-    // period and turns into QoS front drops — the Result-33 regression).
+    // Luminar production path: validate + enqueue only. The worker owns
+    // release order and runs the pipeline; this callback must never block on
+    // either aux state or a long GICP iteration, because blocking can exhaust
+    // DDS keep-last history and silently lose front clouds.
     this->enqueuePrimary(pc_in);
     return;
   }
 
-  // Legacy synchronous path (concat disabled or non-Luminar sensor).
+  // Legacy synchronous path (non-Luminar sensor).
   // [P3 FIX 2026-07-14] Catch a pipeline exception (e.g. strict-merge abort)
   // HERE, on whatever executor thread ran this callback. The try/catch around
   // executor.spin() in main() only covers the single spin-calling thread; under
@@ -2971,11 +3098,14 @@ void gicp_plusplus::LocalizationNode::enqueuePrimary(
   // Decode ONCE. An invalid range (unsupported time field) means point-time
   // matching is impossible: release immediately and let mergeAuxClouds record
   // the per-aux outcome — the front cloud itself is still processed.
-  pending.range = luminarTimestampRangeFromCloud(*pc);
+  pending.range = luminarTimestampRangeFromCloud(
+      *pc, this->concat_float64_time_is_epoch_ns_);
+  pending.relative_float64_time = luminarCloudUsesRelativeFloat64(
+      *pc, this->concat_float64_time_is_epoch_ns_);
   const auto now = std::chrono::steady_clock::now();
   pending.enqueued = now;
   pending.deadline =
-      pending.range.valid
+      (pending.range.valid || pending.relative_float64_time)
           ? now + std::chrono::duration<int64_t, std::nano>(
                       static_cast<int64_t>(this->concat_future_aux_wait_s_ * 1e9))
           : now;
@@ -3085,6 +3215,36 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
           break;
         }
       }
+    } else if (front.relative_float64_time) {
+      // Laguna's decoder publishes FLOAT64 seconds-since-sweep-start. There
+      // is no absolute point range to compare, so mirror GLIM's safe
+      // header-fallback watermark: wait until every aux stream has reached
+      // this primary header before selecting the nearest header. Releasing
+      // immediately would always choose the latest past side sweep.
+      const double primary_header =
+          rclcpp::Time(front.msg->header.stamp).seconds();
+      for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+        auto& aux = *this->aux_lidars_[i];
+        const double clock_off =
+            (i < this->concat_aux_time_offsets_.size())
+                ? this->concat_aux_time_offsets_[i]
+                : 0.0;
+        double newest_header = -std::numeric_limits<double>::infinity();
+        {
+          std::lock_guard<std::mutex> alk(aux.mtx);
+          for (const auto& buffered : aux.buffer) {
+            newest_header = std::max(
+                newest_header,
+                rclcpp::Time(buffered.msg->header.stamp).seconds() +
+                    clock_off);
+          }
+        }
+        if (newest_header < primary_header) {
+          all_matched = false;
+          ready = false;
+          break;
+        }
+      }
     }
 
     // [P2 FIX 2026-07-14] Copy the deadline before waiting. wait_until takes
@@ -3102,7 +3262,7 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
 
     // Decide the release reason before popping.
     int reason;
-    if (!front.range.valid) {
+    if (!front.range.valid && !front.relative_float64_time) {
       // [P3 FIX 2026-07-14] Primary had no decodable absolute point time: the
       // aux-matching block above was skipped entirely, so "all_matched" is
       // vacuously true. Report it distinctly instead of as a healthy match.
@@ -3341,6 +3501,11 @@ void gicp_plusplus::LocalizationNode::processScan(
   uint8_t time_datatype = 0;
   int time_count = 0;
   const bool has_time_field = findTimeField(*pc, time_off, time_datatype, time_count);
+  this->luminar_scan_time_is_epoch_ns_ =
+      this->sensor == dlio::SensorType::LUMINAR && has_time_field &&
+      luminarUsesRawEpochCarrier(
+          time_datatype, time_count,
+          this->concat_float64_time_is_epoch_ns_);
 
   // One-shot timestamp-field diagnostic. Fires exactly once across the whole
   // node lifetime (std::call_once) and dumps every PointField + the first few
@@ -3403,7 +3568,9 @@ void gicp_plusplus::LocalizationNode::processScan(
       dst.intensity = read_intensity(src);
       clearPointTimeUnion(dst);
       if (has_time_field) {
-        copyPointTimeFromCloud(src, time_off, time_datatype, time_count, point_step, this->sensor, dst);
+        copyPointTimeFromCloud(
+            src, time_off, time_datatype, time_count, point_step, this->sensor,
+            this->concat_float64_time_is_epoch_ns_, dst);
       }
     }
   };
@@ -3456,7 +3623,9 @@ void gicp_plusplus::LocalizationNode::processScan(
 
   if (this->sensor == dlio::SensorType::LUMINAR && has_time_field && this->verbose_ &&
       !raw_scan->points.empty()) {
-    logLuminarTimestampStats(raw_scan->points.size(), *raw_scan, 0);
+    logLuminarTimestampStats(
+        raw_scan->points.size(), *raw_scan, 0,
+        this->luminar_scan_time_is_epoch_ns_);
   }
 
   // Store as original scan for deskewing
@@ -3529,7 +3698,8 @@ void gicp_plusplus::LocalizationNode::callbackAuxPointCloud(
   if (this->sensor == dlio::SensorType::LUMINAR) {
     // Decode once here (Reentrant aux group, cheap ~ms scan) so matching and
     // the synchronizer readiness test never re-read cloud bytes.
-    buffered.luminar_range = luminarTimestampRangeFromCloud(*buffered.msg);
+    buffered.luminar_range = luminarTimestampRangeFromCloud(
+        *buffered.msg, this->concat_float64_time_is_epoch_ns_);
   }
   auto& aux = *this->aux_lidars_[aux_index];
   {
@@ -3716,7 +3886,8 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     // (copyPointTimeFromCloud) on the accepted absolute encodings (UINT8[8] /
     // FLOAT64); it internally guards short/truncated buffers, and this capture
     // runs BEFORE the tight-cloud guard further down.
-    primary_luminar_range = luminarTimestampRangeFromCloud(*primary);
+    primary_luminar_range = luminarTimestampRangeFromCloud(
+        *primary, this->concat_float64_time_is_epoch_ns_);
     if (primary_luminar_range.valid) {
       this->luminar_primary_min_ts_ns_ = primary_luminar_range.min_ns;
       this->luminar_primary_min_ts_valid_ = true;
@@ -3772,12 +3943,15 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     // wrong-sweep / 149 ms-span failure mode. Release the front alone and
     // explicitly omit every aux; the header fallback below exists only for
     // non-Luminar sensors.
-    if (this->sensor == dlio::SensorType::LUMINAR && !primary_luminar_range.valid) {
+    const bool relative_float64_time = luminarCloudUsesRelativeFloat64(
+        *primary, this->concat_float64_time_is_epoch_ns_);
+    if (this->sensor == dlio::SensorType::LUMINAR &&
+        !primary_luminar_range.valid && !relative_float64_time) {
       RCLCPP_WARN_THROTTLE(
           this->get_logger(), *this->get_clock(), 5000,
-          "lidar_concat: primary cloud has no usable absolute point-time range "
-          "(unsupported_point_time); omitting '%s' and merging front-only — "
-          "header-nearest matching is not a safe Luminar fallback",
+          "lidar_concat: primary cloud has neither a usable absolute point-time "
+          "range nor the supported relative FLOAT64 time contract "
+          "(unsupported_point_time); omitting '%s' and merging front-only",
           aux.topic.c_str());
       continue;
     }
@@ -3927,7 +4101,11 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     uint8_t time_dt_type;
     int time_count;
     const bool has_time_field = findTimeField(*match, time_off, time_dt_type, time_count);
-    const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
+    const bool luminar_raw_epoch =
+        this->sensor == dlio::SensorType::LUMINAR &&
+        luminarUsesRawEpochCarrier(
+            time_dt_type, time_count,
+            this->concat_float64_time_is_epoch_ns_);
     // [REVIEW FIX 2026-07-08 P3] For Luminar, "a time field exists" is not
     // "the time field is usable": the decoder accepts ONLY the 8-byte
     // absolute carriers (UINT8[8] raw uint64 epoch ns, or the same bits
@@ -3937,7 +4115,7 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
     // unsupported Luminar schema like a missing time field here so the aux is
     // DROPPED under deskew instead.
     const bool usable_time_field = has_time_field &&
-        (!luminar_u64 ||
+        (this->sensor != dlio::SensorType::LUMINAR ||
          time_dt_type == sensor_msgs::msg::PointField::FLOAT64 ||
          (time_dt_type == sensor_msgs::msg::PointField::UINT8 && time_count == 8));
     if (usable_time_field) {
@@ -3945,7 +4123,7 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
       // absolute carrier ignores dt and applies only the measured residual
       // clock offset — header acquisition phase never touches point times.
       const double dt = rclcpp::Time(match->header.stamp).seconds() + aux_clock_off - t_primary;
-      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64,
+      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_raw_epoch,
                            aux_clock_off);
     } else if (this->deskew_) {
       // Without per-point timestamps the aux rays would deskew against the
@@ -3955,7 +4133,8 @@ gicp_plusplus::LocalizationNode::mergeAuxClouds(
       if (has_time_field) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                              "lidar_concat: skipping '%s' — unsupported Luminar time schema "
-                             "(datatype=%u count=%d; need UINT8[8] or FLOAT64 epoch-ns)",
+                             "(datatype=%u count=%d; need UINT8[8] epoch-ns or "
+                             "FLOAT64 relative seconds/explicit epoch-ns)",
                              aux.topic.c_str(), static_cast<unsigned>(time_dt_type), time_count);
       } else {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -4268,7 +4447,8 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
     extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp * 1e-9; };
     deskew_time_ready = true;
-  } else if (this->sensor == dlio::SensorType::LUMINAR) {
+  } else if (this->sensor == dlio::SensorType::LUMINAR &&
+             this->luminar_scan_time_is_epoch_ns_) {
     // Per-point value is absolute PTP epoch ns (driver reconstruction of the
     // packet-header 48-bit seconds + per-ray 32-bit sub-second nanoseconds;
     // see Luminar Iris Data Output Specification v1.3.0 §2.1 and §2.2/§2.6.3).
@@ -4314,6 +4494,18 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
       return sweep_ref_time + static_cast<double>(static_cast<int64_t>(ts) - static_cast<int64_t>(min_ts_captured)) * 1e-9;
     };
     deskew_time_ready = true;
+  } else if (this->sensor == dlio::SensorType::LUMINAR) {
+    // Laguna's decoder publishes FLOAT64 seconds since the start of each
+    // sweep. mergeAuxClouds() rebases auxiliary values by
+    // (T_aux_header - T_primary_header), so every merged point is already
+    // expressed relative to the primary header.
+    point_time_cmp = [](const PointType& p1, const PointType& p2) {
+      return p1.timestamp < p2.timestamp;
+    };
+    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) {
+      return sweep_ref_time + pt.timestamp;
+    };
+    deskew_time_ready = true;
   }
 
   if (!deskew_time_ready) {
@@ -4349,7 +4541,9 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   unique_time_indices.push_back(deskewed_scan_->points.size());
 
   if (this->sensor == dlio::SensorType::LUMINAR && this->verbose_ && !deskewed_scan_->points.empty()) {
-    logLuminarTimestampStats(deskewed_scan_->points.size(), *deskewed_scan_, timestamps.size());
+    logLuminarTimestampStats(
+        deskewed_scan_->points.size(), *deskewed_scan_, timestamps.size(),
+        this->luminar_scan_time_is_epoch_ns_);
   }
 
   if (timestamps.empty()) {
@@ -4386,6 +4580,12 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   if (this->prev_scan_stamp == 0.0) {
     this->prev_scan_stamp = this->scan_stamp.seconds();
     this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
+    // Although the seed pose has not been IMU-advanced on this first frame,
+    // the GICP candidate produced from the placed cloud is a measurement at
+    // this scan's median point time. Label the candidate accordingly so an
+    // accepted first scan advances base_pose_stamp_ instead of pinning every
+    // subsequent integration request to the pre-replay GT seed timestamp.
+    this->t_prior_stamp_ = timestamps[median_pt_index];
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
     this->current_scan = deskewed_scan_;
     this->scan_in_world_frame_ = true;
@@ -4415,6 +4615,11 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
                            "Waiting for sufficient IMU history (oldest: %.3f, need: %.3f). Skipping deskewing.",
                            oldest_imu_time, this->prev_scan_stamp);
       this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
+      // As above, a successful registration against this scan is a
+      // median-time measurement even though its initial guess was not
+      // propagated. Advancing this stamp lets the next frame use the newly
+      // accepted pose as its honest IMU integration seed.
+      this->t_prior_stamp_ = timestamps[median_pt_index];
       pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
       this->current_scan = deskewed_scan_;
       this->scan_in_world_frame_ = true;
@@ -5038,9 +5243,11 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
        final_jump_rot_deg <= this->gicp_nonconv_ok_max_rot_deg_);
   const bool effectively_converged = converged || nonconv_fallback_ok;
 
-  // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
-  // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
-  // accept/reject decisions — purely a diagnostic.
+  // Atlas divergence cross-check (optional). Compares the scan's
+  // accepted-or-candidate pose to a time-matched odom sample. It is purely a
+  // diagnostic when max_candidate_position_error_m=0; otherwise the
+  // RTK-quality position error also feeds the broad wrong-basin safety gate
+  // below (never a per-frame position blend).
   double gt_pos_err = -1.0;
   double gt_rot_err_deg = -1.0;
   double gt_dt = 0.0;
@@ -5275,8 +5482,19 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
   bool gicp_rejected_support = false;
+  bool gicp_rejected_gt_sanity = false;
   if (effectively_converged && candidate_pose_valid) {
-    if (!analysis_hessian.allFinite()) {
+    if (this->gt_max_candidate_pos_error_m_ > 0.0 &&
+        gt_pos_err >= 0.0 &&
+        gt_pos_err > this->gt_max_candidate_pos_error_m_) {
+      // Atlas is already an on-car input for initialization, heading and
+      // recovery. Use its RTK-quality position only as a broad wrong-basin
+      // safety envelope: healthy GICP remains untouched inside the radius,
+      // while a parallel-wall/ghost match cannot be fed into the observer for
+      // tens of seconds. gt_pos_err is available only after the covariance
+      // quality gate and a time-bounded interpolation succeeded.
+      gicp_rejected_gt_sanity = true;
+    } else if (!analysis_hessian.allFinite()) {
       // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
       // returns +inf, but every Hessian gate below requires
       // std::isfinite(hessian_condition) — so these scans previously skipped
@@ -5354,13 +5572,20 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_hessian && !gicp_rejected_jump &&
-                             !gicp_rejected_yaw && !gicp_rejected_support;
+                             !gicp_rejected_yaw && !gicp_rejected_support &&
+                             !gicp_rejected_gt_sanity;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
   } else if (!effectively_converged) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("failed_to_converge").c_str());
+  } else if (gicp_rejected_gt_sanity) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "GICP REJECTED (RTK candidate sanity: position error %.3fm > %.3fm): %s",
+        gt_pos_err, this->gt_max_candidate_pos_error_m_,
+        build_scan_debug_log("rejected_gt_sanity").c_str());
   } else if (gicp_rejected_fitness) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
@@ -5494,7 +5719,6 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
       this->prev_vel = this->geo.prev_vel;
     }
-
     if (this->debug_jump_log_enabled_ && gicp_valid && this->last_gicp_valid_) {
       if (large_jump) {
         const Eigen::Vector3f t_prior = this->T_prior.block<3, 1>(0, 3);
@@ -5549,6 +5773,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
+                       : gicp_rejected_gt_sanity ? "RTK candidate sanity rejected (wrong basin)"
                        : gicp_rejected_support ? "insufficient correspondence support"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
@@ -5562,22 +5787,24 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       q.normalize();
       // [P2 FIX 2026-07-09] Seed writes under the owner lock (order:
       // pose -> seed -> geo, consistent with the accept path and deskew).
-      std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
-      this->basePose.p = new_p;
-      this->basePose.q = q;
-      // [REVIEW FIX 2026-07-08] T_prior is also a median-point-time pose.
-      this->base_pose_stamp_ = this->t_prior_stamp_;
       {
-        // P2#1 (stale-velocity bug): seed the next scan's IMU integration from
-        // the CURRENT IMU-propagated velocity, not geo.prev_vel. geo.prev_vel
-        // is only refreshed by updateState() (accepted scans) or a GT snap, so
-        // during an N-frame rejection streak it stayed frozen at the last
-        // accepted scan's velocity while the vehicle's velocity vector rotated
-        // through the turn — every per-scan prior then extrapolated straight
-        // ("corner cutting", run-12 webm). state.v.lin.w is maintained at IMU
-        // rate by propagateState() and is the correct dead-reckoning velocity.
-        std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
-        this->prev_vel = this->state.v.lin.w;
+        std::lock_guard<std::mutex> seed_lock(this->seed_mtx_);
+        this->basePose.p = new_p;
+        this->basePose.q = q;
+        // [REVIEW FIX 2026-07-08] T_prior is also a median-point-time pose.
+        this->base_pose_stamp_ = this->t_prior_stamp_;
+        {
+          // P2#1 (stale-velocity bug): seed the next scan's IMU integration from
+          // the CURRENT IMU-propagated velocity, not geo.prev_vel. geo.prev_vel
+          // is only refreshed by updateState() (accepted scans) or a GT snap, so
+          // during an N-frame rejection streak it stayed frozen at the last
+          // accepted scan's velocity while the vehicle's velocity vector rotated
+          // through the turn — every per-scan prior then extrapolated straight
+          // ("corner cutting", run-12 webm). state.v.lin.w is maintained at IMU
+          // rate by propagateState() and is the correct dead-reckoning velocity.
+          std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+          this->prev_vel = this->state.v.lin.w;
+        }
       }
       RCLCPP_WARN(this->get_logger(),
                   "Localization: ⚠ GICP %s — holding IMU dead-reckoning pose [%.2f, %.2f, %.2f] | fitness=%.4f time=%.2fms",
@@ -6927,38 +7154,77 @@ bool gicp_plusplus::LocalizationNode::imuMeasFromTimeRange(
 
   std::lock_guard<std::mutex> lock(this->mtx_imu);
 
-  if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    // Not enough IMU data yet
+  out.clear();
+  const bool empty = this->imu_buffer.empty();
+  const bool invalid_range =
+      !std::isfinite(start_time) || !std::isfinite(end_time) ||
+      start_time > end_time;
+  const bool missing_newer =
+      !empty && this->imu_buffer.front().stamp < end_time;
+  const double missing_older_s =
+      empty ? std::numeric_limits<double>::infinity()
+            : this->imu_buffer.back().stamp - start_time;
+  const bool missing_older =
+      !empty && missing_older_s > 0.002;
+  if (empty || invalid_range || missing_newer || missing_older) {
+    // Need a monotone window with one real IMU sample on or before start_time
+    // and one on or after end_time. imu_buffer is newest -> oldest.
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "IMU range unavailable: request=[%.6f,%.6f] buffer=[oldest=%.6f,"
+        "newest=%.6f,size=%zu] empty=%d invalid=%d missing_older=%d "
+        "missing_newer=%d",
+        start_time, end_time,
+        empty ? -1.0 : this->imu_buffer.back().stamp,
+        empty ? -1.0 : this->imu_buffer.front().stamp,
+        this->imu_buffer.size(), empty, invalid_range, missing_older,
+        missing_newer);
     return false;
   }
 
-  auto imu_it = this->imu_buffer.begin();
+  // Walk oldest -> newest while the lock is held. Keep only the newest sample
+  // at/before start_time, then every sample through the first one at/after
+  // end_time. The former reverse_iterator-range construction mixed a forward
+  // iterator boundary with reverse_iterator base semantics and could produce
+  // an empty slice even though the circular buffer visibly bracketed the
+  // requested interval. With real FLOAT64 Luminar point times that disabled
+  // IMU prediction/deskew on every frame and eventually caused high-speed
+  // GICP loss.
+  bool have_start_bracket = false;
+  for (auto it = this->imu_buffer.rbegin(); it != this->imu_buffer.rend(); ++it) {
+    if (!have_start_bracket) {
+      if (it->stamp <= start_time || out.empty()) {
+        // There can be many older samples. Retain only the nearest one so the
+        // returned slice starts at the interpolation bracket, not at the
+        // circular buffer's oldest entry. The out.empty() case admits at most
+        // 2 ms of start-side extrapolation (guarded above), covering the
+        // sub-millisecond seed-vs-first-IMU phase seen at replay startup.
+        out.clear();
+        out.push_back(*it);
+      } else if (!out.empty()) {
+        have_start_bracket = true;
+        out.push_back(*it);
+        if (it->stamp >= end_time) {
+          return out.size() >= 2;
+        }
+      }
+      continue;
+    }
 
-  auto last_imu_it = imu_it;
-  imu_it++;
-  while (imu_it != this->imu_buffer.end() && imu_it->stamp >= end_time) {
-    last_imu_it = imu_it;
-    imu_it++;
+    out.push_back(*it);
+    if (it->stamp >= end_time) {
+      return out.size() >= 2;
+    }
   }
 
-  while (imu_it != this->imu_buffer.end() && imu_it->stamp >= start_time) {
-    imu_it++;
-  }
-
-  if (imu_it == this->imu_buffer.end()) {
-    // not enough IMU measurements
-    return false;
-  }
-  imu_it++;
-
-  // [REVIEW FIX 2026-07-08 P1] Copy the slice out (forward time order: from
-  // the sample just before start_time through the sample at/after end_time)
-  // while STILL holding mtx_imu. Iterators into the circular buffer must not
-  // survive past the lock: a concurrent IMU push_front invalidates them.
-  out.assign(boost::circular_buffer<ImuMeas>::reverse_iterator(imu_it),
-             boost::circular_buffer<ImuMeas>::reverse_iterator(last_imu_it));
-
-  return true;
+  out.clear();
+  RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "IMU range traversal failed despite bracket guard: request=[%.6f,%.6f] "
+      "buffer=[oldest=%.6f,newest=%.6f,size=%zu]",
+      start_time, end_time, this->imu_buffer.back().stamp,
+      this->imu_buffer.front().stamp, this->imu_buffer.size());
+  return false;
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
@@ -7322,6 +7588,18 @@ void gicp_plusplus::LocalizationNode::propagateState(const ImuMeas& imu_local) {
 
   // Ground vehicle Z-velocity damping (same as in updateState)
   new_v_lin_w[2] *= (1.0f - dt * static_cast<float>(this->geo_Kz_damping_));
+  if (this->geo_max_state_speed_ > 0.0) {
+    const float speed = new_v_lin_w.norm();
+    if (std::isfinite(speed) &&
+        speed > static_cast<float>(this->geo_max_state_speed_)) {
+      new_v_lin_w *= static_cast<float>(this->geo_max_state_speed_) / speed;
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "propagateState: observer speed %.1fm/s exceeded physical cap %.1fm/s; "
+          "clamped (inspect GICP rejection/recovery)",
+          static_cast<double>(speed), this->geo_max_state_speed_);
+    }
+  }
 
   // Orientation propagation
   omega.w() = 0;
@@ -7771,6 +8049,19 @@ void gicp_plusplus::LocalizationNode::updateState() {
   // A ground vehicle's true Z-velocity is ~0; residual gravity miscompensation
   // causes vel_z to drift. Apply exponential decay each update.
   this->state.v.lin.w[2] *= (1.0f - dt_eff * this->geo_Kz_damping_);
+  if (this->geo_max_state_speed_ > 0.0) {
+    const float speed = this->state.v.lin.w.norm();
+    if (std::isfinite(speed) &&
+        speed > static_cast<float>(this->geo_max_state_speed_)) {
+      this->state.v.lin.w *=
+          static_cast<float>(this->geo_max_state_speed_) / speed;
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "updateState: observer speed %.1fm/s exceeded physical cap %.1fm/s; "
+          "clamped",
+          static_cast<double>(speed), this->geo_max_state_speed_);
+    }
+  }
 
   // Orientation correction
   this->state.q.w() += dt_eff * this->geo_Kq_ * qcorr.w();
