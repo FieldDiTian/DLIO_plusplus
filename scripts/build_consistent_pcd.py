@@ -58,7 +58,9 @@ def matrix_from_manifest(manifest: dict, key: str) -> np.ndarray:
     return matrix
 
 
-def read_manifest(pcd_path: Path) -> tuple[Path, dict]:
+def read_manifest(
+    pcd_path: Path, allow_missing_origin: bool = False
+) -> tuple[Path, dict]:
     path = pcd_path.with_suffix(pcd_path.suffix + ".manifest.yaml")
     if not path.is_file():
         raise FileNotFoundError(f"required map provenance manifest not found: {path}")
@@ -68,8 +70,24 @@ def read_manifest(pcd_path: Path) -> tuple[Path, dict]:
         raise ValueError(f"{path}: expected a YAML mapping")
     if manifest.get("frame") != "enu":
         raise ValueError(f"{path}: input map frame must be 'enu'")
-    if not manifest.get("enu_origin"):
+    matrix_from_manifest(manifest, "T_world_utm")
+    matrix_from_manifest(manifest, "T_output_enu_input_enu")
+    origin = str(manifest.get("enu_origin", "")).split("#", 1)[0].strip()
+    if not origin or origin.startswith("UNSPECIFIED"):
+        if allow_missing_origin:
+            return path, manifest
         raise ValueError(f"{path}: input map must declare enu_origin")
+    parts = [part for part in re.split(r"[\s,]+", origin) if part]
+    if len(parts) != 3:
+        raise ValueError(f"{path}: enu_origin must be lat,lon,alt, got {origin!r}")
+    try:
+        lat, lon, alt = (float(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"{path}: non-numeric enu_origin {origin!r}") from exc
+    if not all(math.isfinite(value) for value in (lat, lon, alt)):
+        raise ValueError(f"{path}: non-finite enu_origin {origin!r}")
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError(f"{path}: enu_origin latitude/longitude out of range")
     return path, manifest
 
 
@@ -287,6 +305,12 @@ def main() -> int:
     parser.add_argument("--min-sessions", type=int, default=2)
     parser.add_argument("--corridor-trajectory", type=Path, required=True)
     parser.add_argument(
+        "--corridor-source-index",
+        type=int,
+        help="0-based input_pcd index whose GLIM trajectory/transform produced "
+        "--corridor-trajectory; mandatory for multi-source builds.",
+    )
+    parser.add_argument(
         "--corridor-index-range",
         type=str,
         required=True,
@@ -306,10 +330,21 @@ def main() -> int:
         action="store_true",
         help="Replace an existing output PCD/manifest.",
     )
+    parser.add_argument(
+        "--allow-missing-origin",
+        action="store_true",
+        help="compatibility escape for legacy UNSPECIFIED origins; unsafe for deployment maps",
+    )
     args = parser.parse_args()
 
     if len(args.input_pcd) < 2:
         parser.error("at least two input PCDs are required for a consistency map")
+    if args.corridor_source_index is None:
+        parser.error(
+            "--corridor-source-index is mandatory when multiple source maps are used"
+        )
+    if not 0 <= args.corridor_source_index < len(args.input_pcd):
+        parser.error("--corridor-source-index is outside the input_pcd list")
     if not math.isfinite(args.voxel_size) or args.voxel_size <= 0.0:
         parser.error("--voxel-size must be finite and > 0")
     if args.min_sessions < 2 or args.min_sessions > len(args.input_pcd):
@@ -323,11 +358,25 @@ def main() -> int:
     except ValueError as exc:
         parser.error(f"--corridor-index-range invalid: {exc}")
 
-    manifest_pairs = [read_manifest(path) for path in args.input_pcd]
-    reference_origin = str(manifest_pairs[0][1]["enu_origin"]).split("#", 1)[0].strip()
-    coverage_manifest_pairs = [read_manifest(path) for path in args.coverage_pcd]
+    all_input_paths = [path.resolve() for path in args.input_pcd + args.coverage_pcd]
+    if len(set(all_input_paths)) != len(all_input_paths):
+        parser.error("duplicate input/coverage PCD paths are not allowed")
+    if args.output_pcd.resolve() in set(all_input_paths):
+        parser.error("output PCD must not collide with an input or coverage PCD")
+
+    manifest_pairs = [
+        read_manifest(path, args.allow_missing_origin)
+        for path in args.input_pcd
+    ]
+    reference_origin = str(
+        manifest_pairs[0][1].get("enu_origin", "UNSPECIFIED")
+    ).split("#", 1)[0].strip()
+    coverage_manifest_pairs = [
+        read_manifest(path, args.allow_missing_origin)
+        for path in args.coverage_pcd
+    ]
     for manifest_path, manifest in manifest_pairs[1:] + coverage_manifest_pairs:
-        origin = str(manifest["enu_origin"]).split("#", 1)[0].strip()
+        origin = str(manifest.get("enu_origin", "UNSPECIFIED")).split("#", 1)[0].strip()
         if origin != reference_origin:
             raise SystemExit(
                 f"ENU datum mismatch: {manifest_path} has {origin!r}, "
@@ -368,7 +417,7 @@ def main() -> int:
     centerline = transformed_centerline(
         args.corridor_trajectory,
         corridor_range,
-        manifest_pairs[0][1],
+        manifest_pairs[args.corridor_source_index][1],
         args.centerline_stride,
     )
     tree = cKDTree(centerline[:, :2])
@@ -462,6 +511,13 @@ def main() -> int:
             "coverage_voxels_added": coverage_added_counts,
             "corridor_radius_m": float(args.corridor_radius),
             "corridor_trajectory": str(args.corridor_trajectory.resolve()),
+            "corridor_source_index": int(args.corridor_source_index),
+            "corridor_source_map": str(
+                args.input_pcd[args.corridor_source_index].resolve()
+            ),
+            "corridor_source_manifest": str(
+                manifest_pairs[args.corridor_source_index][0].resolve()
+            ),
             "corridor_index_range": args.corridor_index_range,
             "corridor_centerline_stride": int(args.centerline_stride),
             "algorithm": (
@@ -472,9 +528,23 @@ def main() -> int:
         }
         # Keep the exact upstream transforms, so the driven centerline and map
         # frame remain independently auditable.
-        manifest["T_world_utm"] = manifest_pairs[0][1]["T_world_utm"]
-        manifest["T_output_enu_input_enu"] = manifest_pairs[0][1][
+        corridor_manifest = manifest_pairs[args.corridor_source_index][1]
+        manifest["T_world_utm"] = corridor_manifest["T_world_utm"]
+        manifest["T_output_enu_input_enu"] = corridor_manifest[
             "T_output_enu_input_enu"
+        ]
+        manifest["source_transforms"] = [
+            {
+                "source_index": index,
+                "pcd": str(pcd.resolve()),
+                "T_world_utm": source_manifest["T_world_utm"],
+                "T_output_enu_input_enu": source_manifest[
+                    "T_output_enu_input_enu"
+                ],
+            }
+            for index, (pcd, (_, source_manifest)) in enumerate(
+                zip(args.input_pcd, manifest_pairs)
+            )
         ]
         manifest["output_formula"] = (
             "consistent_voxels + unique_voxels_kept_outside_corridor "

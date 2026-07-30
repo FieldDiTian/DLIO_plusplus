@@ -319,12 +319,24 @@ If you ever switch sensors and the deskew looks wrong, use the one-shot diagnost
      --bag /path/to/DATASET_ROOT/prep_bag/<run>_front_atlas_gicp \
      --run-name <run>_compressed_full_1x \
      --overlay /path/to/gicp/install/setup.bash \
+     --mode gnss_aided \
+     --reference-is-gt-ack \
      --config-path GICP_plusplus/cfg/front_quality_replay.yaml \
      --start-offset 0 \
      --duration <full-overlap-seconds> \
      --rate 1.0 \
      --primary-queue-size 32
    ```
+   `gnss_aided` explicitly labels that Atlas participates in localization.
+   When the same Atlas odometry is also the score reference, the acknowledgement
+   flag is mandatory because that evidence is not independent truth.
+   `--mode independent` instead requires a `--reference-topic` distinct from
+   the runtime `--gt-topic`; a YAML profile alone cannot make the same aided
+   stream independent truth. The optional
+   `GICP_plusplus/cfg/front_no_atlas_translation_replay.yaml` removes
+   per-scan Atlas translation seeding/gating for a registration A/B, but does
+   not relabel its evidence as independent. Acceptance, rejection-streak,
+   debug-coverage, and zero-drop gates are explicit runner flags.
    The offline audit uses RELIABLE LiDAR publication/subscription on both
    sides so a large PointCloud2 cannot disappear in DDS without accounting.
    Its 50,000-message rosbag read-ahead queue keeps storage/decompression

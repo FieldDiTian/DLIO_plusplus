@@ -932,7 +932,13 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
-  glim->save(dump_path);
+  try {
+    glim->save(dump_path);
+  } catch (const std::exception& e) {
+    hard_error = true;
+    spdlog::critical(
+      "GLIM dump save failed after retaining all recoverable submaps: {}", e.what());
+  }
   const size_t num_submaps = glim->num_submaps();
   if (num_submaps == 0) {
     spdlog::critical(

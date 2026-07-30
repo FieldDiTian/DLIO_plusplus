@@ -28,6 +28,12 @@ usage() {
     '  --imu-topic TOPIC            default /gps_p1/imu' \
     '  --gt-topic TOPIC             default /gps_p1/filtered_odom' \
     '  --reference-topic TOPIC      defaults to --gt-topic' \
+    '  --mode MODE                  evidence label: gnss_aided | independent' \
+    '  --reference-is-gt-ack        acknowledge aided scoring is not independent truth' \
+    '  --min-accept-rate FRACTION   scorecard gate; default 0 (disabled)' \
+    '  --max-rejection-streak N     scorecard gate; default 0 (disabled)' \
+    '  --min-debug-coverage FRACTION fail if debug frames/input scans is lower; default 0.80' \
+    '  --require-zero-drops         fail on front drops or timestamp resets' \
     '  --primary-queue-size N       default 8' \
     '  --read-ahead-queue-size N    rosbag playback prefetch; default 50000' \
     '  --config-path YAML           run-local overrides loaded after package defaults' \
@@ -51,6 +57,12 @@ POINTCLOUD_TOPIC=/luminar_front/points
 IMU_TOPIC=/gps_p1/imu
 GT_TOPIC=/gps_p1/filtered_odom
 REFERENCE_TOPIC=
+MODE=
+REFERENCE_IS_GT_ACK=false
+MIN_ACCEPT_RATE=0
+MAX_REJECTION_STREAK=0
+MIN_DEBUG_COVERAGE=0.80
+REQUIRE_ZERO_DROPS=false
 PRIMARY_QUEUE_SIZE=8
 READ_AHEAD_QUEUE_SIZE=50000
 CONFIG_PATH=
@@ -81,6 +93,12 @@ while [[ $# -gt 0 ]]; do
     --imu-topic) IMU_TOPIC="${2:?missing value}"; shift 2 ;;
     --gt-topic) GT_TOPIC="${2:?missing value}"; shift 2 ;;
     --reference-topic) REFERENCE_TOPIC="${2:?missing value}"; shift 2 ;;
+    --mode) MODE="${2:?missing value}"; shift 2 ;;
+    --reference-is-gt-ack) REFERENCE_IS_GT_ACK=true; shift ;;
+    --min-accept-rate) MIN_ACCEPT_RATE="${2:?missing value}"; shift 2 ;;
+    --max-rejection-streak) MAX_REJECTION_STREAK="${2:?missing value}"; shift 2 ;;
+    --min-debug-coverage) MIN_DEBUG_COVERAGE="${2:?missing value}"; shift 2 ;;
+    --require-zero-drops) REQUIRE_ZERO_DROPS=true; shift ;;
     --primary-queue-size) PRIMARY_QUEUE_SIZE="${2:?missing value}"; shift 2 ;;
     --read-ahead-queue-size) READ_AHEAD_QUEUE_SIZE="${2:?missing value}"; shift 2 ;;
     --config-path) CONFIG_PATH="${2:?missing value}"; shift 2 ;;
@@ -113,25 +131,46 @@ if [[ ${#BAGS[@]} -eq 0 ]]; then
   printf 'At least one --bag is required\n' >&2
   exit 2
 fi
+if [[ "$MODE" != "gnss_aided" && "$MODE" != "independent" ]]; then
+  printf '%s\n' '--mode must be explicitly set to gnss_aided or independent' >&2
+  exit 2
+fi
 if [[ ! "$PRIMARY_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ||
-      ! "$READ_AHEAD_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+      ! "$READ_AHEAD_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ||
+      ! "$MAX_REJECTION_STREAK" =~ ^[0-9]+$ ]]; then
   printf 'Queue sizes must be positive integers\n' >&2
   exit 2
 fi
+if ! awk -v a="$MIN_ACCEPT_RATE" -v c="$MIN_DEBUG_COVERAGE" \
+    'BEGIN { exit !(a >= 0 && a <= 1 && c >= 0 && c <= 1) }'; then
+  printf 'Acceptance and coverage thresholds must be fractions in [0,1]\n' >&2
+  exit 2
+fi
 
-MAP="$(realpath -e "$MAP")"
-OVERLAY="$(realpath -e "$OVERLAY")"
+resolve_existing() {
+  local label="$1"
+  local path="$2"
+  local resolved
+  if ! resolved="$(realpath -e -- "$path" 2>/dev/null)"; then
+    printf '%s does not exist: %s\n' "$label" "$path" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+MAP="$(resolve_existing Map "$MAP")" || exit 3
+OVERLAY="$(resolve_existing Overlay "$OVERLAY")" || exit 3
 for index in "${!BAGS[@]}"; do
-  BAGS[$index]="$(realpath -e "${BAGS[$index]}")"
+  BAGS[$index]="$(resolve_existing Bag "${BAGS[$index]}")" || exit 3
 done
 if [[ -n "$QOS_OVERRIDES" ]]; then
-  QOS_OVERRIDES="$(realpath -e "$QOS_OVERRIDES")"
+  QOS_OVERRIDES="$(resolve_existing 'QoS overrides' "$QOS_OVERRIDES")" || exit 3
 fi
 if [[ -n "$BRIDGE_SCRIPT" ]]; then
-  BRIDGE_SCRIPT="$(realpath -e "$BRIDGE_SCRIPT")"
+  BRIDGE_SCRIPT="$(resolve_existing 'Bridge script' "$BRIDGE_SCRIPT")" || exit 3
 fi
 if [[ -n "$CONFIG_PATH" ]]; then
-  CONFIG_PATH="$(realpath -e "$CONFIG_PATH")"
+  CONFIG_PATH="$(resolve_existing 'Config path' "$CONFIG_PATH")" || exit 3
 fi
 
 if [[ "$MAP" == */maps/* ]]; then
@@ -169,6 +208,20 @@ fi
 if [[ -z "$REFERENCE_TOPIC" ]]; then
   REFERENCE_TOPIC="$GT_TOPIC"
 fi
+if [[ "$MODE" == "gnss_aided" && "$REFERENCE_TOPIC" == "$GT_TOPIC" &&
+      "$REFERENCE_IS_GT_ACK" != "true" ]]; then
+  printf '%s\n' \
+    'The GNSS-aided run uses the same topic for seeding/gating and scoring.' \
+    'Pass --reference-is-gt-ack to label and acknowledge this non-independent evidence,' \
+    'or pass a genuinely independent --reference-topic.' >&2
+  exit 2
+fi
+if [[ "$MODE" == "independent" && "$REFERENCE_TOPIC" == "$GT_TOPIC" ]]; then
+  printf '%s\n' \
+    'Independent evidence requires --reference-topic to differ from the runtime --gt-topic.' \
+    'A parameter profile alone cannot turn the same aided stream into independent truth.' >&2
+  exit 2
+fi
 if [[ ${#PLAY_TOPICS[@]} -eq 0 ]]; then
   PLAY_TOPICS=(
     "$POINTCLOUD_TOPIC"
@@ -194,6 +247,7 @@ launch_pid=
 record_pid=
 reference_record_pid=
 resource_pid=
+playback_pid=
 
 stop_pid() {
   local pid="${1:-}"
@@ -223,6 +277,7 @@ stop_launch() {
 }
 
 cleanup() {
+  stop_pid "$playback_pid"
   stop_pid "$record_pid"
   stop_pid "$reference_record_pid"
   stop_launch
@@ -285,13 +340,37 @@ record_pid=$!
 ros2 bag record --storage mcap --output "$RUN_DIR/reference_topics_bag" \
   "$REFERENCE_TOPIC" >"$RUN_DIR/reference_record.log" 2>&1 &
 reference_record_pid=$!
-sleep 2
+
+wait_for_subscription() {
+  local topic="$1"
+  local label="$2"
+  local count
+  for _ in {1..60}; do
+    count="$(ros2 topic info "$topic" 2>/dev/null |
+      awk '/Subscription count:/ {print $3; exit}')"
+    if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+      return 0
+    fi
+    if ! kill -0 "$record_pid" 2>/dev/null ||
+        ! kill -0 "$reference_record_pid" 2>/dev/null; then
+      printf 'Recorder exited while waiting for %s subscription\n' "$label" >&2
+      return 1
+    fi
+    sleep 0.25
+  done
+  printf 'Timed out waiting for recorder subscription: %s (%s)\n' "$label" "$topic" >&2
+  return 1
+}
+
+wait_for_subscription /gicp/localization/debug/fitness 'debug evidence' || exit 5
+wait_for_subscription "$REFERENCE_TOPIC" 'reference evidence' || exit 5
 
 declare -a play_args=()
 for bag in "${BAGS[@]}"; do
   play_args+=(-i "$bag" "$STORAGE_ID")
 done
 play_args+=(
+  --start-paused
   --read-ahead-queue-size "$READ_AHEAD_QUEUE_SIZE"
   --rate "$RATE"
   --start-offset "$START_OFFSET"
@@ -301,13 +380,40 @@ play_args+=(
   --topics
 )
 play_args+=("${PLAY_TOPICS[@]}")
-if [[ "$LIDAR_RELIABLE_QOS" == "true" ]]; then
+if [[ -n "$QOS_OVERRIDES" ]]; then
   play_args+=(--qos-profile-overrides-path "$QOS_OVERRIDES")
 fi
 
 play_start_ns="$(date +%s%N)"
-ros2 bag play "${play_args[@]}" >"$RUN_DIR/playback.log" 2>&1
-playback_exit=$?
+ros2 bag play "${play_args[@]}" >"$RUN_DIR/playback.log" 2>&1 &
+playback_pid=$!
+resume_ready=0
+for _ in {1..120}; do
+  if ros2 service list 2>/dev/null | grep -qx '/rosbag2_player/resume'; then
+    resume_ready=1
+    break
+  fi
+  if ! kill -0 "$playback_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$resume_ready" -ne 1 ]]; then
+  printf 'rosbag player exited or never exposed the resume service\n' >&2
+  playback_exit=7
+  stop_pid "$playback_pid"
+else
+  if ! ros2 service call /rosbag2_player/resume rosbag2_interfaces/srv/Resume '{}' \
+      >"$RUN_DIR/resume.log" 2>&1; then
+    printf 'Failed to resume paused rosbag playback\n' >&2
+    playback_exit=8
+    stop_pid "$playback_pid"
+  else
+    wait "$playback_pid"
+    playback_exit=$?
+  fi
+fi
+playback_pid=
 play_end_ns="$(date +%s%N)"
 
 sleep 3
@@ -354,17 +460,103 @@ play_wall_s="$(awk -v start="$play_start_ns" -v end="$play_end_ns" \
   if [[ -n "$CONFIG_PATH" ]]; then
     printf 'config_sha256=%s\n' "$(sha256sum "$CONFIG_PATH" | awk '{print $1}')"
   fi
+  printf 'qos_overrides=%s\n' "$QOS_OVERRIDES"
+  printf 'play_topics=%s\n' "${PLAY_TOPICS[*]}"
+  printf 'bridge_script=%s\n' "$BRIDGE_SCRIPT"
+  printf 'bridge_args=%s\n' "${BRIDGE_ARGS[*]}"
   printf 'pointcloud_topic=%s\n' "$POINTCLOUD_TOPIC"
   printf 'imu_topic=%s\n' "$IMU_TOPIC"
   printf 'gt_topic=%s\n' "$GT_TOPIC"
   printf 'reference_topic=%s\n' "$REFERENCE_TOPIC"
+  printf 'mode=%s\n' "$MODE"
+  printf 'reference_is_gt_ack=%s\n' "$REFERENCE_IS_GT_ACK"
+  printf 'min_accept_rate=%s\n' "$MIN_ACCEPT_RATE"
+  printf 'max_rejection_streak=%s\n' "$MAX_REJECTION_STREAK"
+  printf 'min_debug_coverage=%s\n' "$MIN_DEBUG_COVERAGE"
+  printf 'require_zero_drops=%s\n' "$REQUIRE_ZERO_DROPS"
 } >"$RUN_DIR/run_status.env"
 
-python3 "$SCRIPT_DIR/../GICP_plusplus/scripts/analyze_scan_debug_log.py" \
-  "$RUN_DIR/localization.log" \
-  >"$RUN_DIR/scan_debug_scorecard.md" \
-  2>"$RUN_DIR/scan_debug_scorecard.err" || true
+ros2 bag info "$RUN_DIR/debug_topics_bag" \
+  >"$RUN_DIR/debug_topics_bag.info" 2>"$RUN_DIR/debug_topics_bag.info.err"
+debug_info_exit=$?
+ros2 bag info "$RUN_DIR/reference_topics_bag" \
+  >"$RUN_DIR/reference_topics_bag.info" 2>"$RUN_DIR/reference_topics_bag.info.err"
+reference_info_exit=$?
+bag_message_count() {
+  awk '/^Messages:/ {print $2; exit}' "$1"
+}
+debug_messages="$(bag_message_count "$RUN_DIR/debug_topics_bag.info")"
+reference_messages="$(bag_message_count "$RUN_DIR/reference_topics_bag.info")"
+debug_messages="${debug_messages:-0}"
+reference_messages="${reference_messages:-0}"
 
-if [[ "$playback_exit" -ne 0 || "$launch_alive" -ne 1 ]]; then
+declare -a analyzer_args=(
+  "$RUN_DIR/localization.log"
+  --json-out "$RUN_DIR/scan_debug_scorecard.json"
+  --mode "$MODE"
+  --min-accept-rate "$MIN_ACCEPT_RATE"
+  --max-rejection-streak "$MAX_REJECTION_STREAK"
+)
+if [[ "$REQUIRE_ZERO_DROPS" == "true" ]]; then
+  analyzer_args+=(--require-zero-drops)
+fi
+python3 "$SCRIPT_DIR/../GICP_plusplus/scripts/analyze_scan_debug_log.py" \
+  "${analyzer_args[@]}" \
+  >"$RUN_DIR/scan_debug_scorecard.md" \
+  2>"$RUN_DIR/scan_debug_scorecard.err"
+analyzer_exit=$?
+
+debug_frames=0
+if [[ -s "$RUN_DIR/scan_debug_scorecard.json" ]]; then
+  debug_frames="$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["frames"])' \
+    "$RUN_DIR/scan_debug_scorecard.json")"
+fi
+expected_input_frames=0
+for index in "${!BAGS[@]}"; do
+  bag="${BAGS[$index]}"
+  bag_info="$RUN_DIR/input_$(printf '%02d' "$index").info"
+  ros2 bag info "$bag" >"$bag_info" 2>"$bag_info.err" || continue
+  bag_duration="$(sed -n 's/^Duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$bag_info" | head -1)"
+  topic_count="$(awk -v topic="$POINTCLOUD_TOPIC" \
+    'index($0, "Topic: " topic " ") {
+       if (match($0, /Count: [0-9]+/)) {
+         value=substr($0, RSTART+7, RLENGTH-7); print value; exit
+       }
+     }' "$bag_info")"
+  if [[ -n "$bag_duration" && -n "$topic_count" ]]; then
+    estimate="$(awk -v count="$topic_count" -v total="$bag_duration" \
+      -v start="$START_OFFSET" -v duration="$DURATION" \
+      'BEGIN {
+         available=total-start; if (available < 0) available=0;
+         window=(duration < available ? duration : available);
+         estimated=(total > 0 ? count*window/total : 0);
+         printf "%d", estimated
+       }')"
+    expected_input_frames=$((expected_input_frames + estimate))
+  fi
+done
+debug_coverage="$(awk -v actual="$debug_frames" -v expected="$expected_input_frames" \
+  'BEGIN {
+     coverage=(expected > 0 ? actual/expected : 0);
+     printf "%.6f", coverage
+   }')"
+{
+  printf 'debug_bag_info_exit=%s\n' "$debug_info_exit"
+  printf 'reference_bag_info_exit=%s\n' "$reference_info_exit"
+  printf 'debug_messages=%s\n' "$debug_messages"
+  printf 'reference_messages=%s\n' "$reference_messages"
+  printf 'analyzer_exit=%s\n' "$analyzer_exit"
+  printf 'debug_frames=%s\n' "$debug_frames"
+  printf 'expected_input_frames=%s\n' "$expected_input_frames"
+  printf 'debug_coverage=%s\n' "$debug_coverage"
+} >>"$RUN_DIR/run_status.env"
+
+if [[ "$playback_exit" -ne 0 || "$launch_alive" -ne 1 ||
+      "$debug_info_exit" -ne 0 || "$reference_info_exit" -ne 0 ||
+      "$debug_messages" -eq 0 || "$reference_messages" -eq 0 ||
+      "$analyzer_exit" -ne 0 || "$expected_input_frames" -eq 0 ]] ||
+    ! awk -v actual="$debug_coverage" -v minimum="$MIN_DEBUG_COVERAGE" \
+      'BEGIN { exit !(actual >= minimum) }'; then
   exit 6
 fi

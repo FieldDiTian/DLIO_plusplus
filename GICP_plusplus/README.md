@@ -121,7 +121,7 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
 | `lidar_concat_enabled` | `false` | Opt in to front+left+right online GICP for synchronization/diagnostic A/B tests. Production uses a three-LiDAR offline map with front-only online GICP to meet 10 Hz. |
 | `primary_queue_size` | `8` | Bounded front compute queue. Keep 8 for live operation. A lossless offline replay may use a larger bounded queue to absorb rosbag delivery bursts, but must separately prove sub-100 ms scan compute and zero overload drops. |
-| `config_path` | empty | Optional run-local YAML loaded after the package default, used for reproducible profiles such as `cfg/front_quality_replay.yaml`. |
+| `config_path` | empty | Optional run-local YAML loaded after the package default. Parameter files are logged in precedence order. Use `cfg/front_quality_replay.yaml` for the GNSS-aided Laguna profile or `cfg/front_no_atlas_translation_replay.yaml` for the per-scan zero-Atlas-translation A/B. |
 | `urdf_path` | (auto-found) | Path to the URDF (`av24.urdf`) used for offline extrinsic resolution. The launch resolves it by walking up from the launch dir; `av24.urdf` is also installed into `share/gicp_plusplus`. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | `child_frame` overrides `localization/lidar_frame` (the LiDAR link the node resolves extrinsics for); `parent_frame` is declared but currently unused (no static-TF helper is launched — `robot_state_publisher` provides the URDF tree). |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
@@ -327,11 +327,21 @@ optional ratio thresholds can still be evaluated in an explicit A/B.
 `cfg/front_quality_replay.yaml` is the checked-in Laguna compressed-map
 profile used through the launch file's `config_path` argument. It leaves the
 production motion chain enabled, uses 0.25 m target and 0.30 m source voxels
-with a 100 m sensor-frame crop, 32 iterations, and an 80 ms optimizer budget.
+with a 100 m sensor-frame crop, 32 iterations, and an 80 ms cooperative
+scan-registration budget. The budget includes source KD-tree/covariance
+preparation and passes only its remaining time to the iterative optimizer.
 Atlas translation seeds only the GICP optimizer; it never modifies
 `basePose`, observer state, or published output. Every candidate must still
 pass correspondence, physical-jump, and the unchanged 5 m Atlas wrong-basin
 gate.
+
+`cfg/front_no_atlas_translation_replay.yaml` is the registration-side A/B: it
+sets both the per-scan Atlas translation seed blend and Atlas
+candidate-position gate to zero. Package defaults may still use Atlas for
+initialization, heading, and recovery, so this profile is not independent
+truth. The audit runner requires an explicit `gnss_aided` or `independent`
+evidence label; independent evidence must use a reference topic distinct from
+the runtime GT topic.
 
 Use the profile with the topic-reduced replay bag and the repository audit
 runner documented in the root workflow. A rate pass requires 1.0x playback,

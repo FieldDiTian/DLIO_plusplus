@@ -712,6 +712,85 @@ bool luminarCloudUsesRelativeFloat64(
              datatype, count, float64_time_is_epoch_ns);
 }
 
+// Sanity-check the explicit FLOAT64 carrier contract against the first cloud.
+// A raw epoch-ns carrier is plausible only when the uint64 interpretation lies
+// close to the header epoch and spans at most a sweep. Ordinary doubles are
+// plausible only as finite, small scan-relative seconds. This catches the
+// otherwise silent configuration inversion where both interpretations still
+// produce finite numbers.
+bool luminarFloat64TimeContractMatches(
+    const sensor_msgs::msg::PointCloud2& msg, bool expect_raw_epoch_ns,
+    std::string& detail) {
+  int time_off = -1;
+  uint8_t datatype = 0;
+  int count = 0;
+  if (!findTimeField(msg, time_off, datatype, count) ||
+      datatype != sensor_msgs::msg::PointField::FLOAT64 || count != 1) {
+    detail = "cloud does not advertise a FLOAT64[1] time field";
+    return true;
+  }
+  if (msg.is_bigendian || time_off < 0 || msg.point_step == 0 ||
+      static_cast<uint32_t>(time_off) + sizeof(uint64_t) > msg.point_step) {
+    detail = "malformed or big-endian FLOAT64 time field";
+    return false;
+  }
+  const size_t point_count = static_cast<size_t>(msg.width) * msg.height;
+  const size_t required_bytes =
+      point_count * static_cast<size_t>(msg.point_step);
+  if (point_count == 0 || msg.data.size() < required_bytes) {
+    detail = "empty or truncated FLOAT64 time payload";
+    return false;
+  }
+
+  double min_double = std::numeric_limits<double>::infinity();
+  double max_double = -std::numeric_limits<double>::infinity();
+  uint64_t min_raw = std::numeric_limits<uint64_t>::max();
+  uint64_t max_raw = 0;
+  bool doubles_finite = true;
+  for (size_t i = 0; i < point_count; ++i) {
+    const uint8_t* tp =
+        msg.data.data() + i * msg.point_step + static_cast<size_t>(time_off);
+    double as_double = 0.0;
+    uint64_t as_raw = 0;
+    std::memcpy(&as_double, tp, sizeof(as_double));
+    std::memcpy(&as_raw, tp, sizeof(as_raw));
+    doubles_finite = doubles_finite && std::isfinite(as_double);
+    min_double = std::min(min_double, as_double);
+    max_double = std::max(max_double, as_double);
+    if (as_raw != 0) {
+      min_raw = std::min(min_raw, as_raw);
+      max_raw = std::max(max_raw, as_raw);
+    }
+  }
+
+  const uint64_t header_ns =
+      static_cast<uint64_t>(msg.header.stamp.sec) * 1000000000ULL +
+      static_cast<uint64_t>(msg.header.stamp.nanosec);
+  const bool raw_nonempty = min_raw != std::numeric_limits<uint64_t>::max();
+  const uint64_t raw_mid = raw_nonempty ? min_raw + (max_raw - min_raw) / 2 : 0;
+  const uint64_t raw_header_error =
+      raw_mid > header_ns ? raw_mid - header_ns : header_ns - raw_mid;
+  const bool raw_plausible =
+      raw_nonempty && header_ns > 1000000000000000ULL &&
+      min_raw > 1000000000000000ULL && max_raw >= min_raw &&
+      max_raw - min_raw <= 2000000000ULL &&
+      raw_header_error <= 5000000000ULL;
+  const bool relative_plausible =
+      doubles_finite && min_double >= -1.0 && max_double <= 10.0 &&
+      max_double >= min_double && max_double - min_double <= 2.0;
+
+  std::ostringstream oss;
+  oss << std::setprecision(9)
+      << "double_range=[" << min_double << "," << max_double << "] "
+      << "raw_range=[" << min_raw << "," << max_raw << "] "
+      << "header_ns=" << header_ns
+      << " relative_plausible=" << relative_plausible
+      << " raw_epoch_plausible=" << raw_plausible;
+  detail = oss.str();
+  return expect_raw_epoch_ns ? raw_plausible
+                             : (relative_plausible && !raw_plausible);
+}
+
 inline bool luminarRawTimestampNsFromBytes(
     const uint8_t* tp, uint8_t datatype, int count, size_t bytes_avail,
     bool float64_time_is_epoch_ns, uint64_t& out) {
@@ -1425,6 +1504,8 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
     this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
     this->dbg_gicp_elapsed_ms_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gicp_elapsed_ms", 10);
+    this->dbg_scan_total_ms_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_total_ms", 10);
     this->dbg_corr_norm_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/corr_norm", 10);
     this->dbg_scan_dt_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_dt", 10);
     this->dbg_imu_age_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_age", 10);
@@ -1690,6 +1771,7 @@ void gicp_plusplus::LocalizationNode::getParams() {
 
   // Map parameters
   this->declare_parameter<std::string>("localization/map_path", "");
+  this->declare_parameter<bool>("localization/require_map_manifest", false);
   this->declare_parameter<std::string>("localization/utm_transform_path", "");
   // [P3 FIX 2026-07-10] optional ENU-datum enforcement against the map manifest
   this->declare_parameter<std::string>("localization/expected_enu_origin", "");
@@ -1708,6 +1790,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/map_rotation/yaw_deg", 0.0);
 
   this->get_parameter("localization/map_path", this->map_path_);
+  this->get_parameter(
+      "localization/require_map_manifest", this->require_map_manifest_);
 
   std::string utm_transform_path;
   this->get_parameter("localization/utm_transform_path", utm_transform_path);
@@ -1741,6 +1825,10 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/gt_odom/enable", true);  // [P3 FIX 2026-07-10] yaml-aligned
   this->declare_parameter<int>("localization/gt_odom/buffer_size", 200);
   this->declare_parameter<double>("localization/gt_odom/max_dt", 0.1);
+  this->declare_parameter<std::string>(
+      "localization/gt_odom/expected_frame_id", this->map_frame);
+  this->declare_parameter<std::string>(
+      "localization/gt_odom/expected_child_frame_id", this->base_frame);
   // Runtime GNSS/INS guard, not a scoring shortcut: an RTK-quality candidate
   // outside this radius is rejected before it can inject a false correction
   // into the geometric observer. Disabled in the C++ fallback; the Laguna
@@ -1757,6 +1845,11 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter("localization/gt_odom/enable", gt_enable);
   this->get_parameter("localization/gt_odom/buffer_size", gt_buf);
   this->get_parameter("localization/gt_odom/max_dt", gt_max_dt);
+  this->get_parameter(
+      "localization/gt_odom/expected_frame_id", this->gt_expected_frame_id_);
+  this->get_parameter(
+      "localization/gt_odom/expected_child_frame_id",
+      this->gt_expected_child_frame_id_);
   this->get_parameter(
       "localization/gt_odom/max_candidate_position_error_m",
       this->gt_max_candidate_pos_error_m_);
@@ -1793,10 +1886,13 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // RTK-fixed and float-mode covariances measured on AV-24 ~ 5e-5 m^2);
   // z threshold 1.0 m^2 (~1 m std, since GPS Z is naturally worse).
   this->declare_parameter<bool>("localization/rtk_gate/enable", true);
+  this->declare_parameter<bool>("localization/rtk_gate/allow_zero_covariance", false);
   this->declare_parameter<double>("localization/rtk_gate/max_pose_var_xy", 0.25);
   this->declare_parameter<double>("localization/rtk_gate/max_pose_var_z", 1.0);
   this->get_parameter("localization/rtk_gate/enable",
                       this->rtk_gate_enabled_);
+  this->get_parameter("localization/rtk_gate/allow_zero_covariance",
+                      this->rtk_gate_allow_zero_covariance_);
   this->get_parameter("localization/rtk_gate/max_pose_var_xy",
                       this->rtk_gate_max_pose_var_xy_);
   this->get_parameter("localization/rtk_gate/max_pose_var_z",
@@ -1837,7 +1933,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // Optional wall-clock budget for the iterative optimizer. Zero preserves
   // the unbounded historical behavior. A timed-out solve fails closed at the
   // INS prior instead of blocking LiDAR reception on a pathological basin.
-  this->declare_parameter<double>("gicp/maxOptimizationTimeMs", 0.0);
+  this->declare_parameter<double>("gicp/maxOptimizationTimeMsCooperative", 0.0);
+  this->declare_parameter<double>("gicp/maxOptimizationTimeMs", -1.0);
   this->declare_parameter<int>("gicp/correspondenceRandomness", 20);
   this->declare_parameter<double>("gicp/maxCorrespondenceDistance", 1.0);
   this->declare_parameter<double>("gicp/transformationEpsilon", 0.0001);
@@ -1935,8 +2032,22 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/ins_prior/max_yaw_sigma_deg", 3.0);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
-  this->get_parameter("gicp/maxOptimizationTimeMs",
+  this->get_parameter("gicp/maxOptimizationTimeMsCooperative",
                       this->gicp_max_optimization_time_ms_);
+  double legacy_max_optimization_time_ms = -1.0;
+  this->get_parameter(
+      "gicp/maxOptimizationTimeMs", legacy_max_optimization_time_ms);
+  if (legacy_max_optimization_time_ms >= 0.0) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "gicp/maxOptimizationTimeMs is deprecated; use "
+        "gicp/maxOptimizationTimeMsCooperative. The budget is cooperative "
+        "and includes source KD-tree/covariance preparation.");
+    if (this->gicp_max_optimization_time_ms_ <= 0.0) {
+      this->gicp_max_optimization_time_ms_ =
+          legacy_max_optimization_time_ms;
+    }
+  }
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
   this->get_parameter("gicp/maxCorrespondenceDistance", this->gicp_max_corr_dist_);
   this->get_parameter("gicp/transformationEpsilon", this->gicp_transformation_epsilon_);
@@ -2093,6 +2204,8 @@ void gicp_plusplus::LocalizationNode::getParams() {
   // regardless of this setting.
   this->declare_parameter<bool>(
       "localization/lidar_concat/float64_time_is_epoch_ns", false);
+  this->declare_parameter<bool>(
+      "localization/lidar_concat/float64_time_fail_on_mismatch", true);
   // Luminar acceptance gate: absolute point-time endpoint-range error
   // max(|min-min|,|max-max|) <= this. Header time is only a tie-break; the
   // 0.1 s header threshold stays solely for non-Luminar fallback matching.
@@ -2137,6 +2250,9 @@ void gicp_plusplus::LocalizationNode::getParams() {
   this->get_parameter(
       "localization/lidar_concat/float64_time_is_epoch_ns",
       this->concat_float64_time_is_epoch_ns_);
+  this->get_parameter(
+      "localization/lidar_concat/float64_time_fail_on_mismatch",
+      this->concat_float64_time_fail_on_mismatch_);
   // Fail LOUD on invalid offsets (GLIM config-loader policy): a NaN/inf or
   // extreme value would flow into point-range matching and the int64 ns
   // conversion in shiftCloudTimestamps (UB / corrupted absolute timestamps).
@@ -2505,16 +2621,25 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
   // a non-ENU frame is FATAL; a configured localization/expected_enu_origin
   // that mismatches the manifest is FATAL; a missing manifest (legacy map)
   // or unspecified origin warns and proceeds.
+  bool manifest_points_present = false;
+  size_t manifest_points = 0;
   {
     const std::string manifest_path = this->map_path_ + ".manifest.yaml";
     std::ifstream mf(manifest_path);
     if (!mf.is_open()) {
+      if (this->require_map_manifest_) {
+        RCLCPP_FATAL(
+            this->get_logger(),
+            "Required map manifest is missing at '%s'.",
+            manifest_path.c_str());
+        return false;
+      }
       RCLCPP_WARN(this->get_logger(),
                   "No map manifest at '%s' — cannot verify the map's frame/ENU datum "
                   "(legacy export?). Re-export with scripts/export_glim_dump_to_pcd.py.",
                   manifest_path.c_str());
     } else {
-      std::string line, mf_frame, mf_origin;
+      std::string line, mf_frame, mf_origin, mf_points;
       while (std::getline(mf, line)) {
         auto value_of = [&](const char* key) -> std::string {
           const std::string k(key);
@@ -2528,6 +2653,35 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
         };
         if (mf_frame.empty()) { const auto v = value_of("frame:"); if (!v.empty()) mf_frame = v; }
         if (mf_origin.empty()) { const auto v = value_of("enu_origin:"); if (!v.empty()) mf_origin = v; }
+        if (mf_points.empty()) { const auto v = value_of("points:"); if (!v.empty()) mf_points = v; }
+      }
+      if (!mf_points.empty()) {
+        try {
+          size_t parsed = 0;
+          const auto value = std::stoull(mf_points, &parsed);
+          if (parsed != mf_points.size() || value == 0) {
+            throw std::invalid_argument("points must be a positive integer");
+          }
+          manifest_points = static_cast<size_t>(value);
+          manifest_points_present = true;
+        } catch (const std::exception& e) {
+          RCLCPP_FATAL(
+              this->get_logger(),
+              "Map manifest points field is invalid ('%s'): %s",
+              mf_points.c_str(), e.what());
+          return false;
+        }
+      }
+      if (this->require_map_manifest_ &&
+          (mf_frame.empty() || mf_origin.empty() ||
+           mf_origin.rfind("UNSPECIFIED", 0) == 0 ||
+           !manifest_points_present)) {
+        RCLCPP_FATAL(
+            this->get_logger(),
+            "Required map manifest is partial: frame='%s' origin='%s' "
+            "points='%s'. A complete ENU provenance record is mandatory.",
+            mf_frame.c_str(), mf_origin.c_str(), mf_points.c_str());
+        return false;
       }
       if (!mf_frame.empty() && mf_frame != "enu") {
         RCLCPP_FATAL(this->get_logger(),
@@ -2552,8 +2706,21 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
       }
       std::string expected_origin;
       this->get_parameter("localization/expected_enu_origin", expected_origin);
+      if (this->require_map_manifest_ && expected_origin.empty()) {
+        RCLCPP_FATAL(
+            this->get_logger(),
+            "localization/require_map_manifest=true also requires "
+            "localization/expected_enu_origin; refusing an unverified datum.");
+        return false;
+      }
       if (!expected_origin.empty()) {
         if (mf_origin.empty() || mf_origin.rfind("UNSPECIFIED", 0) == 0) {
+          if (this->require_map_manifest_) {
+            RCLCPP_FATAL(
+                this->get_logger(),
+                "Required map manifest has no usable ENU datum.");
+            return false;
+          }
           RCLCPP_WARN(this->get_logger(),
                       "localization/expected_enu_origin is set but the map manifest carries no "
                       "datum — origin compatibility CANNOT be verified.");
@@ -2612,6 +2779,15 @@ bool gicp_plusplus::LocalizationNode::loadMap() {
 
   if (this->map_cloud->points.empty()) {
     RCLCPP_ERROR(this->get_logger(), "Loaded map is empty!");
+    return false;
+  }
+  if (manifest_points_present &&
+      manifest_points != this->map_cloud->points.size()) {
+    RCLCPP_FATAL(
+        this->get_logger(),
+        "Map/manifest pair is inconsistent: manifest points=%zu but loaded "
+        "PCD points=%zu. Refusing a partially replaced artifact pair.",
+        manifest_points, this->map_cloud->points.size());
     return false;
   }
 
@@ -3114,6 +3290,41 @@ void gicp_plusplus::LocalizationNode::enqueuePrimary(
     return;
   }
 
+  if (!this->concat_float64_contract_checked_.exchange(true)) {
+    std::string contract_detail;
+    if (!luminarFloat64TimeContractMatches(
+            *pc, this->concat_float64_time_is_epoch_ns_, contract_detail)) {
+      if (this->concat_float64_time_fail_on_mismatch_) {
+        {
+          std::lock_guard<std::mutex> lk(this->sync_mtx_);
+          ++this->front_received_;
+          ++this->front_invalid_;
+          this->sync_fatal_.store(true);
+        }
+        RCLCPP_FATAL(
+            this->get_logger(),
+            "Luminar FLOAT64 point-time carrier contradicts "
+            "localization/lidar_concat/float64_time_is_epoch_ns=%s: %s",
+            this->concat_float64_time_is_epoch_ns_ ? "true" : "false",
+            contract_detail.c_str());
+        rclcpp::shutdown();
+        return;
+      }
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "Luminar FLOAT64 point-time carrier mismatch ignored by explicit "
+          "escape hatch: %s",
+          contract_detail.c_str());
+    } else {
+      RCLCPP_INFO(
+          this->get_logger(),
+          "Luminar FLOAT64 point-time carrier validated (%s): %s",
+          this->concat_float64_time_is_epoch_ns_ ? "raw epoch ns"
+                                                : "relative seconds",
+          contract_detail.c_str());
+    }
+  }
+
   PendingPrimaryCloud pending;
   pending.msg = pc;
   // Decode ONCE. An invalid range (unsupported time field) means point-time
@@ -3370,6 +3581,7 @@ void gicp_plusplus::LocalizationNode::syncWorkerLoop() {
 void gicp_plusplus::LocalizationNode::processScan(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in,
     uint64_t sync_epoch) {
+  this->scan_pipeline_start_ = std::chrono::steady_clock::now();
 
   // The synchronizer worker intentionally unlocks sync_mtx_ before entering
   // the expensive scan pipeline. Serialize that handoff with epoch reset: if a
@@ -5354,6 +5566,10 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   }
 
   if (this->debug_pub_enabled_) {
+    const double scan_total_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - this->scan_pipeline_start_)
+            .count();
     auto publish_float = [](const rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr& pub, double value) {
       std_msgs::msg::Float64 msg;
       msg.data = value;
@@ -5362,6 +5578,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
 
     publish_float(this->dbg_fitness_pub, fitness_score);
     publish_float(this->dbg_gicp_elapsed_ms_pub, elapsed_ms);
+    publish_float(this->dbg_scan_total_ms_pub, scan_total_ms);
     publish_float(this->dbg_corr_norm_pub, guess_to_solution_trans);
     publish_float(this->dbg_scan_dt_pub, scan_dt);
     publish_float(this->dbg_imu_age_pub, imu_buffer_span);
@@ -5490,6 +5707,17 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " guess_from_last=[" << scalarSummary(guess_from_last_trans) << "m,"
         << scalarSummary(guess_from_last_rot_deg) << "deg]"
         << " gicp_ms=" << scalarSummary(elapsed_ms, 2)
+        << " gicp_stage_ms=[tree="
+        << scalarSummary(this->gicp.getSourceTreeMs(), 2)
+        << ",cov=" << scalarSummary(this->gicp.getSourceCovarianceMs(), 2)
+        << ",target_cov="
+        << scalarSummary(this->gicp.getTargetCovarianceMs(), 2)
+        << ",optimizer=" << scalarSummary(this->gicp.getOptimizerMs(), 2)
+        << ",timeout=" << this->gicp.getTimeoutStage() << "]"
+        << " scan_total_ms=" << scalarSummary(
+               std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() -
+                   this->scan_pipeline_start_).count(), 2)
         << " converged=" << (converged ? "true" : "false")
         << " timed_out=" << (gicp_timed_out ? 1 : 0)
         << " fitness=" << scalarSummary(fitness_score, 6)
@@ -5512,6 +5740,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << " ins_dyaw=" << scalarSummary(this->last_ins_yaw_diff_deg_, 2) << "deg"
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
+        << " gt_dropped_invalid=" << this->gt_dropped_invalid_.load()
+        << " gt_dropped_frame=" << this->gt_dropped_frame_.load()
         << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
     for (size_t i = 0; i < this->concat_last_aux_dt_.size(); ++i) {
       oss << ",dt" << i << "=" << scalarSummary(this->concat_last_aux_dt_[i], 3)
@@ -5889,7 +6119,10 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // configured threshold, snap state.{pose,velocity} to the time-matched GT
     // sample (transformed into base_frame). The snap overrides the dead-reckoned
     // pose and resets the counter; logs its own warn line.
-    this->maybeSnapPoseToGT(reason);
+    const bool force_absolute_snap =
+        gicp_rejected_gt_sanity || gicp_rejected_fitness_ratio ||
+        gicp_rejected_yaw || gicp_rejected_jump;
+    this->maybeSnapPoseToGT(reason, force_absolute_snap);
   }
 }
 
@@ -5994,8 +6227,61 @@ void gicp_plusplus::LocalizationNode::publishPose() {
 }
 
 void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+  const double stamp =
+      msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+  const auto& p = msg->pose.pose.position;
+  const auto& q = msg->pose.pose.orientation;
+  const auto& linear = msg->twist.twist.linear;
+  const auto& angular = msg->twist.twist.angular;
+  const double q_norm_sq =
+      q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+  const bool pose_covariance_finite = std::all_of(
+      msg->pose.covariance.begin(), msg->pose.covariance.end(),
+      [](double value) { return std::isfinite(value); });
+  const bool twist_covariance_finite = std::all_of(
+      msg->twist.covariance.begin(), msg->twist.covariance.end(),
+      [](double value) { return std::isfinite(value); });
+  const bool fields_finite =
+      std::isfinite(stamp) && stamp > 0.0 &&
+      std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+      std::isfinite(q.w) && std::isfinite(q.x) &&
+      std::isfinite(q.y) && std::isfinite(q.z) &&
+      std::isfinite(q_norm_sq) && q_norm_sq > 1e-12 &&
+      std::isfinite(linear.x) && std::isfinite(linear.y) &&
+      std::isfinite(linear.z) && std::isfinite(angular.x) &&
+      std::isfinite(angular.y) && std::isfinite(angular.z) &&
+      pose_covariance_finite && twist_covariance_finite;
+  if (!fields_finite) {
+    const auto count = ++this->gt_dropped_invalid_;
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Dropping invalid GT odom before quaternion normalization "
+        "(stamp=%.9f q_norm_sq=%.6g, gt_dropped_invalid=%lu)",
+        stamp, q_norm_sq, static_cast<unsigned long>(count));
+    return;
+  }
+
+  const bool frame_ok =
+      !msg->header.frame_id.empty() && !msg->child_frame_id.empty() &&
+      (this->gt_expected_frame_id_.empty() ||
+       msg->header.frame_id == this->gt_expected_frame_id_) &&
+      (this->gt_expected_child_frame_id_.empty() ||
+       msg->child_frame_id == this->gt_expected_child_frame_id_);
+  if (!frame_ok) {
+    const auto count = ++this->gt_dropped_frame_;
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Dropping GT odom with unexpected frames '%s' -> '%s'; expected "
+        "'%s' -> '%s' (gt_dropped_frame=%lu)",
+        msg->header.frame_id.c_str(), msg->child_frame_id.c_str(),
+        this->gt_expected_frame_id_.c_str(),
+        this->gt_expected_child_frame_id_.c_str(),
+        static_cast<unsigned long>(count));
+    return;
+  }
+
   GtSample s;
-  s.stamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+  s.stamp = stamp;
   s.p = Eigen::Vector3f(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
   s.q = Eigen::Quaternionf(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                            msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
@@ -6189,7 +6475,8 @@ bool gicp_plusplus::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) cons
   // cross-check. Parity with the adapter's filtered_odom_rtk_fixed gate.
   return rtkPositionCovarianceOk(s.cov_pos_xx, s.cov_pos_yy, s.cov_pos_zz,
                                  this->rtk_gate_max_pose_var_xy_,
-                                 this->rtk_gate_max_pose_var_z_);
+                                 this->rtk_gate_max_pose_var_z_,
+                                 this->rtk_gate_allow_zero_covariance_);
 }
 
 bool gicp_plusplus::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
@@ -6525,7 +6812,8 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
   return true;
 }
 
-bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
+bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(
+    const char* reason, bool force_absolute) {
   // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
   // [P3 FIX 2026-07-10] Demoted from unconditional INFO ("prove helper is
   // being called" diagnostic) — it fired on EVERY non-accepted scan, ~10
@@ -6685,9 +6973,12 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   Eigen::Matrix4f T_gt_scan = Eigen::Matrix4f::Identity();
   T_gt_scan.block<3, 3>(0, 0) = q_new.toRotationMatrix();
   T_gt_scan.block<3, 1>(0, 3) = p_new;
-  const bool snap_delta_ok = matrixFinite(T_est_scan);
+  const bool snap_estimate_finite = matrixFinite(T_est_scan);
+  const bool apply_delta = !force_absolute && snap_estimate_finite;
   const Eigen::Matrix4f T_corr =
-      snap_delta_ok ? Eigen::Matrix4f(T_gt_scan * T_est_scan.inverse()) : T_gt_scan;
+      snap_estimate_finite
+          ? Eigen::Matrix4f(T_gt_scan * T_est_scan.inverse())
+          : T_gt_scan;
 
   this->current_pose = T_gt_scan;  // scan-chain pose stays a scan-time quantity
   Eigen::Vector3f v_base_world;
@@ -6706,13 +6997,14 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
 
     Eigen::Quaternionf q_state_new;
     Eigen::Vector3f p_state_new;
-    if (snap_delta_ok) {
+    if (apply_delta) {
       Eigen::Quaternionf q_corr(Eigen::Matrix3f(T_corr.block<3, 3>(0, 0)));
       q_corr.normalize();
       q_state_new = (q_corr * this->state.q).normalized();
       p_state_new = T_corr.block<3, 3>(0, 0) * this->state.p + T_corr.block<3, 1>(0, 3);
     } else {
-      // Degenerate pre-snap estimate: absolute overwrite (legacy behavior).
+      // Catastrophic/wrong-lock branch or degenerate pre-snap estimate:
+      // overwrite the observer absolutely instead of preserving a bad basin.
       q_state_new = q_new;
       p_state_new = p_new;
     }
@@ -6733,11 +7025,14 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
     ++this->geo.update_seq;  // discard any in-flight propagateState computations
   }
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: delta-form snap — correction |t|=%.2f m |rot|=%.2f deg applied to the "
+              "GT recovery: %s snap — correction |t|=%.2f m |rot|=%.2f deg applied to the "
               "LIVE observer state%s",
+              apply_delta ? "delta-form" : "absolute",
               T_corr.block<3, 1>(0, 3).norm(),
               rotationDistanceDeg(Eigen::Matrix4f::Identity(), T_corr),
-              snap_delta_ok ? "" : " (ABSOLUTE fallback: pre-snap estimate non-finite)");
+              apply_delta ? "" :
+                  (force_absolute ? " (forced by catastrophic/wrong-lock rejection)"
+                                  : " (pre-snap estimate non-finite)"));
   {
     // [P2 FIX 2026-07-09] Seed writes under the owner lock (pose -> seed:
     // maybeSnapPoseToGT runs inside performLocalization's pose_mutex scope).
@@ -6748,6 +7043,7 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
     // (median point time) — matching the accept/reject stamps and the
     // estimate the delta was formed against.
     this->base_pose_stamp_ = snap_stamp;
+    this->t_prior_stamp_ = snap_stamp;
     this->prev_vel = v_base_world;
   }
 
@@ -7224,77 +7520,20 @@ bool gicp_plusplus::LocalizationNode::imuMeasFromTimeRange(
 
   std::lock_guard<std::mutex> lock(this->mtx_imu);
 
-  out.clear();
-  const bool empty = this->imu_buffer.empty();
-  const bool invalid_range =
-      !std::isfinite(start_time) || !std::isfinite(end_time) ||
-      start_time > end_time;
-  const bool missing_newer =
-      !empty && this->imu_buffer.front().stamp < end_time;
-  const double missing_older_s =
-      empty ? std::numeric_limits<double>::infinity()
-            : this->imu_buffer.back().stamp - start_time;
-  const bool missing_older =
-      !empty && missing_older_s > 0.002;
-  if (empty || invalid_range || missing_newer || missing_older) {
-    // Need a monotone window with one real IMU sample on or before start_time
-    // and one on or after end_time. imu_buffer is newest -> oldest.
+  constexpr double kOlderToleranceSec = 0.002;
+  if (!selectBracketedImuRange(
+          this->imu_buffer, start_time, end_time, kOlderToleranceSec, out)) {
     RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "IMU range unavailable: request=[%.6f,%.6f] buffer=[oldest=%.6f,"
-        "newest=%.6f,size=%zu] empty=%d invalid=%d missing_older=%d "
-        "missing_newer=%d",
+        "newest=%.6f,size=%zu]",
         start_time, end_time,
-        empty ? -1.0 : this->imu_buffer.back().stamp,
-        empty ? -1.0 : this->imu_buffer.front().stamp,
-        this->imu_buffer.size(), empty, invalid_range, missing_older,
-        missing_newer);
+        this->imu_buffer.empty() ? -1.0 : this->imu_buffer.back().stamp,
+        this->imu_buffer.empty() ? -1.0 : this->imu_buffer.front().stamp,
+        this->imu_buffer.size());
     return false;
   }
-
-  // Walk oldest -> newest while the lock is held. Keep only the newest sample
-  // at/before start_time, then every sample through the first one at/after
-  // end_time. The former reverse_iterator-range construction mixed a forward
-  // iterator boundary with reverse_iterator base semantics and could produce
-  // an empty slice even though the circular buffer visibly bracketed the
-  // requested interval. With real FLOAT64 Luminar point times that disabled
-  // IMU prediction/deskew on every frame and eventually caused high-speed
-  // GICP loss.
-  bool have_start_bracket = false;
-  for (auto it = this->imu_buffer.rbegin(); it != this->imu_buffer.rend(); ++it) {
-    if (!have_start_bracket) {
-      if (it->stamp <= start_time || out.empty()) {
-        // There can be many older samples. Retain only the nearest one so the
-        // returned slice starts at the interpolation bracket, not at the
-        // circular buffer's oldest entry. The out.empty() case admits at most
-        // 2 ms of start-side extrapolation (guarded above), covering the
-        // sub-millisecond seed-vs-first-IMU phase seen at replay startup.
-        out.clear();
-        out.push_back(*it);
-      } else if (!out.empty()) {
-        have_start_bracket = true;
-        out.push_back(*it);
-        if (it->stamp >= end_time) {
-          return out.size() >= 2;
-        }
-      }
-      continue;
-    }
-
-    out.push_back(*it);
-    if (it->stamp >= end_time) {
-      return out.size() >= 2;
-    }
-  }
-
-  out.clear();
-  RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "IMU range traversal failed despite bracket guard: request=[%.6f,%.6f] "
-      "buffer=[oldest=%.6f,newest=%.6f,size=%zu]",
-      start_time, end_time, this->imu_buffer.back().stamp,
-      this->imu_buffer.front().stamp, this->imu_buffer.size());
-  return false;
+  return true;
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>

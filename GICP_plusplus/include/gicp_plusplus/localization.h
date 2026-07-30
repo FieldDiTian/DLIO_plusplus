@@ -5,6 +5,7 @@
 #include "dlio/dlio.h"
 #include "gicp_plusplus/small_gicp_backend.hpp"
 #include "gicp_plusplus/luminar_sweep_matching.hpp"
+#include "gicp_plusplus/imu_range.hpp"
 #include "gicp_plusplus/rtk_gate.hpp"
 
 // ROS
@@ -131,7 +132,7 @@ private:
                             Eigen::Vector3f& v_ang_body_out) const;
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
-  bool maybeSnapPoseToGT(const char* reason);
+  bool maybeSnapPoseToGT(const char* reason, bool force_absolute);
   // [P3 FIX 2026-07-14] Optional world-frame linear velocity seed. When null
   // (RViz /initialpose, param pose) velocity is zeroed as before; the GT
   // odom-init path passes the message's own twist so a mid-run seed does not
@@ -262,6 +263,10 @@ private:
   std::deque<GtSample> gt_odom_buffer_;
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
+  std::string gt_expected_frame_id_;
+  std::string gt_expected_child_frame_id_;
+  std::atomic<uint64_t> gt_dropped_invalid_{0};
+  std::atomic<uint64_t> gt_dropped_frame_{0};
 
   // RTK quality gate (P1-native), applied PER CONSUMER — not a buffer
   // filter. Every gt_odom sample is buffered; gtSampleIsRtkFixed (finite,
@@ -272,6 +277,7 @@ private:
   // separate status topic is involved. Replaces the old BESTGNSSPOS-enum
   // gate (removed when the NovAtel path was retired).
   bool rtk_gate_enabled_;
+  bool rtk_gate_allow_zero_covariance_;
   double rtk_gate_max_pose_var_xy_;  // m^2; reject if cov[0] or cov[7] > this
   double rtk_gate_max_pose_var_z_;   // m^2; reject if cov[14] > this
   // Counter for rate-limited rejection logging.
@@ -344,6 +350,8 @@ private:
   // as FLOAT64; those require an explicit opt-in so ordinary doubles are
   // never reinterpreted as multi-billion-second timestamps.
   bool concat_float64_time_is_epoch_ns_ = false;
+  bool concat_float64_time_fail_on_mismatch_ = true;
+  std::atomic<bool> concat_float64_contract_checked_{false};
 
   // ---- Async Luminar front worker / aux synchronizer ----
   // Contract: every valid front cloud is released exactly once, in order,
@@ -466,6 +474,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dbg_pose_markers_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_fitness_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gicp_elapsed_ms_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_total_ms_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_corr_norm_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_dt_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_imu_age_pub;
@@ -511,6 +520,7 @@ private:
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
   double prev_scan_stamp;
+  std::chrono::steady_clock::time_point scan_pipeline_start_;
   // [REVIEW FIX 2026-07-08] The timestamp basePose actually corresponds to.
   // basePose is set from the accepted candidate / T_prior, which is the pose
   // at the MEDIAN POINT TIME of the scan (frames[median_pt_index]) -- NOT the
@@ -721,6 +731,7 @@ private:
 
   // Parameters
   std::string map_path_;
+  bool require_map_manifest_ = false;
   double map_roll_deg_;
   double map_pitch_deg_;
   double map_yaw_deg_;

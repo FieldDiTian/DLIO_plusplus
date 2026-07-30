@@ -13,7 +13,7 @@ import tempfile
 
 import yaml
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -213,7 +213,13 @@ def generate_launch_description():
                 ('map', 'gicp/localization/map'),
             ],
         )
-        return [node]
+        active_files = [str(localization_yaml_path.perform(context))]
+        if config_path_value:
+            active_files.append(config_path_value)
+        return [
+            LogInfo(msg='GICP parameter files (in precedence order): ' + ' -> '.join(active_files)),
+            node,
+        ]
 
     rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'localization.rviz'])
 

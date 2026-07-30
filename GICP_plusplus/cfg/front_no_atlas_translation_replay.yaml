@@ -1,8 +1,9 @@
 /**:
   ros__parameters:
-    # Laguna high-information front-only localization profile. Atlas translation is
-    # used only to place the GICP optimizer in the correct local basin; it is
-    # never blended into basePose, observer state, or published output.
+    # Laguna front-only A/B profile with per-scan Atlas translation removed
+    # from the optimizer seed and candidate gate. This is NOT independent
+    # truth: package defaults still permit Atlas initialization, heading, and
+    # recovery unless a caller overrides those contracts explicitly.
     localization/map_voxel_size: 0.25
     dlio/preprocessing/cropBoxFilter/size: 100.0
     dlio/preprocessing/voxelFilter/use: true
@@ -21,16 +22,12 @@
     gicp/fitnessBaseline/enable: false
     gicp/fitnessRatioRejectThreshold: 0.0
 
-    # Keep the deployed Laguna motion-prediction chain.
     dlio/deskew: true
     localization/ins_prior/enable: true
-    localization/ins_prior/gicp_position_seed_blend: 1.0
+    localization/ins_prior/gicp_position_seed_blend: 0.0
     localization/ins_prior/gicp_position_seed_max_step_m: 20.0
+    localization/gt_odom/max_candidate_position_error_m: 0.0
 
-    # Fail closed on a map match outside the quality-gated Atlas envelope.
-    localization/gt_odom/max_candidate_position_error_m: 5.0
-
-    # Laguna online contract and observer safety limits.
     localization/lidar_concat/enabled: false
     localization/lidar_concat/reliable_qos: false
     localization/lidar_concat/time_threshold: 0.05

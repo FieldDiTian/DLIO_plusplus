@@ -329,12 +329,7 @@ class SmallGicpBackend {
   void setInputSource(const PointCloudSourceConstPtr& cloud) {
     input_ = cloud;
     source_covs_.clear();
-    if (input_ && !input_->empty()) {
-      source_tree_ = std::make_shared<small_gicp::KdTree<PointCloudSource>>(
-          input_, small_gicp::KdTreeBuilderOMP(num_threads_));
-    } else {
-      source_tree_.reset();
-    }
+    source_tree_.reset();
   }
 
   bool calculateTargetCovariances() {
@@ -405,6 +400,12 @@ class SmallGicpBackend {
   }
 
   void align(PointCloudSource& output, const Eigen::Matrix4f& guess) {
+    const auto cooperative_budget_start = std::chrono::steady_clock::now();
+    source_tree_ms_ = 0.0;
+    source_covariance_ms_ = 0.0;
+    target_covariance_ms_ = 0.0;
+    optimizer_ms_ = 0.0;
+    timeout_stage_ = "none";
     converged_ = false;
     final_transformation_ = guess;
     final_fitness_ = std::numeric_limits<double>::infinity();
@@ -417,21 +418,66 @@ class SmallGicpBackend {
       output.clear();
       return;
     }
+    const auto elapsed_budget_ms = [&]() {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - cooperative_budget_start)
+          .count();
+    };
+    const auto budget_exhausted = [&]() {
+      return max_optimization_time_ms_ > 0.0 &&
+             elapsed_budget_ms() >= max_optimization_time_ms_;
+    };
+    const auto fail_timeout = [&](const char* stage) {
+      timed_out_ = true;
+      timeout_stage_ = stage;
+      converged_ = false;
+      final_transformation_ = guess;
+      final_error_ = std::numeric_limits<double>::infinity();
+      final_fitness_ = std::numeric_limits<double>::infinity();
+      num_correspondences = 0;
+      output.clear();
+    };
 
     small_gicp::PointCloudProxy<PointSource> source_proxy(*input_, source_covs_);
     small_gicp::PointCloudProxy<PointTarget> target_proxy(*target_, target_covs_);
 
     if (!source_tree_) {
+      const auto stage_start = std::chrono::steady_clock::now();
       source_tree_ = std::make_shared<small_gicp::KdTree<PointCloudSource>>(
           input_, small_gicp::KdTreeBuilderOMP(num_threads_));
+      source_tree_ms_ = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - stage_start)
+                            .count();
+    }
+    if (budget_exhausted()) {
+      fail_timeout("source_tree");
+      return;
     }
     if (source_covs_.size() != input_->size()) {
+      const auto stage_start = std::chrono::steady_clock::now();
       small_gicp::estimate_covariances_omp(
           source_proxy, *source_tree_, k_correspondences_, num_threads_);
+      source_covariance_ms_ =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - stage_start)
+              .count();
+    }
+    if (budget_exhausted()) {
+      fail_timeout("source_covariance");
+      return;
     }
     if (target_covs_.size() != target_->size()) {
+      const auto stage_start = std::chrono::steady_clock::now();
       small_gicp::estimate_covariances_omp(
           target_proxy, *target_tree_, k_correspondences_, num_threads_);
+      target_covariance_ms_ =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - stage_start)
+              .count();
+    }
+    if (budget_exhausted()) {
+      fail_timeout("target_covariance");
+      return;
     }
 
     GroundVehicleGeneralFactor general_factor;
@@ -454,14 +500,27 @@ class SmallGicpBackend {
     registration.rejector.max_dist_sq = max_corr_dist_ * max_corr_dist_;
     registration.optimizer.verbose = debug_print_;
     registration.optimizer.max_iterations = max_iterations_;
-    registration.optimizer.max_time_ms = max_optimization_time_ms_;
+    registration.optimizer.max_time_ms =
+        max_optimization_time_ms_ > 0.0
+            ? max_optimization_time_ms_ - elapsed_budget_ms()
+            : 0.0;
+    if (max_optimization_time_ms_ > 0.0 &&
+        registration.optimizer.max_time_ms <= 0.0) {
+      fail_timeout("pre_optimizer");
+      return;
+    }
     registration.optimizer.timeout_flag = &timed_out_;
     registration.general_factor = general_factor;
 
+    const auto optimizer_start = std::chrono::steady_clock::now();
     result_ = registration.align(
         target_proxy, source_proxy, *target_tree_, Eigen::Isometry3d(guess.cast<double>()));
+    optimizer_ms_ = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - optimizer_start)
+                        .count();
 
     if (timed_out_) {
+      timeout_stage_ = "optimizer";
       result_ = small_gicp::RegistrationResult(
           Eigen::Isometry3d(guess.cast<double>()));
       converged_ = false;
@@ -501,6 +560,11 @@ class SmallGicpBackend {
   double getFinalError() const { return final_error_; }
   bool hasConverged() const { return converged_; }
   bool hasTimedOut() const { return timed_out_; }
+  double getSourceTreeMs() const { return source_tree_ms_; }
+  double getSourceCovarianceMs() const { return source_covariance_ms_; }
+  double getTargetCovarianceMs() const { return target_covariance_ms_; }
+  double getOptimizerMs() const { return optimizer_ms_; }
+  const char* getTimeoutStage() const { return timeout_stage_; }
   const Eigen::Matrix<double, 6, 6>& getFinalHessian() const { return result_.H; }
   Eigen::Matrix4f getFinalTransformation() const { return final_transformation_; }
   const small_gicp::RegistrationResult& getRegistrationResult() const { return result_; }
@@ -517,6 +581,11 @@ class SmallGicpBackend {
   double rotation_epsilon_;
   bool debug_print_;
   bool timed_out_;
+  double source_tree_ms_ = 0.0;
+  double source_covariance_ms_ = 0.0;
+  double target_covariance_ms_ = 0.0;
+  double optimizer_ms_ = 0.0;
+  const char* timeout_stage_ = "none";
 
   PointCloudSourceConstPtr input_;
   PointCloudTargetConstPtr target_;

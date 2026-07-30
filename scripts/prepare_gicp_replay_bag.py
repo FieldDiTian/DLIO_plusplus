@@ -123,6 +123,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     bags = [Path(value).expanduser().resolve(strict=True) for value in args.bag]
+    if len(set(bags)) != len(bags):
+        raise SystemExit("Duplicate --bag inputs are not allowed")
 
     if args.out:
         output = Path(args.out).expanduser().resolve(strict=False)
@@ -165,6 +167,10 @@ def main() -> int:
                 f"Cross-dataset input refused: {bag} belongs to {source_root}, "
                 f"output belongs to {dataset_root}"
             )
+        if output == bag or is_relative_to(output, bag) or is_relative_to(bag, output):
+            raise SystemExit(
+                f"Input/output path collision refused: input={bag} output={output}"
+            )
 
     if output.exists():
         raise SystemExit(f"Refusing to overwrite output bag: {output}")
@@ -173,7 +179,9 @@ def main() -> int:
         raise SystemExit("Every retained topic must be an absolute ROS topic")
 
     prep_root.mkdir(parents=True, exist_ok=True)
-    config_dir = prep_root / "configs"
+    # Dry-run is intentionally isolated so it cannot occupy the production
+    # conversion-config pathname and block the subsequent real conversion.
+    config_dir = prep_root / ("dry_run_configs" if args.dry_run else "configs")
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"{output.name}.convert.yaml"
     if config_path.exists():

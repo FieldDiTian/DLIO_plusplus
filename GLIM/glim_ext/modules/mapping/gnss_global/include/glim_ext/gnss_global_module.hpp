@@ -157,7 +157,7 @@ public:
       std::max(1, config.param<int>("gnss", "fit_validation_samples", 10));
     // Maximum training AND held-out prediction RMS (m) accepted before the
     // one-shot transform can latch. <= 0 disables both gates.
-    fit_max_rms = config.param<double>("gnss", "fit_max_rms", 0.25);
+    fit_max_rms = config.param<double>("gnss", "fit_max_rms", 2.0);
     if (!std::isfinite(fit_max_rms)) {
       throw std::invalid_argument("gnss.fit_max_rms must be finite");
     }
